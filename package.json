@@ -1,0 +1,24 @@
+{
+  "name": "convoy",
+  "version": "0.0.1",
+  "description": "Deployment agent that rehearses, ships, and observes — without touching your code.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/teckedd-code2save/convoy.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx watch src/index.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
