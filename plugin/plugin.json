@@ -1,0 +1,8 @@
+{
+  "name": "convoy",
+  "version": "0.0.1",
+  "description": "Deployment agent that rehearses, ships, and observes — without touching your code.",
+  "author": "serendepify",
+  "license": "MIT",
+  "homepage": "https://github.com/teckedd-code2save/convoy"
+}
