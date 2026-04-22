@@ -144,13 +144,59 @@ See [`docs/principles.md`](./docs/principles.md) for the full rationale.
 
 ---
 
-## Status
+## Status: what's real, what's opt-in
 
-Hackathon-scope build, Apr 21 → Apr 26, 2026. Target: a real, runnable vertical slice that demos end-to-end — plan → apply → medic catches a breach → diagnosis card in the browser — against a real local target.
+| Capability | Real | How to enable |
+|---|---|---|
+| Scanner (detects ecosystem, framework, data layer, topology, scripts, existing platform config) | **Real** | default |
+| Platform picker (scored) | **Real** | default |
+| Opus-authored Dockerfile / platform manifest content | **Real** | set `ANTHROPIC_API_KEY` |
+| First-person ship narrative | **Real** | set `ANTHROPIC_API_KEY` |
+| Plan artifact (JSON + readable render) | **Real** | default |
+| Approval loop (CLI ↔ web via SQLite + server action) | **Real** | default |
+| Medic log diagnosis | **Real** | set `ANTHROPIC_API_KEY` |
+| **Opening a real GitHub PR with the authored files** | **Real** | `--real-author` (requires `gh auth login` + write access to the target) |
+| **PR merge via `gh pr merge`** | **Real** | `--real-author --auto-merge` |
+| **Local rehearsal (spawn target, probe endpoints, scrape metrics, feed real logs to medic)** | **Real** | `--real-rehearsal` |
+| **Fly.io canary deploy** | **Real** | `--real-fly --fly-app=<name>` (requires `flyctl` + `fly auth login`) |
+| **Observe → auto-rollback on breach** | **Real** | same as above |
+| Railway / Vercel / Cloud Run adapters | Declared, scripted | v2 |
 
-- Fly.io / Railway / Vercel / Cloud Run adapters are declared; execution is stubbed pending platform credentials. The plan, rehearsal narrative, and rollback strategy are real per-platform.
-- Medic is real against any log stream you feed it.
-- The web approval loop is end-to-end: the CLI blocks at approvals and the browser unblocks them via a server action writing to the shared SQLite DB.
+Without any `--real-*` flag, the pipeline runs a scripted demo path that still exercises the plan, approval, medic (with fixture logs), and status machinery. Flags turn each stage real one by one — so a new user can feel the product before they wire credentials.
+
+## Real shipping — setup
+
+One-time per platform:
+
+```bash
+# GitHub (for --real-author) — you almost certainly already have this
+brew install gh
+gh auth login           # needs repo + workflow scopes
+
+# Fly.io (for --real-fly) — optional
+brew install flyctl     # or: curl -L https://fly.io/install.sh | sh
+fly auth login          # free hobby tier, no card required
+```
+
+Per target repo:
+
+- Must be a git repo with a `github.com` remote you have write to.
+- Secrets for the running service go in `<target>/.env.convoy-secrets` (gitignored). Convoy reads it and stages each line via `fly secrets set`. Values never enter git.
+- If you want Convoy to create the Fly app on first run, pass `--fly-create-app`. Otherwise pre-create with `fly apps create <name>`.
+
+Full real deploy:
+
+```bash
+npm run convoy -- plan ../my-repo --platform=fly --save
+PLAN=$(npm run convoy -- plans | grep my-repo | awk '{print $1}')
+npm run convoy -- apply "$PLAN" \
+  --real-author --auto-merge \
+  --real-rehearsal --probe-path=/orders --probe-path=/health \
+  --real-fly --fly-app=my-app --fly-create-app \
+  --fly-bake-window=120
+```
+
+What happens: Convoy opens a real PR, merges it on approval, rehearses the build locally (spawning the target, probing real endpoints), then calls `fly deploy --strategy=canary`. Fly's canary strategy deploys one machine at a time with health gates, then rolls out to all. Convoy observes `<app>.fly.dev/health` for the bake window; if error rate > 1% or p99 > 1000ms, it fires `fly releases rollback` — which is the genuine reverse path.
 
 ---
 
