@@ -335,6 +335,7 @@ function StatusBadge({ status, live }: { status: string; live: boolean }) {
     pending: { color: 'bg-muted', label: 'pending' },
     running: { color: 'bg-accent animate-pulse', label: 'running' },
     awaiting_approval: { color: 'bg-warn animate-pulse', label: 'awaiting approval' },
+    awaiting_fix: { color: 'bg-warn animate-pulse', label: 'awaiting fix' },
     succeeded: { color: 'bg-success', label: 'succeeded' },
     failed: { color: 'bg-danger', label: 'failed' },
     rolled_back: { color: 'bg-danger', label: 'rolled back' },

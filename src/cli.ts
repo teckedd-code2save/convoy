@@ -105,6 +105,14 @@ function attachRenderer(bus: ConvoyBus, startedAt: Date): () => void {
           if (e.run.liveUrl) {
             process.stdout.write(`  ${pc.dim('Live URL:')} ${pc.cyan(e.run.liveUrl)}\n`);
           }
+        } else if (e.run.status === 'awaiting_fix') {
+          const ms = Date.now() - startedAt.getTime();
+          process.stdout.write(
+            `\n${pc.bold(pc.yellow(SYMBOL.pause))} ${pc.bold(pc.yellow(`Paused after ${formatDuration(ms)} — awaiting developer fix`))}\n`,
+          );
+          process.stdout.write(
+            `  ${pc.dim('Medic diagnosed a code-level failure. Fix your code, push the commit, and re-run \`convoy apply\`.')}\n`,
+          );
         } else if (e.run.status === 'failed') {
           const ms = Date.now() - startedAt.getTime();
           process.stdout.write(

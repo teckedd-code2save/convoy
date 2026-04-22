@@ -21,6 +21,7 @@ export type RunStatus =
   | 'pending'
   | 'running'
   | 'awaiting_approval'
+  | 'awaiting_fix'
   | 'succeeded'
   | 'failed'
   | 'rolled_back';

@@ -1,7 +1,7 @@
 import type { ConvoyBus } from './bus.js';
 import type { RunStateStore } from './state.js';
-import type { Stage, StageContext, OrchestratorOpts } from './stages.js';
-import type { Run, StageName } from './types.js';
+import { RehearsalBreachError, type Stage, type StageContext, type OrchestratorOpts } from './stages.js';
+import type { Run, RunStatus, StageName } from './types.js';
 
 /**
  * Runs stages sequentially. Each stage's output becomes available to the next
@@ -54,19 +54,29 @@ export class Orchestrator {
       return finished;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const isBreach = err instanceof RehearsalBreachError;
+      const nextStatus: RunStatus = isBreach ? 'awaiting_fix' : 'failed';
+
       const failureEvent = this.#store.appendEvent(
         started.id,
         currentStageName,
         'failed',
-        { error: message },
+        {
+          error: message,
+          ...(isBreach && { reason: 'rehearsal_breach', classification: (err.diagnosis as { classification?: string } | undefined)?.classification }),
+        },
       );
       this.#bus.emit({ type: 'event.appended', event: failureEvent });
 
-      const failed = this.#store.updateRun(started.id, {
-        status: 'failed',
+      const finalized = this.#store.updateRun(started.id, {
+        status: nextStatus,
         completedAt: new Date(),
       });
-      this.#bus.emit({ type: 'run.updated', run: failed });
+      this.#bus.emit({ type: 'run.updated', run: finalized });
+
+      // Breach is a controlled pause — developer fixes and restarts.
+      // Don't rethrow, callers shouldn't treat this as a crash.
+      if (isBreach) return finalized;
       throw err;
     }
   }
