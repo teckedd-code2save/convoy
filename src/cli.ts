@@ -147,16 +147,24 @@ function attachRenderer(bus: ConvoyBus, startedAt: Date): () => void {
   });
 }
 
-interface ShipOpts {
+interface ShipOpts extends ApplyOpts {
   platform?: string;
-  live?: boolean;
-  autoApprove: boolean;
+  workspace?: string;
+  noAi?: boolean;
 }
 
-async function runShip(repoUrl: string, opts: ShipOpts): Promise<void> {
-  if (opts.live) {
-    console.error(pc.yellow('--live is not supported yet in the hackathon scaffold. Running dry-run.'));
-  }
+
+/**
+ * `convoy ship <path-or-url>` = plan + save + apply in one shot. The target
+ * is resolved via resolveTarget (local path OR github URL/shorthand), a plan
+ * is built and persisted, and the orchestrator runs with whatever --real-*
+ * flags were passed. Default is the scripted pipeline; add flags to make
+ * stages real.
+ */
+async function runShip(
+  target: string,
+  opts: ShipOpts,
+): Promise<void> {
   let platformOverride: Platform | undefined;
   if (opts.platform !== undefined) {
     if (!isPlatform(opts.platform)) {
@@ -170,29 +178,54 @@ async function runShip(repoUrl: string, opts: ShipOpts): Promise<void> {
     platformOverride = opts.platform;
   }
 
-  const store = new RunStateStore(STATE_PATH);
-  const bus = new ConvoyBus();
-  const stages = defaultStages();
-  const orchestrator = new Orchestrator(store, bus, stages);
-
-  const startedAt = new Date();
-  const unsubscribe = attachRenderer(bus, startedAt);
-
-  const orchestratorOpts: OrchestratorOpts = {
-    dryRun: true,
-    autoApprove: opts.autoApprove,
-    ...(platformOverride !== undefined && { platformOverride }),
-  };
-
+  const thinking = startThinking();
   try {
-    await orchestrator.run(repoUrl, orchestratorOpts);
+    const resolved = await resolveTarget(target, {
+      onProgress: (phase, detail) => {
+        thinking.stop();
+        const line = detail ? `  ${pc.dim(phase)} ${detail}` : `  ${pc.dim(phase)}`;
+        process.stdout.write(`${line}\n`);
+      },
+    });
+
+    const inferredRepoUrl = resolved.repoUrl ?? undefined;
+
+    const { plan, enrichmentSource } = await buildPlan(resolved.localPath, {
+      ...(inferredRepoUrl !== undefined && { repoUrl: inferredRepoUrl }),
+      ...(resolved.branch !== undefined && { branch: resolved.branch }),
+      ...(resolved.sha !== undefined && { sha: resolved.sha }),
+      ...(platformOverride !== undefined && { platformOverride }),
+      ...(opts.workspace !== undefined && { workspace: opts.workspace }),
+      ai: opts.noAi ? { disable: true } : {},
+    });
+    thinking.stop();
+
+    const planStore = new PlanStore(PLANS_DIR);
+    planStore.save(plan);
+
+    process.stdout.write(
+      `${pc.dim('Plan')} ${pc.bold(plan.id.slice(0, 8))} ${pc.dim('saved')} ${pc.dim(`(narrative: ${enrichmentSource})`)}\n`,
+    );
+    process.stdout.write(
+      `${pc.dim('Target:')} ${plan.target.name} ${pc.dim(`(${plan.target.ecosystem}${plan.target.framework ? `, ${plan.target.framework}` : ''})`)}\n`,
+    );
+    if (plan.deployability.verdict === 'not-cloud-deployable') {
+      process.stdout.write(
+        `${pc.red('Refused:')} ${plan.deployability.reason}\n`,
+      );
+      process.exitCode = 2;
+      return;
+    }
+    process.stdout.write(
+      `${pc.dim('Platform:')} ${plan.platform.chosen} ${pc.dim(`(${plan.platform.source})`)}\n\n`,
+    );
+
+    await runApply(plan.id, opts);
   } catch (err) {
+    thinking.stop();
     const message = err instanceof Error ? err.message : String(err);
-    console.error(pc.red(`\nrun terminated: ${message}`));
+    console.error(pc.red(`\nship failed: ${message}`));
     process.exitCode = 1;
-  } finally {
-    unsubscribe();
-    store.close();
   }
 }
 
@@ -284,11 +317,13 @@ function startThinking(): { stop: () => void } {
 
 interface ApplyOpts {
   autoApprove: boolean;
-  realRehearsal?: boolean;
-  realAuthor?: boolean;
+  // These default to true (real). Use --no-real-X to stub, or --demo for all three.
+  realAuthor: boolean;
+  realRehearsal: boolean;
+  realFly: boolean;
+  demo?: boolean;
   autoMerge?: boolean;
   mergeMethod?: string;
-  realFly?: boolean;
   flyApp?: string;
   flyOrg?: string;
   flyCreateApp?: boolean;
@@ -302,6 +337,187 @@ interface ApplyOpts {
   probeRequests?: number;
   probeConcurrency?: number;
   env?: Record<string, string>;
+}
+
+interface PreflightCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+  remedy?: string;
+}
+
+interface PreflightReport {
+  realAuthor: boolean;
+  realRehearsal: boolean;
+  realFly: boolean;
+  checks: PreflightCheck[];
+  hardFailures: string[];
+}
+
+async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<PreflightReport> {
+  const report: PreflightReport = {
+    realAuthor: opts.realAuthor,
+    realRehearsal: opts.realRehearsal,
+    realFly: opts.realFly,
+    checks: [],
+    hardFailures: [],
+  };
+
+  if (opts.demo) {
+    report.realAuthor = false;
+    report.realRehearsal = false;
+    report.realFly = false;
+    report.checks.push({
+      name: 'demo mode',
+      ok: true,
+      detail: 'all stages stubbed for the demo (no PR, no subprocess, no Fly deploy)',
+    });
+    return report;
+  }
+
+  // --- real author ---
+  if (opts.realAuthor) {
+    if (plan.author.convoyAuthoredFiles.length === 0) {
+      report.realAuthor = false;
+      report.checks.push({
+        name: 'real author',
+        ok: true,
+        detail: 'skipped — plan has no files to author',
+      });
+    } else {
+      const { detectRepo: detect, gitHubAuthStatus: authStatus } = await import('./core/github-runner.js');
+      const repo = await detect(plan.target.localPath);
+      if (!repo) {
+        report.realAuthor = false;
+        report.hardFailures.push(
+          `real author: target at ${plan.target.localPath} is not a git repo with a github.com remote. ` +
+            `If it's a fresh clone, make sure --real-author is desired, or pass --no-real-author.`,
+        );
+        report.checks.push({
+          name: 'real author',
+          ok: false,
+          detail: 'target has no .git with github.com origin',
+          remedy: 'ensure the repo has a github.com remote, or pass --no-real-author',
+        });
+      } else {
+        const auth = await authStatus();
+        if (!auth.ok) {
+          report.realAuthor = false;
+          report.hardFailures.push(
+            `real author: gh is not authenticated (${auth.error ?? 'unknown'}). Run \`gh auth login\` or pass --no-real-author.`,
+          );
+          report.checks.push({
+            name: 'real author',
+            ok: false,
+            detail: 'gh not authenticated',
+            remedy: 'gh auth login',
+          });
+        } else {
+          report.checks.push({
+            name: 'real author',
+            ok: true,
+            detail: `gh authed as ${auth.user ?? 'unknown'} — will open PR on ${repo.owner}/${repo.repo}`,
+          });
+        }
+      }
+    }
+  } else {
+    report.checks.push({ name: 'real author', ok: true, detail: 'skipped (--no-real-author)' });
+  }
+
+  // --- real rehearsal ---
+  if (opts.realRehearsal) {
+    if (!plan.rehearsal.startCommand) {
+      report.realRehearsal = false;
+      report.hardFailures.push(
+        `real rehearsal: no start command detected for this target. ` +
+          `Add a \`start\` script or pass --no-real-rehearsal.`,
+      );
+      report.checks.push({
+        name: 'real rehearsal',
+        ok: false,
+        detail: 'no start command detected',
+        remedy: 'add a start script to the target, or pass --no-real-rehearsal',
+      });
+    } else {
+      report.checks.push({
+        name: 'real rehearsal',
+        ok: true,
+        detail: `will spawn \`${plan.rehearsal.startCommand}\` on port ${plan.rehearsal.expectedPort ?? 8080}`,
+      });
+    }
+  } else {
+    report.checks.push({ name: 'real rehearsal', ok: true, detail: 'skipped (--no-real-rehearsal)' });
+  }
+
+  // --- real fly ---
+  if (opts.realFly) {
+    if (plan.platform.chosen !== 'fly') {
+      report.realFly = false;
+      report.checks.push({
+        name: 'real fly',
+        ok: true,
+        detail: `skipped — plan chose ${plan.platform.chosen}; the only real adapter today is fly. Re-plan with --platform=fly to deploy for real, or pass --no-real-fly.`,
+      });
+    } else {
+      const { flyctlAvailable, flyAuthStatus } = await import('./adapters/fly/runner.js');
+      const available = await flyctlAvailable();
+      if (!available) {
+        report.realFly = false;
+        report.hardFailures.push(
+          `real fly: flyctl not installed. Install: \`curl -L https://fly.io/install.sh | sh\`. Or pass --no-real-fly.`,
+        );
+        report.checks.push({
+          name: 'real fly',
+          ok: false,
+          detail: 'flyctl not in PATH',
+          remedy: 'brew install flyctl',
+        });
+      } else {
+        const auth = await flyAuthStatus();
+        if (!auth.ok) {
+          report.realFly = false;
+          report.hardFailures.push(
+            `real fly: flyctl is not authenticated. Run \`fly auth login\`. Or pass --no-real-fly.`,
+          );
+          report.checks.push({
+            name: 'real fly',
+            ok: false,
+            detail: 'flyctl not authenticated',
+            remedy: 'fly auth login',
+          });
+        } else {
+          report.checks.push({
+            name: 'real fly',
+            ok: true,
+            detail: `flyctl authed as ${auth.user ?? 'unknown'} — will deploy to Fly`,
+          });
+        }
+      }
+    }
+  } else {
+    report.checks.push({ name: 'real fly', ok: true, detail: 'skipped (--no-real-fly)' });
+  }
+
+  return report;
+}
+
+function renderPreflight(report: PreflightReport): void {
+  process.stdout.write(`${pc.bold('Preflight')}\n`);
+  for (const c of report.checks) {
+    const mark = c.ok ? pc.green('✓') : pc.red('✗');
+    process.stdout.write(`  ${mark} ${c.name.padEnd(18)} ${pc.dim(c.detail)}\n`);
+    if (!c.ok && c.remedy) {
+      process.stdout.write(`    ${pc.yellow('remedy:')} ${c.remedy}\n`);
+    }
+  }
+  process.stdout.write('\n');
+}
+
+function autoFlyAppName(plan: ConvoyPlan): string {
+  const base = plan.target.name.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'convoy-app';
+  const hash = plan.id.slice(0, 6);
+  return `convoy-${base}-${hash}`.slice(0, 30);
 }
 
 async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
@@ -337,8 +553,19 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
   const startedAt = new Date();
   const unsubscribe = attachRenderer(bus, startedAt);
 
+  // Preflight — confirm each real-* stage can actually run. If a hard
+  // prereq is missing and the user didn't opt out, fail with a clear remedy.
+  const preflight = await preflightApply(plan, opts);
+  renderPreflight(preflight);
+  if (preflight.hardFailures.length > 0) {
+    for (const f of preflight.hardFailures) {
+      console.error(pc.red(`✗ ${f}`));
+    }
+    process.exit(2);
+  }
+
   const orchestratorOpts: OrchestratorOpts = {
-    dryRun: !opts.realRehearsal,
+    dryRun: !preflight.realRehearsal,
     autoApprove: opts.autoApprove,
     platformOverride: plan.platform.chosen,
     planId: plan.id,
@@ -354,57 +581,41 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     };
   }
 
-  if (opts.realRehearsal) {
+  if (preflight.realRehearsal) {
     const real = buildRealRehearsalOpts(plan, opts);
-    if (!real) {
-      console.error(pc.red('Could not build a real rehearsal config from this plan — missing start command.'));
-      process.exit(2);
-    }
-    orchestratorOpts.realRehearsal = real;
-    process.stdout.write(
-      `${pc.dim('Real rehearsal:')} ${pc.bold(`${real.startCommand}`)} on port ${real.port}\n`,
-    );
-  }
-
-  if (opts.realAuthor) {
-    if (plan.author.convoyAuthoredFiles.length === 0) {
-      console.error(pc.yellow('--real-author: nothing to author (plan has no Convoy-authored files).'));
-    } else {
-      const method = (opts.mergeMethod === 'merge' || opts.mergeMethod === 'squash' || opts.mergeMethod === 'rebase')
-        ? opts.mergeMethod
-        : 'squash';
-      const realAuthor: RealAuthorOpt = {
-        repoPath: plan.target.localPath,
-        authoredFiles: plan.author.convoyAuthoredFiles.map((f) => ({
-          path: f.path,
-          contentPreview: f.contentPreview,
-          summary: f.summary,
-        })),
-        prTitle: `convoy: deploy plumbing for ${plan.platform.chosen}`,
-        prBody: buildPrBody(plan),
-        mergeOnApproval: opts.autoMerge === true,
-        mergeMethod: method,
-      };
-      orchestratorOpts.realAuthor = realAuthor;
-      process.stdout.write(
-        `${pc.dim('Real author:')} PR against ${pc.bold(plan.target.localPath)} ${opts.autoMerge ? pc.dim(`(auto-merge: ${method})`) : pc.dim('(manual merge)')}\n`,
-      );
+    if (real) {
+      orchestratorOpts.realRehearsal = real;
     }
   }
 
-  if (opts.realFly) {
-    if (plan.platform.chosen !== 'fly') {
-      console.error(
-        pc.red(
-          `--real-fly requires the plan to target fly (this plan picked ${plan.platform.chosen}). Pass --platform=fly during plan or change targets.`,
-        ),
-      );
-      process.exit(2);
-    }
+  if (preflight.realAuthor) {
+    const method = (opts.mergeMethod === 'merge' || opts.mergeMethod === 'squash' || opts.mergeMethod === 'rebase')
+      ? opts.mergeMethod
+      : 'squash';
+    const realAuthor: RealAuthorOpt = {
+      repoPath: plan.target.localPath,
+      authoredFiles: plan.author.convoyAuthoredFiles.map((f) => ({
+        path: f.path,
+        contentPreview: f.contentPreview,
+        summary: f.summary,
+      })),
+      prTitle: `convoy: deploy plumbing for ${plan.platform.chosen}`,
+      prBody: buildPrBody(plan),
+      mergeOnApproval: opts.autoMerge === true,
+      mergeMethod: method,
+    };
+    orchestratorOpts.realAuthor = realAuthor;
+  }
+
+  if (preflight.realFly) {
+    const flyAppName = opts.flyApp ?? autoFlyAppName(plan);
     if (!opts.flyApp) {
-      console.error(pc.red('--real-fly requires --fly-app=<name>.'));
-      process.exit(2);
+      process.stdout.write(
+        `${pc.dim('Fly app name auto-generated:')} ${pc.bold(flyAppName)}\n`,
+      );
     }
+    // Shadow old body with new block (kept under original if-chain so the rest compiles)
+    {
     const strategy = (opts.flyStrategy === 'canary' || opts.flyStrategy === 'rolling' || opts.flyStrategy === 'bluegreen' || opts.flyStrategy === 'immediate')
       ? opts.flyStrategy
       : 'canary';
@@ -412,10 +623,10 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     const secrets = existsSync(secretsPath) ? parseEnvFile(secretsPath) : {};
 
     const realFly: RealFlyOpt = {
-      appName: opts.flyApp,
+      appName: flyAppName,
       cwd: plan.target.localPath,
       strategy,
-      createIfMissing: opts.flyCreateApp === true,
+      createIfMissing: opts.flyCreateApp !== false,
       convoyAuthoredFiles: plan.author.convoyAuthoredFiles.map((f) => f.path),
       thresholdErrorRatePct: 1.0,
       thresholdP99Ms: 1000,
@@ -425,8 +636,9 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     if (Object.keys(secrets).length > 0) realFly.secrets = secrets;
     orchestratorOpts.realFly = realFly;
     process.stdout.write(
-      `${pc.dim('Real Fly deploy:')} ${pc.bold(opts.flyApp)} ${pc.dim(`(strategy: ${strategy}, bake: ${realFly.bakeWindowSeconds}s, secrets: ${Object.keys(secrets).length})`)}\n`,
+      `${pc.dim('Real Fly deploy:')} ${pc.bold(flyAppName)} ${pc.dim(`(strategy: ${strategy}, bake: ${realFly.bakeWindowSeconds}s, secrets: ${Object.keys(secrets).length})`)}\n`,
     );
+    }
   }
 
   const repoUrl = plan.target.repoUrl ?? plan.target.localPath;
@@ -651,13 +863,40 @@ const program = new Command()
   .version('0.0.1');
 
 program
-  .command('ship <repoUrl>')
-  .description('Drive a deployment from repository to production (dry-run only in the scaffold).')
+  .command('ship <target>')
+  .description('Plan + apply end-to-end. Real by default. Accepts a local path or a GitHub URL / owner/repo.')
   .option('--platform <platform>', 'explicit platform choice: fly | railway | vercel | cloudrun')
-  .option('--live', 'run real deploys (not yet supported)')
-  .option('--no-auto-approve', 'wait for external approval decisions instead of auto-approving in dry-run')
-  .action(async (repoUrl: string, options: { platform?: string; live?: boolean; autoApprove: boolean }) => {
-    await runShip(repoUrl, options);
+  .option('--workspace <subdir>', 'target a specific subdirectory (e.g. backend, apps/web)')
+  .option('--no-auto-approve', 'block on approvals; decide them from the web UI')
+  .option('--no-ai', 'skip the Opus narrative pass')
+  .option('--demo', 'scripted pipeline — no PR, no subprocess, no Fly deploy')
+  .option('--no-real-author', 'stub the author stage instead of opening a real PR')
+  .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
+  .option('--no-real-fly', 'stub the deploy stages instead of deploying to Fly')
+  .option('--auto-merge', 'merge the authored PR automatically on approval')
+  .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
+  .option('--fly-app <name>', 'Fly.io app name (auto-generated from target if omitted)')
+  .option('--fly-org <org>', 'Fly.io organization (default: personal)')
+  .option('--no-fly-create-app', 'do NOT create the Fly app if it does not exist')
+  .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate')
+  .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set`')
+  .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds', (v) => Number(v))
+  .option('--env-file <path>', 'env file for --real-rehearsal subprocess')
+  .option(
+    '--probe-path <path>',
+    'probe path for real rehearsal load (repeatable)',
+    (value: string, acc: string[]) => [...acc, value],
+    [] as string[],
+  )
+  .option('--probe-requests <n>', 'number of requests in the real rehearsal probe', (v) => Number(v))
+  .option('--probe-concurrency <n>', 'concurrency', (v) => Number(v))
+  .option('--env <kv>', 'env var to pass to the subprocess, KEY=VALUE (repeatable)', (value: string, acc: Record<string, string>) => {
+    const idx = value.indexOf('=');
+    if (idx > 0) acc[value.slice(0, idx)] = value.slice(idx + 1);
+    return acc;
+  }, {} as Record<string, string>)
+  .action(async (target: string, options: ShipOpts) => {
+    await runShip(target, options);
   });
 
 program
@@ -682,19 +921,20 @@ program
 
 program
   .command('apply <planId>')
-  .description('Execute a saved plan. Reads .convoy/plans/<planId>.json and runs the pipeline.')
+  .description('Execute a saved plan. Real by default — opens a real PR, rehearses locally, deploys to Fly. Use --demo for a scripted pipeline.')
   .option('--no-auto-approve', 'wait for external approval decisions instead of auto-approving')
-  .option('--real-author', 'open a real PR against the target\'s GitHub repo (requires gh auth + write access)')
-  .option('--auto-merge', 'when --real-author is set, merge the PR automatically on approval (otherwise waits for manual merge)')
+  .option('--demo', 'scripted pipeline (no PR, no subprocess, no Fly deploy)')
+  .option('--no-real-author', 'stub the author stage instead of opening a real PR')
+  .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
+  .option('--no-real-fly', 'stub the deploy stages instead of deploying to Fly')
+  .option('--auto-merge', 'merge the authored PR automatically on approval (default: wait for manual merge)')
   .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
-  .option('--real-fly', 'deploy to Fly.io for real — canary/promote/observe stages call flyctl')
-  .option('--fly-app <name>', 'Fly.io app name (required with --real-fly)')
+  .option('--fly-app <name>', 'Fly.io app name (auto-generated from target if omitted)')
   .option('--fly-org <org>', 'Fly.io organization (default: personal)')
-  .option('--fly-create-app', 'create the Fly app if it does not exist')
+  .option('--no-fly-create-app', 'do NOT create the Fly app if it does not exist (default: create)')
   .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate (default: canary)')
   .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set` (default: <target>/.env.convoy-secrets)')
   .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds (default: 60)', (v) => Number(v))
-  .option('--real-rehearsal', 'run the target locally as a subprocess, probe real metrics, feed real logs to medic')
   .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary (triggers medic with fixture logs)')
   .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
   .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
