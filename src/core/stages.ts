@@ -1,4 +1,12 @@
 import type { ConvoyBus } from './bus.js';
+import {
+  createPrFromAuthoredFiles,
+  detectRepo,
+  gitHubAuthStatus,
+  mergePr,
+  prStatus,
+  type GitRepoContext,
+} from './github-runner.js';
 import { diagnose } from './medic.js';
 import { RehearsalRunner, type MetricsSnapshot } from './rehearsal-runner.js';
 import type { RunStateStore } from './state.js';
@@ -19,6 +27,16 @@ export interface OrchestratorOpts {
   injectFailure?: InjectFailureOpt;
   planId?: string | null;
   realRehearsal?: RealRehearsalOpt;
+  realAuthor?: RealAuthorOpt;
+}
+
+export interface RealAuthorOpt {
+  repoPath: string;
+  authoredFiles: { path: string; contentPreview: string; summary?: string }[];
+  prTitle: string;
+  prBody: string;
+  mergeOnApproval: boolean;
+  mergeMethod?: 'merge' | 'squash' | 'rebase';
 }
 
 export interface RealRehearsalOpt {
@@ -193,6 +211,10 @@ export class AuthorStage extends BaseStage {
   readonly name = 'author' as const;
 
   override async run(ctx: StageContext): Promise<unknown> {
+    if (ctx.opts.realAuthor) {
+      return this.#runReal(ctx, ctx.opts.realAuthor);
+    }
+
     this.emit(ctx, 'started', {});
     await this.sleep(1200, ctx.signal);
 
@@ -208,6 +230,92 @@ export class AuthorStage extends BaseStage {
     });
 
     const result = { pr_url: prUrl, files, merged: true };
+    this.emit(ctx, 'finished', result);
+    return result;
+  }
+
+  async #runReal(ctx: StageContext, cfg: RealAuthorOpt): Promise<unknown> {
+    this.emit(ctx, 'started', { mode: 'real-github', repo_path: cfg.repoPath });
+
+    const repo = await detectRepo(cfg.repoPath);
+    if (!repo) {
+      throw new Error(
+        `real-author requires ${cfg.repoPath} to be a git repo with a github.com remote. ` +
+          `Found no .git directory there or no parseable GitHub origin.`,
+      );
+    }
+
+    this.emit(ctx, 'progress', {
+      phase: 'git.detected',
+      owner: repo.owner,
+      repo: repo.repo,
+      default_branch: repo.defaultBranch,
+    });
+
+    const auth = await gitHubAuthStatus();
+    if (!auth.ok) {
+      throw new Error(
+        `gh is not authenticated (${auth.error ?? 'unknown'}). Run: gh auth login`,
+      );
+    }
+    this.emit(ctx, 'progress', { phase: 'gh.authenticated', user: auth.user, scopes: auth.scopes });
+
+    let pr;
+    try {
+      pr = await createPrFromAuthoredFiles(
+        repo,
+        ctx.run.id,
+        cfg.authoredFiles.map((f) => ({ path: f.path, contentPreview: f.contentPreview })),
+        cfg.prTitle,
+        cfg.prBody,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`PR creation failed: ${message}`);
+    }
+
+    this.emit(ctx, 'progress', {
+      phase: 'pr.opened',
+      pr_url: pr.prUrl,
+      pr_number: pr.prNumber,
+      branch: pr.branch,
+      files: cfg.authoredFiles.map((f) => f.path),
+    });
+
+    await this.awaitApproval(ctx, 'merge_pr', {
+      pr_url: pr.prUrl,
+      pr_number: pr.prNumber,
+      branch: pr.branch,
+      files: cfg.authoredFiles.map((f) => f.path),
+      note: 'Only Convoy-authored deployment files were committed. Source code is untouched.',
+    });
+
+    if (cfg.mergeOnApproval) {
+      this.emit(ctx, 'progress', { phase: 'pr.merging' });
+      const merge = await mergePr(pr.prUrl, { method: cfg.mergeMethod ?? 'squash' });
+      if (!merge.ok) {
+        throw new Error(`PR merge failed: ${merge.error ?? 'unknown'}`);
+      }
+      this.emit(ctx, 'progress', { phase: 'pr.merged' });
+    } else {
+      // Poll until someone merges or closes the PR manually.
+      const deadline = Date.now() + 10 * 60 * 1000;
+      while (Date.now() < deadline) {
+        if (ctx.signal.aborted) throw new Error('aborted');
+        const status = await prStatus(pr.prUrl);
+        if (status === 'merged') break;
+        if (status === 'closed') throw new Error('PR was closed without merging');
+        await this.sleep(5000);
+      }
+    }
+
+    const result = {
+      pr_url: pr.prUrl,
+      pr_number: pr.prNumber,
+      branch: pr.branch,
+      files: cfg.authoredFiles.map((f) => f.path),
+      merged: true,
+    };
     this.emit(ctx, 'finished', result);
     return result;
   }
