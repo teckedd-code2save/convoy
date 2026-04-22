@@ -662,24 +662,35 @@ export class PromoteStage extends BaseStage {
 
     const hostname = `${cfg.appName}.fly.dev`;
     const healthPath = cfg.healthPath ?? '/health';
-    const verifyWindowMs = 10_000;
+    const verifyWindowMs = 20_000;
+    const probeTimeoutMs = 5_000;
     const deadline = Date.now() + verifyWindowMs;
+    const latencies: number[] = [];
     let consecutive = 0;
+    let lastFailure: { status?: number; error?: string } | null = null;
     while (Date.now() < deadline && consecutive < 3) {
-      const h = await flyHealthCheck(hostname, healthPath);
+      const h = await flyHealthCheck(hostname, healthPath, probeTimeoutMs);
+      if (h.latencyMs !== undefined) latencies.push(h.latencyMs);
       this.emit(ctx, 'progress', {
         phase: 'fly.health_probe',
         status: h.status ?? 0,
         latency_ms: h.latencyMs,
         ok: h.ok,
       });
-      if (h.ok) consecutive += 1;
-      else consecutive = 0;
+      if (h.ok) {
+        consecutive += 1;
+      } else {
+        consecutive = 0;
+        lastFailure = { ...(h.status !== undefined && { status: h.status }), ...(h.error !== undefined && { error: h.error }) };
+      }
       await this.sleep(1500, ctx.signal);
     }
 
     if (consecutive < 3) {
-      throw new Error(`promote verification failed: ${healthPath} did not return 200 three times in a row`);
+      const reason = lastFailure
+        ? `${healthPath} did not pass (last probe: status=${lastFailure.status ?? 0}${lastFailure.error ? `, error=${lastFailure.error}` : ''})`
+        : `${healthPath} did not return 200 three times in a row within ${verifyWindowMs}ms`;
+      return triggerRealFlyRollback(ctx, cfg, reason, 'promote');
     }
 
     const liveUrl = `https://${hostname}`;
@@ -693,11 +704,43 @@ export class PromoteStage extends BaseStage {
     const result = {
       live_url: liveUrl,
       hostname,
+      p99_ms: percentile(latencies, 0.99),
       ...(currentVersion !== undefined && { release_version: currentVersion }),
     };
-    this.emit(ctx, 'finished', result);
+    this.emit(ctx, 'finished', result as unknown as Record<string, unknown>);
     return result;
   }
+}
+
+/**
+ * Shared rollback helper invoked by promote and observe stages when they
+ * detect a breach. Emits phases, calls flyRollback, updates run status to
+ * rolled_back, and throws so the orchestrator records a clean failure.
+ */
+async function triggerRealFlyRollback(
+  ctx: StageContext,
+  cfg: RealFlyOpt,
+  reason: string,
+  firedBy: 'promote' | 'observe',
+): Promise<never> {
+  const emit = (kind: EventKind, payload: unknown): void => {
+    const event = ctx.store.appendEvent(ctx.run.id, firedBy, kind, payload);
+    ctx.bus.emit({ type: 'event.appended', event });
+  };
+  emit('progress', { phase: 'rollback.starting', reason });
+  const result = await flyRollback(cfg.appName);
+  if (!result.ok) {
+    emit('progress', { phase: 'rollback.failed', error: result.error });
+    throw new Error(`${firedBy} breach AND rollback failed: ${result.error}`);
+  }
+  emit('progress', {
+    phase: 'rollback.done',
+    restored_version: result.restoredVersion,
+  });
+  ctx.store.updateRun(ctx.run.id, { status: 'rolled_back', completedAt: new Date() });
+  const updated = ctx.store.getRun(ctx.run.id);
+  if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
+  throw new Error(`${firedBy} breach (${reason}) triggered rollback`);
 }
 
 export class ObserveStage extends BaseStage {
@@ -800,20 +843,7 @@ export class ObserveStage extends BaseStage {
   }
 
   async #triggerRollback(ctx: StageContext, cfg: RealFlyOpt, reason: string): Promise<unknown> {
-    this.emit(ctx, 'progress', { phase: 'rollback.starting', reason });
-    const result = await flyRollback(cfg.appName);
-    if (!result.ok) {
-      this.emit(ctx, 'progress', { phase: 'rollback.failed', error: result.error });
-      throw new Error(`observe breach AND rollback failed: ${result.error}`);
-    }
-    this.emit(ctx, 'progress', {
-      phase: 'rollback.done',
-      restored_version: result.restoredVersion,
-    });
-    ctx.store.updateRun(ctx.run.id, { status: 'rolled_back', completedAt: new Date() });
-    const updated = ctx.store.getRun(ctx.run.id);
-    if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
-    throw new Error(`observe breach (${reason}) triggered rollback`);
+    return triggerRealFlyRollback(ctx, cfg, reason, 'observe');
   }
 }
 

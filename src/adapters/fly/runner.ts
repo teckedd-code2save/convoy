@@ -214,7 +214,7 @@ function extractHostname(text: string): string | null {
 }
 
 export async function flyListReleases(appName: string): Promise<FlyRelease[]> {
-  const res = await runFlyctl(['releases', '--app', appName, '--json'], {
+  const res = await runFlyctl(['releases', '--image', '--json', '--app', appName], {
     timeoutMs: 15000,
     allowFailure: true,
   });
@@ -224,7 +224,11 @@ export async function flyListReleases(appName: string): Promise<FlyRelease[]> {
     return parsed.map((row) => ({
       version: Number(row['Version'] ?? row['version'] ?? 0),
       status: String(row['Status'] ?? row['status'] ?? 'unknown'),
-      image: typeof row['Image'] === 'string' ? row['Image'] : undefined,
+      image: typeof row['ImageRef'] === 'string'
+        ? row['ImageRef']
+        : typeof row['Image'] === 'string'
+          ? row['Image']
+          : undefined,
       createdAt: typeof row['CreatedAt'] === 'string' ? row['CreatedAt'] : undefined,
       description: typeof row['Description'] === 'string' ? row['Description'] : undefined,
     }));
@@ -233,18 +237,51 @@ export async function flyListReleases(appName: string): Promise<FlyRelease[]> {
   }
 }
 
+/**
+ * Rollback by redeploying a previous release's image. Modern flyctl has no
+ * \`fly releases rollback\` subcommand; the supported path is to `fly deploy
+ * --image <ref>` with the image from a prior release. We use --strategy
+ * immediate so the restored image swaps in fast rather than going through
+ * a canary progression.
+ *
+ * Default target: the release immediately before the current one. Pass
+ * targetVersion to restore a specific release (usually the last known-healthy
+ * version when chaining through several broken deploys).
+ */
 export async function flyRollback(
   appName: string,
   targetVersion?: number,
 ): Promise<{ ok: boolean; restoredVersion?: number; error?: string }> {
-  const args = ['releases', 'rollback', '--app', appName, '--yes'];
-  if (targetVersion !== undefined) args.push(String(targetVersion));
   try {
-    const res = await runFlyctl(args, { timeoutMs: 5 * 60 * 1000 });
-    const match = (res.stdout + res.stderr).match(/v(\d+)/i);
-    const result: { ok: boolean; restoredVersion?: number; error?: string } = { ok: true };
-    if (match && match[1]) result.restoredVersion = Number(match[1]);
-    return result;
+    const releases = await flyListReleases(appName);
+    if (releases.length === 0) {
+      return { ok: false, error: 'no releases found for app' };
+    }
+
+    // Releases come back newest-first.
+    const current = releases[0];
+    const target =
+      targetVersion !== undefined
+        ? releases.find((r) => r.version === targetVersion)
+        : releases.find((r) => r.version < (current?.version ?? 0) && r.status === 'complete');
+
+    if (!target) {
+      return {
+        ok: false,
+        error: targetVersion !== undefined
+          ? `release v${targetVersion} not found for ${appName}`
+          : `no prior complete release found for ${appName}`,
+      };
+    }
+    if (!target.image) {
+      return { ok: false, error: `release v${target.version} has no image reference` };
+    }
+
+    await runFlyctl(
+      ['deploy', '--image', target.image, '--app', appName, '--strategy', 'immediate', '--yes'],
+      { timeoutMs: 5 * 60 * 1000 },
+    );
+    return { ok: true, restoredVersion: target.version };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
