@@ -1,0 +1,35 @@
+{
+  "$schema": "https://claude.ai/plugin/mcp.schema.json",
+  "mcpServers": {
+    "convoy-state": {
+      "description": "Read-only access to Convoy's run state database for the orchestrator, medic, and correlator agents. Implementation pending — this is a manifest stub.",
+      "command": "node",
+      "args": ["../src/mcp/state-server.js"],
+      "planned": true
+    },
+    "convoy-fly": {
+      "description": "Fly.io adapter — deploy, ephemeral, rollback, logs, health. Implementation pending.",
+      "command": "node",
+      "args": ["../src/mcp/fly-server.js"],
+      "planned": true
+    },
+    "convoy-railway": {
+      "description": "Railway adapter — deploy, preview environments, rollback, logs, health. Implementation pending.",
+      "command": "node",
+      "args": ["../src/mcp/railway-server.js"],
+      "planned": true
+    },
+    "convoy-vercel": {
+      "description": "Vercel adapter — preview, promote, alias rollback, logs. Implementation pending.",
+      "command": "node",
+      "args": ["../src/mcp/vercel-server.js"],
+      "planned": true
+    },
+    "convoy-cloudrun": {
+      "description": "Google Cloud Run adapter — revisions, traffic splits, rollback, logs. Implementation pending.",
+      "command": "node",
+      "args": ["../src/mcp/cloudrun-server.js"],
+      "planned": true
+    }
+  }
+}
