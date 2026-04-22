@@ -14,7 +14,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "convoy": "tsx src/cli.ts"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
@@ -23,6 +24,8 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
-    "better-sqlite3": "^12.9.0"
+    "better-sqlite3": "^12.9.0",
+    "commander": "^14.0.3",
+    "picocolors": "^1.1.1"
   }
 }
