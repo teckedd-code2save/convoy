@@ -1,4 +1,5 @@
 import type { ConvoyBus } from './bus.js';
+import { diagnose } from './medic.js';
 import type { RunStateStore } from './state.js';
 import type {
   Approval,
@@ -14,7 +15,16 @@ export interface OrchestratorOpts {
   dryRun: boolean;
   platformOverride?: Platform;
   autoApprove?: boolean;
+  injectFailure?: InjectFailureOpt;
 }
+
+export type InjectFailureOpt = {
+  stage: 'rehearse' | 'canary';
+  kind: 'latency' | 'error-rate' | 'build';
+  logsPath?: string;
+  repoPath?: string;
+  convoyAuthoredFiles?: string[];
+};
 
 export interface StageContext {
   run: Run;
@@ -185,7 +195,7 @@ export class RehearseStage extends BaseStage {
   override async run(ctx: StageContext): Promise<unknown> {
     this.emit(ctx, 'started', {});
     this.emit(ctx, 'progress', { phase: 'ephemeral.creating' });
-    await this.sleep(1400, ctx.signal);
+    await this.sleep(1200, ctx.signal);
 
     const ephemeralUrl = `https://convoy-rehearsal-${ctx.run.id.slice(0, 6)}.fly.dev`;
     this.emit(ctx, 'progress', { phase: 'ephemeral.ready', url: ephemeralUrl });
@@ -193,6 +203,37 @@ export class RehearseStage extends BaseStage {
 
     this.emit(ctx, 'progress', { phase: 'smoke_tests.passed', count: 8 });
     await this.sleep(500, ctx.signal);
+
+    const inject = ctx.opts.injectFailure;
+    if (inject && inject.stage === 'rehearse') {
+      this.emit(ctx, 'progress', {
+        phase: 'synthetic_load.breach',
+        p99_ms: 494,
+        error_rate_pct: 6.67,
+        threshold_error_rate_pct: 1.0,
+      });
+      await this.sleep(300, ctx.signal);
+
+      const logs = await loadInjectedLogs(inject);
+
+      this.emit(ctx, 'progress', { phase: 'medic.invoked' });
+
+      const diagnosis = await diagnose({
+        stage: 'rehearse',
+        phase: 'synthetic_load',
+        repoPath: inject.repoPath ?? '.',
+        convoyAuthoredFiles: inject.convoyAuthoredFiles ?? [],
+        logs,
+        metrics: { p99_ms: 494, p95_ms: 410, error_rate_pct: 6.67, count: 90 },
+        errorMessage: 'synthetic load breached error-rate tolerance (6.67% > 1%)',
+      });
+
+      this.emit(ctx, 'diagnosis', diagnosis);
+      this.emit(ctx, 'progress', { phase: 'ephemeral.destroying' });
+      await this.sleep(300, ctx.signal);
+
+      throw new RehearsalBreachError(diagnosis);
+    }
 
     this.emit(ctx, 'progress', { phase: 'synthetic_load.passed', p99_ms: 142 });
     await this.sleep(400, ctx.signal);
@@ -210,6 +251,39 @@ export class RehearseStage extends BaseStage {
     this.emit(ctx, 'finished', result);
     return result;
   }
+}
+
+export class RehearsalBreachError extends Error {
+  constructor(public readonly diagnosis: unknown) {
+    super('rehearsal breached tolerance — medic produced a diagnosis');
+    this.name = 'RehearsalBreachError';
+  }
+}
+
+async function loadInjectedLogs(inject: InjectFailureOpt): Promise<string[]> {
+  if (!inject.logsPath) return defaultBuggyLogs();
+  try {
+    const { readFileSync } = await import('node:fs');
+    return readFileSync(inject.logsPath, 'utf8').split('\n').filter(Boolean);
+  } catch {
+    return defaultBuggyLogs();
+  }
+}
+
+function defaultBuggyLogs(): string[] {
+  const now = new Date().toISOString();
+  return [
+    `{"ts":"${now}","level":"info","message":"server_started","port":8080,"mode":"production"}`,
+    `{"ts":"${now}","level":"info","message":"orders_served","count":20,"page":1,"pageSize":20,"latency_ms":14}`,
+    `{"ts":"${now}","level":"info","message":"orders_served","count":20,"page":2,"pageSize":20,"latency_ms":12}`,
+    `{"ts":"${now}","level":"info","message":"orders_served","count":20,"page":3,"pageSize":20,"latency_ms":15}`,
+    `{"ts":"${now}","level":"error","message":"orders_query_timeout","latency_ms":474,"endpoint":"/orders","page":1,"pageSize":20,"note":"downstream orders-db call exceeded deadline"}`,
+    `{"ts":"${now}","level":"info","message":"orders_served","count":20,"page":4,"pageSize":20,"latency_ms":13}`,
+    `{"ts":"${now}","level":"info","message":"orders_served","count":20,"page":5,"pageSize":20,"latency_ms":18}`,
+    `{"ts":"${now}","level":"error","message":"orders_query_timeout","latency_ms":492,"endpoint":"/orders","page":2,"pageSize":20,"note":"downstream orders-db call exceeded deadline"}`,
+    `{"ts":"${now}","level":"info","message":"orders_served","count":20,"page":6,"pageSize":20,"latency_ms":14}`,
+    `{"ts":"${now}","level":"error","message":"orders_query_timeout","latency_ms":461,"endpoint":"/orders","page":3,"pageSize":20,"note":"downstream orders-db call exceeded deadline"}`,
+  ];
 }
 
 export class CanaryStage extends BaseStage {

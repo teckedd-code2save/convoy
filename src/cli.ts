@@ -250,7 +250,10 @@ function startThinking(): { stop: () => void } {
   };
 }
 
-async function runApply(planId: string, opts: { autoApprove: boolean }): Promise<void> {
+async function runApply(
+  planId: string,
+  opts: { autoApprove: boolean; injectFailure?: string; logs?: string },
+): Promise<void> {
   const plans = new PlanStore(PLANS_DIR);
   const plan = resolvePlan(plans, planId);
 
@@ -288,6 +291,16 @@ async function runApply(planId: string, opts: { autoApprove: boolean }): Promise
     autoApprove: opts.autoApprove,
     platformOverride: plan.platform.chosen,
   };
+
+  if (opts.injectFailure === 'rehearse' || opts.injectFailure === 'canary') {
+    orchestratorOpts.injectFailure = {
+      stage: opts.injectFailure,
+      kind: 'error-rate',
+      repoPath: plan.target.localPath,
+      convoyAuthoredFiles: plan.author.convoyAuthoredFiles.map((f) => f.path),
+      ...(opts.logs !== undefined && { logsPath: opts.logs }),
+    };
+  }
 
   const repoUrl = plan.target.repoUrl ?? plan.target.localPath;
   try {
@@ -441,7 +454,9 @@ program
   .command('apply <planId>')
   .description('Execute a saved plan. Reads .convoy/plans/<planId>.json and runs the pipeline.')
   .option('--no-auto-approve', 'wait for external approval decisions instead of auto-approving')
-  .action(async (planId: string, options: { autoApprove: boolean }) => {
+  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary (triggers medic with real logs)')
+  .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
+  .action(async (planId: string, options: { autoApprove: boolean; injectFailure?: string; logs?: string }) => {
     await runApply(planId, options);
   });
 

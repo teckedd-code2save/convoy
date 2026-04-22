@@ -18,5 +18,8 @@ export {
   PromoteStage,
   ObserveStage,
   ApprovalRejectedError,
+  RehearsalBreachError,
 } from './core/stages.js';
-export type { Stage, StageContext, OrchestratorOpts } from './core/stages.js';
+export type { Stage, StageContext, OrchestratorOpts, InjectFailureOpt } from './core/stages.js';
+export { diagnose } from './core/medic.js';
+export type { Diagnosis, DiagnosisInput, DiagnosisFix } from './core/medic.js';
