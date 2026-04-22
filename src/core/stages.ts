@@ -1,3 +1,14 @@
+import {
+  flyAppExists,
+  flyAuthStatus,
+  flyCreateApp,
+  flyctlAvailable,
+  flyDeploy,
+  flyHealthCheck,
+  flyListReleases,
+  flyRollback,
+  flySetSecrets,
+} from '../adapters/fly/runner.js';
 import type { ConvoyBus } from './bus.js';
 import {
   createPrFromAuthoredFiles,
@@ -28,6 +39,7 @@ export interface OrchestratorOpts {
   planId?: string | null;
   realRehearsal?: RealRehearsalOpt;
   realAuthor?: RealAuthorOpt;
+  realFly?: RealFlyOpt;
 }
 
 export interface RealAuthorOpt {
@@ -37,6 +49,20 @@ export interface RealAuthorOpt {
   prBody: string;
   mergeOnApproval: boolean;
   mergeMethod?: 'merge' | 'squash' | 'rebase';
+}
+
+export interface RealFlyOpt {
+  appName: string;
+  cwd: string;
+  org?: string;
+  createIfMissing?: boolean;
+  strategy?: 'canary' | 'rolling' | 'bluegreen' | 'immediate';
+  secrets?: Record<string, string>;
+  healthPath?: string;
+  bakeWindowSeconds?: number;
+  thresholdErrorRatePct?: number;
+  thresholdP99Ms?: number;
+  convoyAuthoredFiles?: string[];
 }
 
 export interface RealRehearsalOpt {
@@ -487,6 +513,10 @@ export class CanaryStage extends BaseStage {
   readonly name = 'canary' as const;
 
   override async run(ctx: StageContext): Promise<unknown> {
+    if (ctx.opts.realFly) {
+      return this.#runRealFly(ctx, ctx.opts.realFly);
+    }
+
     this.emit(ctx, 'started', {});
 
     await this.awaitApproval(ctx, 'promote', {
@@ -511,12 +541,101 @@ export class CanaryStage extends BaseStage {
     this.emit(ctx, 'finished', result);
     return result;
   }
+
+  async #runRealFly(ctx: StageContext, cfg: RealFlyOpt): Promise<unknown> {
+    this.emit(ctx, 'started', { mode: 'real-fly', app: cfg.appName, strategy: cfg.strategy ?? 'canary' });
+
+    const available = await flyctlAvailable();
+    if (!available) {
+      throw new Error(
+        'flyctl is not installed. Install it first: `curl -L https://fly.io/install.sh | sh`',
+      );
+    }
+    const auth = await flyAuthStatus();
+    if (!auth.ok) {
+      throw new Error(`flyctl not authenticated: ${auth.error ?? 'unknown'}. Run: fly auth login`);
+    }
+    this.emit(ctx, 'progress', { phase: 'fly.authenticated', user: auth.user });
+
+    const exists = await flyAppExists(cfg.appName);
+    if (!exists) {
+      if (!cfg.createIfMissing) {
+        throw new Error(
+          `Fly app "${cfg.appName}" does not exist. Create it first (fly apps create ${cfg.appName}) or pass --fly-create-app.`,
+        );
+      }
+      this.emit(ctx, 'progress', { phase: 'fly.creating', app: cfg.appName, org: cfg.org ?? 'personal' });
+      await flyCreateApp(cfg.appName, cfg.org);
+      this.emit(ctx, 'progress', { phase: 'fly.created' });
+    }
+
+    if (cfg.secrets && Object.keys(cfg.secrets).length > 0) {
+      this.emit(ctx, 'progress', { phase: 'secrets.staging', count: Object.keys(cfg.secrets).length });
+      await flySetSecrets(cfg.appName, cfg.secrets);
+      this.emit(ctx, 'progress', { phase: 'secrets.staged' });
+    }
+
+    await this.awaitApproval(ctx, 'promote', {
+      app: cfg.appName,
+      strategy: cfg.strategy ?? 'canary',
+      note: `Rehearsal clean. Deploy to Fly app "${cfg.appName}" using ${cfg.strategy ?? 'canary'} strategy?`,
+    });
+
+    const preReleases = await flyListReleases(cfg.appName);
+    const previousVersion = preReleases[0]?.version;
+    if (previousVersion !== undefined) {
+      this.emit(ctx, 'progress', { phase: 'rollback.prestaged', previous_version: previousVersion });
+    }
+
+    this.emit(ctx, 'progress', { phase: 'fly.deploying', strategy: cfg.strategy ?? 'canary' });
+
+    const deployResult = await flyDeploy(cfg.appName, cfg.cwd, {
+      strategy: cfg.strategy ?? 'canary',
+      remoteOnly: true,
+      onLog: (line) => {
+        if (/error|failed|panic/i.test(line)) {
+          this.emit(ctx, 'log', { line });
+        }
+      },
+    });
+
+    if (!deployResult.ok) {
+      this.emit(ctx, 'progress', { phase: 'fly.deploy_failed', error: deployResult.error });
+      const diagnosis = await diagnose({
+        stage: 'canary',
+        phase: 'fly_deploy',
+        repoPath: cfg.cwd,
+        convoyAuthoredFiles: cfg.convoyAuthoredFiles ?? [],
+        logs: deployResult.logs,
+        errorMessage: deployResult.error ?? 'fly deploy failed',
+      });
+      this.emit(ctx, 'diagnosis', diagnosis);
+      throw new Error(`Fly deploy failed: ${deployResult.error}`);
+    }
+
+    const hostname = deployResult.hostname ?? `${cfg.appName}.fly.dev`;
+    this.emit(ctx, 'progress', { phase: 'fly.deployed', hostname });
+
+    const result = {
+      healthy: true,
+      strategy: cfg.strategy ?? 'canary',
+      hostname,
+      app: cfg.appName,
+      ...(previousVersion !== undefined && { previous_version: previousVersion }),
+    };
+    this.emit(ctx, 'finished', result);
+    return result;
+  }
 }
 
 export class PromoteStage extends BaseStage {
   readonly name = 'promote' as const;
 
   override async run(ctx: StageContext): Promise<unknown> {
+    if (ctx.opts.realFly) {
+      return this.#runRealFly(ctx, ctx.opts.realFly);
+    }
+
     this.emit(ctx, 'started', {});
 
     for (const pct of [10, 25, 50, 100]) {
@@ -533,12 +652,62 @@ export class PromoteStage extends BaseStage {
     this.emit(ctx, 'finished', result);
     return result;
   }
+
+  async #runRealFly(ctx: StageContext, cfg: RealFlyOpt): Promise<unknown> {
+    // Fly's canary strategy already rolled out to all machines inside the
+    // CanaryStage. PromoteStage just verifies the live hostname for a short
+    // window — this is the earliest moment we can say users are served the
+    // new image.
+    this.emit(ctx, 'started', { mode: 'real-fly', phase: 'verify-live' });
+
+    const hostname = `${cfg.appName}.fly.dev`;
+    const healthPath = cfg.healthPath ?? '/health';
+    const verifyWindowMs = 10_000;
+    const deadline = Date.now() + verifyWindowMs;
+    let consecutive = 0;
+    while (Date.now() < deadline && consecutive < 3) {
+      const h = await flyHealthCheck(hostname, healthPath);
+      this.emit(ctx, 'progress', {
+        phase: 'fly.health_probe',
+        status: h.status ?? 0,
+        latency_ms: h.latencyMs,
+        ok: h.ok,
+      });
+      if (h.ok) consecutive += 1;
+      else consecutive = 0;
+      await this.sleep(1500, ctx.signal);
+    }
+
+    if (consecutive < 3) {
+      throw new Error(`promote verification failed: ${healthPath} did not return 200 three times in a row`);
+    }
+
+    const liveUrl = `https://${hostname}`;
+    ctx.store.updateRun(ctx.run.id, { liveUrl });
+    const updated = ctx.store.getRun(ctx.run.id);
+    if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
+
+    const releases = await flyListReleases(cfg.appName);
+    const currentVersion = releases[0]?.version;
+
+    const result = {
+      live_url: liveUrl,
+      hostname,
+      ...(currentVersion !== undefined && { release_version: currentVersion }),
+    };
+    this.emit(ctx, 'finished', result);
+    return result;
+  }
 }
 
 export class ObserveStage extends BaseStage {
   readonly name = 'observe' as const;
 
   override async run(ctx: StageContext): Promise<unknown> {
+    if (ctx.opts.realFly) {
+      return this.#runRealFly(ctx, ctx.opts.realFly);
+    }
+
     this.emit(ctx, 'started', { bake_window_seconds: 2 });
     await this.sleep(2000, ctx.signal);
 
@@ -550,6 +719,93 @@ export class ObserveStage extends BaseStage {
     this.emit(ctx, 'finished', result);
     return result;
   }
+
+  async #runRealFly(ctx: StageContext, cfg: RealFlyOpt): Promise<unknown> {
+    const window = cfg.bakeWindowSeconds ?? 60;
+    this.emit(ctx, 'started', { bake_window_seconds: window });
+
+    const hostname = `${cfg.appName}.fly.dev`;
+    const healthPath = cfg.healthPath ?? '/health';
+    const thresholdErrorRatePct = cfg.thresholdErrorRatePct ?? 1.0;
+    const thresholdP99Ms = cfg.thresholdP99Ms ?? 1000;
+
+    const probeEveryMs = 2000;
+    const deadline = Date.now() + window * 1000;
+    let probeCount = 0;
+    let errors = 0;
+    const latencies: number[] = [];
+
+    while (Date.now() < deadline) {
+      if (ctx.signal.aborted) throw new Error('aborted');
+      const h = await flyHealthCheck(hostname, healthPath);
+      probeCount += 1;
+      if (!h.ok) errors += 1;
+      if (h.latencyMs !== undefined) latencies.push(h.latencyMs);
+
+      const errorRatePct = (errors / probeCount) * 100;
+      const p99 = percentile(latencies, 0.99);
+      this.emit(ctx, 'progress', {
+        phase: 'observe.probe',
+        probe_count: probeCount,
+        error_rate_pct: Number(errorRatePct.toFixed(2)),
+        p99_ms: p99,
+        ok: h.ok,
+      });
+
+      if (probeCount >= 5 && errorRatePct > thresholdErrorRatePct) {
+        this.emit(ctx, 'progress', {
+          phase: 'observe.breach',
+          reason: `error rate ${errorRatePct.toFixed(2)}% exceeded ${thresholdErrorRatePct}%`,
+        });
+        return this.#triggerRollback(ctx, cfg, `error rate ${errorRatePct.toFixed(2)}% > ${thresholdErrorRatePct}%`);
+      }
+      if (p99 !== undefined && p99 > thresholdP99Ms) {
+        this.emit(ctx, 'progress', {
+          phase: 'observe.breach',
+          reason: `p99 ${p99}ms exceeded ${thresholdP99Ms}ms`,
+        });
+        return this.#triggerRollback(ctx, cfg, `p99 ${p99}ms > ${thresholdP99Ms}ms`);
+      }
+
+      await this.sleep(probeEveryMs, ctx.signal);
+    }
+
+    const p99 = percentile(latencies, 0.99);
+    const errorRatePct = probeCount === 0 ? 0 : (errors / probeCount) * 100;
+    const result = {
+      window_seconds: window,
+      slo_healthy: true,
+      probe_count: probeCount,
+      error_rate_pct: Number(errorRatePct.toFixed(2)),
+      p99_ms: p99,
+    };
+    this.emit(ctx, 'finished', result as unknown as Record<string, unknown>);
+    return result;
+  }
+
+  async #triggerRollback(ctx: StageContext, cfg: RealFlyOpt, reason: string): Promise<unknown> {
+    this.emit(ctx, 'progress', { phase: 'rollback.starting', reason });
+    const result = await flyRollback(cfg.appName);
+    if (!result.ok) {
+      this.emit(ctx, 'progress', { phase: 'rollback.failed', error: result.error });
+      throw new Error(`observe breach AND rollback failed: ${result.error}`);
+    }
+    this.emit(ctx, 'progress', {
+      phase: 'rollback.done',
+      restored_version: result.restoredVersion,
+    });
+    ctx.store.updateRun(ctx.run.id, { status: 'rolled_back', completedAt: new Date() });
+    const updated = ctx.store.getRun(ctx.run.id);
+    if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
+    throw new Error(`observe breach (${reason}) triggered rollback`);
+  }
+}
+
+function percentile(latencies: number[], q: number): number | undefined {
+  if (latencies.length === 0) return undefined;
+  const sorted = [...latencies].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * q));
+  return sorted[idx];
 }
 
 export function defaultStages(): Stage[] {

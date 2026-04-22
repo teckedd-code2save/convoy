@@ -13,6 +13,7 @@ import {
   defaultStages,
   type OrchestratorOpts,
   type RealAuthorOpt,
+  type RealFlyOpt,
   type RealRehearsalOpt,
 } from './core/stages.js';
 import { RunStateStore } from './core/state.js';
@@ -271,6 +272,13 @@ interface ApplyOpts {
   realAuthor?: boolean;
   autoMerge?: boolean;
   mergeMethod?: string;
+  realFly?: boolean;
+  flyApp?: string;
+  flyOrg?: string;
+  flyCreateApp?: boolean;
+  flyStrategy?: string;
+  flySecretsFile?: string;
+  flyBakeWindow?: number;
   injectFailure?: string;
   logs?: string;
   envFile?: string;
@@ -366,6 +374,43 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
         `${pc.dim('Real author:')} PR against ${pc.bold(plan.target.localPath)} ${opts.autoMerge ? pc.dim(`(auto-merge: ${method})`) : pc.dim('(manual merge)')}\n`,
       );
     }
+  }
+
+  if (opts.realFly) {
+    if (plan.platform.chosen !== 'fly') {
+      console.error(
+        pc.red(
+          `--real-fly requires the plan to target fly (this plan picked ${plan.platform.chosen}). Pass --platform=fly during plan or change targets.`,
+        ),
+      );
+      process.exit(2);
+    }
+    if (!opts.flyApp) {
+      console.error(pc.red('--real-fly requires --fly-app=<name>.'));
+      process.exit(2);
+    }
+    const strategy = (opts.flyStrategy === 'canary' || opts.flyStrategy === 'rolling' || opts.flyStrategy === 'bluegreen' || opts.flyStrategy === 'immediate')
+      ? opts.flyStrategy
+      : 'canary';
+    const secretsPath = opts.flySecretsFile ?? `${plan.target.localPath}/.env.convoy-secrets`;
+    const secrets = existsSync(secretsPath) ? parseEnvFile(secretsPath) : {};
+
+    const realFly: RealFlyOpt = {
+      appName: opts.flyApp,
+      cwd: plan.target.localPath,
+      strategy,
+      createIfMissing: opts.flyCreateApp === true,
+      convoyAuthoredFiles: plan.author.convoyAuthoredFiles.map((f) => f.path),
+      thresholdErrorRatePct: 1.0,
+      thresholdP99Ms: 1000,
+      bakeWindowSeconds: opts.flyBakeWindow ?? 60,
+    };
+    if (opts.flyOrg) realFly.org = opts.flyOrg;
+    if (Object.keys(secrets).length > 0) realFly.secrets = secrets;
+    orchestratorOpts.realFly = realFly;
+    process.stdout.write(
+      `${pc.dim('Real Fly deploy:')} ${pc.bold(opts.flyApp)} ${pc.dim(`(strategy: ${strategy}, bake: ${realFly.bakeWindowSeconds}s, secrets: ${Object.keys(secrets).length})`)}\n`,
+    );
   }
 
   const repoUrl = plan.target.repoUrl ?? plan.target.localPath;
@@ -616,6 +661,13 @@ program
   .option('--real-author', 'open a real PR against the target\'s GitHub repo (requires gh auth + write access)')
   .option('--auto-merge', 'when --real-author is set, merge the PR automatically on approval (otherwise waits for manual merge)')
   .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
+  .option('--real-fly', 'deploy to Fly.io for real — canary/promote/observe stages call flyctl')
+  .option('--fly-app <name>', 'Fly.io app name (required with --real-fly)')
+  .option('--fly-org <org>', 'Fly.io organization (default: personal)')
+  .option('--fly-create-app', 'create the Fly app if it does not exist')
+  .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate (default: canary)')
+  .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set` (default: <target>/.env.convoy-secrets)')
+  .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds (default: 60)', (v) => Number(v))
   .option('--real-rehearsal', 'run the target locally as a subprocess, probe real metrics, feed real logs to medic')
   .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary (triggers medic with fixture logs)')
   .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
