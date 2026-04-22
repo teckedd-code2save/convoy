@@ -15,6 +15,7 @@ import {
   type RealAuthorOpt,
   type RealFlyOpt,
   type RealRehearsalOpt,
+  type RealVercelOpt,
 } from './core/stages.js';
 import { RunStateStore } from './core/state.js';
 import type { Platform, Run, RunEvent, StageName } from './core/types.js';
@@ -453,16 +454,10 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
     report.checks.push({ name: 'real rehearsal', ok: true, detail: 'skipped (--no-real-rehearsal)' });
   }
 
-  // --- real fly ---
-  if (opts.realFly) {
-    if (plan.platform.chosen !== 'fly') {
-      report.realFly = false;
-      report.checks.push({
-        name: 'real fly',
-        ok: true,
-        detail: `skipped — plan chose ${plan.platform.chosen}; the only real adapter today is fly. Re-plan with --platform=fly to deploy for real, or pass --no-real-fly.`,
-      });
-    } else {
+  // --- real deploy (platform-specific) ---
+  const platform = plan.platform.chosen;
+  if (platform === 'fly') {
+    if (opts.realFly) {
       const { flyctlAvailable, flyAuthStatus } = await import('./adapters/fly/runner.js');
       const available = await flyctlAvailable();
       if (!available) {
@@ -470,12 +465,7 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
         report.hardFailures.push(
           `real fly: flyctl not installed. Install: \`curl -L https://fly.io/install.sh | sh\`. Or pass --no-real-fly.`,
         );
-        report.checks.push({
-          name: 'real fly',
-          ok: false,
-          detail: 'flyctl not in PATH',
-          remedy: 'brew install flyctl',
-        });
+        report.checks.push({ name: 'real fly', ok: false, detail: 'flyctl not in PATH', remedy: 'brew install flyctl' });
       } else {
         const auth = await flyAuthStatus();
         if (!auth.ok) {
@@ -483,12 +473,7 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
           report.hardFailures.push(
             `real fly: flyctl is not authenticated. Run \`fly auth login\`. Or pass --no-real-fly.`,
           );
-          report.checks.push({
-            name: 'real fly',
-            ok: false,
-            detail: 'flyctl not authenticated',
-            remedy: 'fly auth login',
-          });
+          report.checks.push({ name: 'real fly', ok: false, detail: 'flyctl not authenticated', remedy: 'fly auth login' });
         } else {
           report.checks.push({
             name: 'real fly',
@@ -497,9 +482,47 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
           });
         }
       }
+    } else {
+      report.checks.push({ name: 'real fly', ok: true, detail: 'skipped (--no-real-fly)' });
+    }
+  } else if (platform === 'vercel') {
+    // For vercel targets, the "realFly" flag is irrelevant; use realFly as the
+    // "real deploy is on" signal and attempt vercel.
+    report.realFly = false;
+    if (opts.realFly) {
+      const { vercelAvailable, vercelAuthStatus } = await import('./adapters/vercel/runner.js');
+      const available = await vercelAvailable();
+      if (!available) {
+        report.hardFailures.push(
+          `real vercel: vercel CLI not installed. Install: \`npm i -g vercel\`. Or pass --no-real-fly.`,
+        );
+        report.checks.push({ name: 'real vercel', ok: false, detail: 'vercel CLI not in PATH', remedy: 'npm i -g vercel' });
+      } else {
+        const auth = await vercelAuthStatus();
+        if (!auth.ok) {
+          report.hardFailures.push(
+            `real vercel: vercel CLI is not authenticated. Run \`vercel login\`. Or pass --no-real-fly.`,
+          );
+          report.checks.push({ name: 'real vercel', ok: false, detail: 'vercel CLI not authenticated', remedy: 'vercel login' });
+        } else {
+          report.checks.push({
+            name: 'real vercel',
+            ok: true,
+            detail: `vercel authed as ${auth.user ?? 'unknown'} — will deploy to Vercel`,
+          });
+        }
+      }
+    } else {
+      report.checks.push({ name: 'real vercel', ok: true, detail: 'skipped (--no-real-fly)' });
     }
   } else {
-    report.checks.push({ name: 'real fly', ok: true, detail: 'skipped (--no-real-fly)' });
+    // railway / cloudrun — not wired yet
+    report.realFly = false;
+    report.checks.push({
+      name: 'real deploy',
+      ok: true,
+      detail: `skipped — plan chose ${platform}; only fly and vercel adapters are live today. Re-plan with --platform=fly, or pass --no-real-fly.`,
+    });
   }
 
   return report;
@@ -628,7 +651,8 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     orchestratorOpts.realAuthor = realAuthor;
   }
 
-  if (preflight.realFly) {
+  const platform = plan.platform.chosen;
+  if (preflight.realFly && platform === 'fly') {
     const flyAppName = opts.flyApp ?? autoFlyAppName(plan);
     if (!opts.flyApp) {
       process.stdout.write(
@@ -659,6 +683,27 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     process.stdout.write(
       `${pc.dim('Real Fly deploy:')} ${pc.bold(flyAppName)} ${pc.dim(`(strategy: ${strategy}, bake: ${realFly.bakeWindowSeconds}s, secrets: ${Object.keys(secrets).length})`)}\n`,
     );
+    }
+  }
+
+  if (platform === 'vercel' && opts.realFly) {
+    const preflightVercel = preflight.checks.find((c) => c.name === 'real vercel');
+    if (preflightVercel?.ok) {
+      const cwd = plan.target.workspace
+        ? `${plan.target.localPath}/${plan.target.workspace}`
+        : plan.target.localPath;
+      const realVercel: RealVercelOpt = {
+        cwd,
+        convoyAuthoredFiles: plan.author.convoyAuthoredFiles.map((f) => f.path),
+        thresholdErrorRatePct: 1.0,
+        thresholdP99Ms: 3000,
+        bakeWindowSeconds: opts.flyBakeWindow ?? 60,
+        healthPath: '/',
+      };
+      orchestratorOpts.realVercel = realVercel;
+      process.stdout.write(
+        `${pc.dim('Real Vercel deploy:')} ${pc.bold(cwd)} ${pc.dim(`(bake: ${realVercel.bakeWindowSeconds}s)`)}\n`,
+      );
     }
   }
 

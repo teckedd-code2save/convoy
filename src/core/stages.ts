@@ -9,6 +9,12 @@ import {
   flyRollback,
   flySetSecrets,
 } from '../adapters/fly/runner.js';
+import {
+  vercelDeploy,
+  vercelHealthCheck,
+  vercelListDeployments,
+  vercelRollback,
+} from '../adapters/vercel/runner.js';
 import type { ConvoyBus } from './bus.js';
 import {
   createPrFromAuthoredFiles,
@@ -40,6 +46,7 @@ export interface OrchestratorOpts {
   realRehearsal?: RealRehearsalOpt;
   realAuthor?: RealAuthorOpt;
   realFly?: RealFlyOpt;
+  realVercel?: RealVercelOpt;
 }
 
 export interface RealAuthorOpt {
@@ -58,6 +65,15 @@ export interface RealFlyOpt {
   createIfMissing?: boolean;
   strategy?: 'canary' | 'rolling' | 'bluegreen' | 'immediate';
   secrets?: Record<string, string>;
+  healthPath?: string;
+  bakeWindowSeconds?: number;
+  thresholdErrorRatePct?: number;
+  thresholdP99Ms?: number;
+  convoyAuthoredFiles?: string[];
+}
+
+export interface RealVercelOpt {
+  cwd: string;
   healthPath?: string;
   bakeWindowSeconds?: number;
   thresholdErrorRatePct?: number;
@@ -529,6 +545,9 @@ export class CanaryStage extends BaseStage {
     if (ctx.opts.realFly) {
       return this.#runRealFly(ctx, ctx.opts.realFly);
     }
+    if (ctx.opts.realVercel) {
+      return this.#runRealVercel(ctx, ctx.opts.realVercel);
+    }
 
     this.emit(ctx, 'started', {});
 
@@ -639,6 +658,62 @@ export class CanaryStage extends BaseStage {
     this.emit(ctx, 'finished', result);
     return result;
   }
+
+  async #runRealVercel(ctx: StageContext, cfg: RealVercelOpt): Promise<unknown> {
+    this.emit(ctx, 'started', { mode: 'real-vercel', cwd: cfg.cwd });
+
+    await this.awaitApproval(ctx, 'promote', {
+      note: 'Convoy-authored PR merged. Deploy to Vercel as a preview?',
+      cwd: cfg.cwd,
+    });
+
+    // Capture prior prod for rollback.
+    const priorDeployments = await vercelListDeployments(cfg.cwd, 20);
+    const previousProd = priorDeployments.find((d) => d.target === 'production' && d.state === 'READY');
+    if (previousProd) {
+      this.emit(ctx, 'progress', {
+        phase: 'rollback.prestaged',
+        previous_production_url: previousProd.url,
+      });
+    }
+
+    this.emit(ctx, 'progress', { phase: 'vercel.deploying_preview' });
+
+    const preview = await vercelDeploy({
+      cwd: cfg.cwd,
+      target: 'preview',
+      onLog: (line) => {
+        if (/error|failed|panic/i.test(line)) {
+          this.emit(ctx, 'log', { line });
+        }
+      },
+    });
+
+    if (!preview.ok) {
+      this.emit(ctx, 'progress', { phase: 'vercel.preview_failed', error: preview.error });
+      const diagnosis = await diagnose({
+        stage: 'canary',
+        phase: 'vercel_preview',
+        repoPath: cfg.cwd,
+        convoyAuthoredFiles: cfg.convoyAuthoredFiles ?? [],
+        logs: preview.logs,
+        errorMessage: preview.error ?? 'vercel preview deploy failed',
+      });
+      this.emit(ctx, 'diagnosis', diagnosis);
+      throw new Error(`Vercel preview deploy failed: ${preview.error}`);
+    }
+
+    const previewUrl = preview.url!;
+    this.emit(ctx, 'progress', { phase: 'vercel.preview_ready', preview_url: previewUrl });
+
+    const result = {
+      healthy: true,
+      preview_url: previewUrl,
+      ...(previousProd?.url && { previous_production_url: previousProd.url }),
+    };
+    this.emit(ctx, 'finished', result);
+    return result;
+  }
 }
 
 export class PromoteStage extends BaseStage {
@@ -647,6 +722,9 @@ export class PromoteStage extends BaseStage {
   override async run(ctx: StageContext): Promise<unknown> {
     if (ctx.opts.realFly) {
       return this.#runRealFly(ctx, ctx.opts.realFly);
+    }
+    if (ctx.opts.realVercel) {
+      return this.#runRealVercel(ctx, ctx.opts.realVercel, ctx.prior['canary'] as Record<string, unknown> | undefined);
     }
 
     this.emit(ctx, 'started', {});
@@ -723,6 +801,61 @@ export class PromoteStage extends BaseStage {
     this.emit(ctx, 'finished', result as unknown as Record<string, unknown>);
     return result;
   }
+
+  async #runRealVercel(
+    ctx: StageContext,
+    cfg: RealVercelOpt,
+    canaryResult: Record<string, unknown> | undefined,
+  ): Promise<unknown> {
+    this.emit(ctx, 'started', { mode: 'real-vercel', phase: 'promote-to-prod' });
+
+    // Verify the preview deployment is healthy before promoting.
+    const previewUrl = typeof canaryResult?.['preview_url'] === 'string' ? canaryResult['preview_url'] : null;
+    const healthPath = cfg.healthPath ?? '/';
+    if (previewUrl) {
+      const probe = await vercelHealthCheck(previewUrl, healthPath);
+      this.emit(ctx, 'progress', {
+        phase: 'preview.probe',
+        url: previewUrl,
+        status: probe.status ?? 0,
+        latency_ms: probe.latencyMs,
+        ok: probe.ok,
+      });
+      if (!probe.ok) {
+        throw new Error(
+          `preview at ${previewUrl}${healthPath} did not respond 200 (status=${probe.status ?? 0}, error=${probe.error ?? 'n/a'})`,
+        );
+      }
+    }
+
+    this.emit(ctx, 'progress', { phase: 'vercel.deploying_production' });
+
+    const prod = await vercelDeploy({
+      cwd: cfg.cwd,
+      target: 'production',
+      onLog: (line) => {
+        if (/error|failed|panic/i.test(line)) {
+          this.emit(ctx, 'log', { line });
+        }
+      },
+    });
+
+    if (!prod.ok) {
+      throw new Error(`Vercel production deploy failed: ${prod.error}`);
+    }
+
+    const liveUrl = prod.url!;
+    ctx.store.updateRun(ctx.run.id, { liveUrl });
+    const updated = ctx.store.getRun(ctx.run.id);
+    if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
+
+    const result = {
+      live_url: liveUrl,
+      ...(prod.deploymentId && { deployment_id: prod.deploymentId }),
+    };
+    this.emit(ctx, 'finished', result);
+    return result;
+  }
 }
 
 /**
@@ -771,6 +904,9 @@ export class ObserveStage extends BaseStage {
   override async run(ctx: StageContext): Promise<unknown> {
     if (ctx.opts.realFly) {
       return this.#runRealFly(ctx, ctx.opts.realFly);
+    }
+    if (ctx.opts.realVercel) {
+      return this.#runRealVercel(ctx, ctx.opts.realVercel, ctx.prior['promote'] as Record<string, unknown> | undefined);
     }
 
     this.emit(ctx, 'started', { bake_window_seconds: 2 });
@@ -866,6 +1002,139 @@ export class ObserveStage extends BaseStage {
 
   async #triggerRollback(ctx: StageContext, cfg: RealFlyOpt, reason: string): Promise<unknown> {
     return triggerRealFlyRollback(ctx, cfg, reason, 'observe');
+  }
+
+  async #runRealVercel(
+    ctx: StageContext,
+    cfg: RealVercelOpt,
+    promoteResult: Record<string, unknown> | undefined,
+  ): Promise<unknown> {
+    const window = cfg.bakeWindowSeconds ?? 60;
+    this.emit(ctx, 'started', { bake_window_seconds: window });
+
+    const liveUrl = typeof promoteResult?.['live_url'] === 'string' ? promoteResult['live_url'] : null;
+    if (!liveUrl) {
+      // Nothing to probe — skip observe window.
+      const result = { window_seconds: 0, slo_healthy: false, reason: 'no live URL from promote' };
+      this.emit(ctx, 'finished', result);
+      return result;
+    }
+
+    const healthPath = cfg.healthPath ?? '/';
+    const thresholdErrorRatePct = cfg.thresholdErrorRatePct ?? 1.0;
+    const thresholdP99Ms = cfg.thresholdP99Ms ?? 2000;
+
+    const probeEveryMs = 3000;
+    const deadline = Date.now() + window * 1000;
+    let probeCount = 0;
+    let errors = 0;
+    const latencies: number[] = [];
+    let lastEmittedAt = 0;
+
+    while (Date.now() < deadline) {
+      if (ctx.signal.aborted) throw new Error('aborted');
+      const h = await vercelHealthCheck(liveUrl, healthPath);
+      probeCount += 1;
+      if (!h.ok) errors += 1;
+      if (h.latencyMs !== undefined) latencies.push(h.latencyMs);
+
+      const errorRatePct = (errors / probeCount) * 100;
+      const p99 = percentile(latencies, 0.99);
+
+      const shouldEmit = probeCount === 1 || probeCount % 5 === 0 || Date.now() - lastEmittedAt > 10000 || !h.ok;
+      if (shouldEmit) {
+        this.emit(ctx, 'progress', {
+          phase: 'observe.probe',
+          probe_count: probeCount,
+          error_rate_pct: Number(errorRatePct.toFixed(2)),
+          p99_ms: p99,
+          ok: h.ok,
+        });
+        lastEmittedAt = Date.now();
+      }
+
+      if (probeCount >= 5 && errorRatePct > thresholdErrorRatePct) {
+        this.emit(ctx, 'progress', {
+          phase: 'observe.breach',
+          reason: `error rate ${errorRatePct.toFixed(2)}% exceeded ${thresholdErrorRatePct}%`,
+        });
+        return this.#triggerVercelRollback(ctx, cfg, promoteResult, `error rate ${errorRatePct.toFixed(2)}% > ${thresholdErrorRatePct}%`);
+      }
+      if (p99 !== undefined && p99 > thresholdP99Ms) {
+        this.emit(ctx, 'progress', {
+          phase: 'observe.breach',
+          reason: `p99 ${p99}ms exceeded ${thresholdP99Ms}ms`,
+        });
+        return this.#triggerVercelRollback(ctx, cfg, promoteResult, `p99 ${p99}ms > ${thresholdP99Ms}ms`);
+      }
+
+      await this.sleep(probeEveryMs, ctx.signal);
+    }
+
+    const p99 = percentile(latencies, 0.99);
+    const errorRatePct = probeCount === 0 ? 0 : (errors / probeCount) * 100;
+    const result = {
+      window_seconds: window,
+      slo_healthy: true,
+      probe_count: probeCount,
+      error_rate_pct: Number(errorRatePct.toFixed(2)),
+      p99_ms: p99,
+    };
+    this.emit(ctx, 'finished', result as unknown as Record<string, unknown>);
+    return result;
+  }
+
+  async #triggerVercelRollback(
+    ctx: StageContext,
+    cfg: RealVercelOpt,
+    promoteResult: Record<string, unknown> | undefined,
+    reason: string,
+  ): Promise<unknown> {
+    this.emit(ctx, 'progress', { phase: 'rollback.starting', reason });
+
+    // For Vercel, "rollback" = alias the prod hostname back to a prior prod
+    // deployment. We look up prior prod deployments and pick the most recent
+    // stable one that isn't what we just shipped.
+    const currentLive = typeof promoteResult?.['live_url'] === 'string' ? promoteResult['live_url'] : null;
+    const deployments = await vercelListDeployments(cfg.cwd, 20);
+    const priorProd = deployments.find((d) => d.target === 'production' && d.state === 'READY' && d.url !== currentLive);
+    if (!priorProd) {
+      this.emit(ctx, 'progress', { phase: 'rollback.failed', error: 'no prior production deployment to roll back to' });
+      ctx.store.updateRun(ctx.run.id, {
+        outcomeReason: `${reason}; rollback failed: no prior production deployment`,
+        completedAt: new Date(),
+      });
+      throw new Error(`observe breach AND rollback failed: no prior production deployment`);
+    }
+
+    // Derive production alias from the current live URL's hostname (best effort).
+    const prodAlias = currentLive ? currentLive.replace(/^https?:\/\//, '').replace(/\/.*$/, '') : '';
+    if (!prodAlias) {
+      this.emit(ctx, 'progress', { phase: 'rollback.failed', error: 'could not determine production alias' });
+      throw new Error('rollback: could not determine production alias from live URL');
+    }
+
+    const result = await vercelRollback(cfg.cwd, prodAlias, priorProd.url);
+    if (!result.ok) {
+      this.emit(ctx, 'progress', { phase: 'rollback.failed', error: result.error });
+      ctx.store.updateRun(ctx.run.id, {
+        outcomeReason: `${reason}; rollback failed: ${result.error}`,
+        completedAt: new Date(),
+      });
+      throw new Error(`observe breach AND rollback failed: ${result.error}`);
+    }
+    this.emit(ctx, 'progress', {
+      phase: 'rollback.done',
+      restored_deployment: priorProd.url,
+    });
+    ctx.store.updateRun(ctx.run.id, {
+      status: 'rolled_back',
+      completedAt: new Date(),
+      outcomeReason: reason,
+    });
+    const updated = ctx.store.getRun(ctx.run.id);
+    if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
+    throw new RollbackTriggeredError(reason, 'observe');
   }
 }
 

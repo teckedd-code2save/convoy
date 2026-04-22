@@ -37,6 +37,7 @@ export interface PlanShipStep {
 export interface PlanTarget {
   repoUrl: string | null;
   localPath: string;
+  workspace: string | null;
   name: string;
   branch: string | null;
   sha: string | null;

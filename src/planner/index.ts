@@ -61,6 +61,7 @@ export async function buildPlan(
   const target: PlanTarget = {
     repoUrl: opts.repoUrl ?? null,
     localPath,
+    workspace: opts.workspace ?? null,
     name: repoName(localPath) || basename(localPath),
     branch: opts.branch ?? null,
     sha: opts.sha ?? null,
