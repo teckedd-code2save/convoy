@@ -66,7 +66,9 @@ export function runFlyctl(
       else stderr += text;
       if (opts.onLog) {
         for (const line of text.split(/\r?\n/)) {
-          if (line.length > 0) opts.onLog(line);
+          if (line.length === 0) continue;
+          if (isFlyctlNoise(line)) continue;
+          opts.onLog(line);
         }
       }
     };
@@ -94,6 +96,17 @@ export function runFlyctl(
       else reject(new Error(`flyctl ${args.join(' ')} failed (${code}): ${stderr || stdout}`));
     });
   });
+}
+
+/**
+ * Lines flyctl emits on every single call that are not useful to the operator
+ * and drown out real progress in our timelines.
+ */
+function isFlyctlNoise(line: string): boolean {
+  if (/Warning: Metrics token unavailable/i.test(line)) return true;
+  if (/failed to run query\(\$slug: String!\)/i.test(line)) return true;
+  if (/^\s*$/.test(line)) return true;
+  return false;
 }
 
 export async function flyctlAvailable(): Promise<boolean> {

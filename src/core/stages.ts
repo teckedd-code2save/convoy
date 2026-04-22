@@ -734,6 +734,8 @@ export class ObserveStage extends BaseStage {
     let probeCount = 0;
     let errors = 0;
     const latencies: number[] = [];
+    let lastEmittedOk: boolean | null = null;
+    let lastEmittedAt = 0;
 
     while (Date.now() < deadline) {
       if (ctx.signal.aborted) throw new Error('aborted');
@@ -744,13 +746,27 @@ export class ObserveStage extends BaseStage {
 
       const errorRatePct = (errors / probeCount) * 100;
       const p99 = percentile(latencies, 0.99);
-      this.emit(ctx, 'progress', {
-        phase: 'observe.probe',
-        probe_count: probeCount,
-        error_rate_pct: Number(errorRatePct.toFixed(2)),
-        p99_ms: p99,
-        ok: h.ok,
-      });
+
+      // Throttle: emit on first probe, on ok-state change, every 5 probes, or
+      // when a threshold is crossed. Keeps the timeline readable on long
+      // bake windows without losing signal.
+      const stateChanged = lastEmittedOk !== null && lastEmittedOk !== h.ok;
+      const periodic = probeCount === 1 || probeCount % 5 === 0;
+      const willBreach =
+        (probeCount >= 5 && errorRatePct > thresholdErrorRatePct) ||
+        (p99 !== undefined && p99 > thresholdP99Ms);
+      const shouldEmit = stateChanged || periodic || willBreach || Date.now() - lastEmittedAt > 10000;
+      if (shouldEmit) {
+        this.emit(ctx, 'progress', {
+          phase: 'observe.probe',
+          probe_count: probeCount,
+          error_rate_pct: Number(errorRatePct.toFixed(2)),
+          p99_ms: p99,
+          ok: h.ok,
+        });
+        lastEmittedOk = h.ok;
+        lastEmittedAt = Date.now();
+      }
 
       if (probeCount >= 5 && errorRatePct > thresholdErrorRatePct) {
         this.emit(ctx, 'progress', {
