@@ -21,7 +21,8 @@ export default function RootLayout({ children }: { children: ReactNode }) {
                 <span className="text-muted text-sm font-normal">rehearse · ship · observe</span>
               </a>
               <nav className="flex items-center gap-5 text-sm text-muted">
-                <a href="/" className="hover:text-ink">Plans</a>
+                <a href="/" className="hover:text-ink">Home</a>
+                <a href="/plans" className="hover:text-ink">Plans</a>
                 <a href="/runs" className="hover:text-ink">Runs</a>
                 <a
                   href="https://github.com/teckedd-code2save/convoy"
