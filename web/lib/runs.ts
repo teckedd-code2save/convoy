@@ -16,6 +16,8 @@ export interface RunRow {
   completedAt: string | null;
   liveUrl: string | null;
   planId: string | null;
+  outcomeReason: string | null;
+  outcomeRestoredVersion: number | null;
 }
 
 export interface EventRow {
@@ -56,6 +58,8 @@ type RawRunRow = {
   completed_at: string | null;
   live_url: string | null;
   plan_id: string | null;
+  outcome_reason: string | null;
+  outcome_restored_version: number | null;
 };
 
 function toRunRow(r: RawRunRow): RunRow {
@@ -68,6 +72,8 @@ function toRunRow(r: RawRunRow): RunRow {
     completedAt: r.completed_at,
     liveUrl: r.live_url,
     planId: r.plan_id,
+    outcomeReason: r.outcome_reason,
+    outcomeRestoredVersion: r.outcome_restored_version,
   };
 }
 

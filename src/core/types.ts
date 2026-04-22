@@ -50,6 +50,8 @@ export interface Run {
   completedAt: Date | null;
   liveUrl: string | null;
   planId: string | null;
+  outcomeReason: string | null;
+  outcomeRestoredVersion: number | null;
 }
 
 export interface RunEvent {

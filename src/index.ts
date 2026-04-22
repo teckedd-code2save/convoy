@@ -19,6 +19,7 @@ export {
   ObserveStage,
   ApprovalRejectedError,
   RehearsalBreachError,
+  RollbackTriggeredError,
 } from './core/stages.js';
 export type { Stage, StageContext, OrchestratorOpts, InjectFailureOpt } from './core/stages.js';
 export { diagnose } from './core/medic.js';

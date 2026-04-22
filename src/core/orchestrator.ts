@@ -1,6 +1,12 @@
 import type { ConvoyBus } from './bus.js';
 import type { RunStateStore } from './state.js';
-import { RehearsalBreachError, type Stage, type StageContext, type OrchestratorOpts } from './stages.js';
+import {
+  RehearsalBreachError,
+  RollbackTriggeredError,
+  type Stage,
+  type StageContext,
+  type OrchestratorOpts,
+} from './stages.js';
 import type { Run, RunStatus, StageName } from './types.js';
 
 /**
@@ -55,7 +61,28 @@ export class Orchestrator {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const isBreach = err instanceof RehearsalBreachError;
+      const isRolledBack = err instanceof RollbackTriggeredError;
+
+      // Rolled-back runs already set their own status + outcome before
+      // throwing. Don't overwrite. Just record the failure event and return
+      // the finalized run as-is.
+      if (isRolledBack) {
+        const failureEvent = this.#store.appendEvent(
+          started.id,
+          currentStageName,
+          'failed',
+          { error: message, reason: 'rollback_triggered', restored_version: err.restoredVersion },
+        );
+        this.#bus.emit({ type: 'event.appended', event: failureEvent });
+        const finalized = this.#store.getRun(started.id);
+        if (finalized) this.#bus.emit({ type: 'run.updated', run: finalized });
+        return finalized ?? started;
+      }
+
       const nextStatus: RunStatus = isBreach ? 'awaiting_fix' : 'failed';
+      const outcomeReason = isBreach
+        ? ((err.diagnosis as { rootCause?: string } | undefined)?.rootCause ?? message)
+        : message;
 
       const failureEvent = this.#store.appendEvent(
         started.id,
@@ -71,6 +98,7 @@ export class Orchestrator {
       const finalized = this.#store.updateRun(started.id, {
         status: nextStatus,
         completedAt: new Date(),
+        outcomeReason,
       });
       this.#bus.emit({ type: 'run.updated', run: finalized });
 

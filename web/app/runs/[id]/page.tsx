@@ -1,6 +1,6 @@
 import { notFound } from 'next/navigation';
 
-import { getRun, listEvents, listApprovals, type EventRow, type ApprovalRow } from '@/lib/runs';
+import { getRun, listEvents, listApprovals, type EventRow, type ApprovalRow, type RunRow } from '@/lib/runs';
 
 import { AutoRefresher } from './refresher';
 import { ApprovalActions } from './approval-form';
@@ -64,6 +64,8 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
         ) : null}
       </header>
 
+      {run.status === 'rolled_back' ? <RolledBackBanner run={run} /> : null}
+
       {pendingApprovals.length > 0 ? (
         <section className="space-y-3">
           <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">
@@ -83,6 +85,32 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
 
       <TimelineSection events={events} />
     </article>
+  );
+}
+
+function RolledBackBanner({ run }: { run: RunRow }) {
+  const restored = run.outcomeRestoredVersion;
+  return (
+    <section className="border border-warn/50 bg-warn/5 rounded-lg p-5 space-y-3">
+      <div className="flex items-center gap-3">
+        <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-warn text-white text-sm font-bold">↺</span>
+        <div className="flex-1">
+          <h2 className="font-semibold">
+            Rolled back{restored !== null ? ` to v${restored}` : ''}
+          </h2>
+          <p className="text-sm text-muted">
+            Convoy caught a breach and restored the previous healthy release.
+            {run.liveUrl ? <> Traffic is now served by <a href={run.liveUrl} target="_blank" rel="noreferrer" className="text-accent hover:underline font-mono">{run.liveUrl}</a>.</> : null}
+          </p>
+        </div>
+      </div>
+      {run.outcomeReason ? (
+        <div className="text-sm bg-card rounded-md p-3 border border-warn/30">
+          <span className="text-xs font-semibold uppercase tracking-wider text-muted mr-2">Breach reason</span>
+          <span className="font-mono">{run.outcomeReason}</span>
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -245,20 +273,46 @@ function TimelineSection({ events }: { events: EventRow[] }) {
             <span
               className={`absolute -left-[5px] top-1.5 w-2.5 h-2.5 rounded-full ${markerForKind(e.kind)}`}
             />
-            <div className="flex items-baseline gap-2 flex-wrap">
-              <span className="font-mono text-xs font-semibold">{e.stage}</span>
-              <span className="text-xs text-muted">{e.kind}</span>
-              <span className="text-xs text-muted ml-auto">
-                {new Date(e.createdAt).toLocaleTimeString()}
-              </span>
-            </div>
-            <div className="text-sm mt-1 font-mono text-muted break-words">
-              {renderPayload(e.payload)}
-            </div>
+            <TimelineEvent event={e} />
           </li>
         ))}
       </ol>
     </section>
+  );
+}
+
+function TimelineEvent({ event }: { event: EventRow }) {
+  const hasPayload =
+    event.payload !== null && event.payload !== undefined && !(typeof event.payload === 'object' && Object.keys(event.payload as Record<string, unknown>).length === 0);
+  const compact = renderPayload(event.payload);
+  const full = hasPayload ? JSON.stringify(event.payload, null, 2) : '';
+
+  return (
+    <details className="group">
+      <summary className="cursor-pointer select-none list-none">
+        <div className="flex items-baseline gap-2 flex-wrap">
+          <span className="font-mono text-xs font-semibold">{event.stage}</span>
+          <span className="text-xs text-muted">{event.kind}</span>
+          <span className="text-xs text-muted ml-auto">
+            {new Date(event.createdAt).toLocaleTimeString()}
+          </span>
+        </div>
+        <div className="text-sm mt-1 font-mono text-muted break-words flex items-start gap-2">
+          <span className="flex-1">{compact || <em className="text-muted/70">(no payload)</em>}</span>
+          {hasPayload ? (
+            <span className="text-xs text-muted/70 shrink-0 group-open:hidden select-none">expand ▾</span>
+          ) : null}
+          {hasPayload ? (
+            <span className="text-xs text-muted/70 shrink-0 hidden group-open:inline select-none">collapse ▴</span>
+          ) : null}
+        </div>
+      </summary>
+      {hasPayload ? (
+        <pre className="mt-2 p-3 rounded-md bg-ink text-paper text-xs font-mono overflow-auto max-h-96 whitespace-pre-wrap break-words">
+{full}
+        </pre>
+      ) : null}
+    </details>
   );
 }
 
@@ -338,7 +392,7 @@ function StatusBadge({ status, live }: { status: string; live: boolean }) {
     awaiting_fix: { color: 'bg-warn animate-pulse', label: 'awaiting fix' },
     succeeded: { color: 'bg-success', label: 'succeeded' },
     failed: { color: 'bg-danger', label: 'failed' },
-    rolled_back: { color: 'bg-danger', label: 'rolled back' },
+    rolled_back: { color: 'bg-warn', label: 'rolled back' },
   };
   const c = config[status] ?? { color: 'bg-muted', label: status };
   return (

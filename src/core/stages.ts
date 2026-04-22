@@ -111,6 +111,22 @@ export class ApprovalRejectedError extends Error {
   }
 }
 
+/**
+ * Thrown by triggerRealFlyRollback after it has already set the run to
+ * rolled_back. The orchestrator catches this specifically so it does NOT
+ * overwrite the status back to 'failed' in its generic error path.
+ */
+export class RollbackTriggeredError extends Error {
+  constructor(
+    public readonly reason: string,
+    public readonly firedBy: 'promote' | 'observe',
+    public readonly restoredVersion?: number,
+  ) {
+    super(`${firedBy} breach (${reason}) triggered rollback`);
+    this.name = 'RollbackTriggeredError';
+  }
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -731,16 +747,25 @@ async function triggerRealFlyRollback(
   const result = await flyRollback(cfg.appName);
   if (!result.ok) {
     emit('progress', { phase: 'rollback.failed', error: result.error });
+    ctx.store.updateRun(ctx.run.id, {
+      outcomeReason: `${reason}; rollback failed: ${result.error}`,
+      completedAt: new Date(),
+    });
     throw new Error(`${firedBy} breach AND rollback failed: ${result.error}`);
   }
   emit('progress', {
     phase: 'rollback.done',
     restored_version: result.restoredVersion,
   });
-  ctx.store.updateRun(ctx.run.id, { status: 'rolled_back', completedAt: new Date() });
+  ctx.store.updateRun(ctx.run.id, {
+    status: 'rolled_back',
+    completedAt: new Date(),
+    outcomeReason: reason,
+    outcomeRestoredVersion: result.restoredVersion ?? null,
+  });
   const updated = ctx.store.getRun(ctx.run.id);
   if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
-  throw new Error(`${firedBy} breach (${reason}) triggered rollback`);
+  throw new RollbackTriggeredError(reason, firedBy, result.restoredVersion);
 }
 
 export class ObserveStage extends BaseStage {

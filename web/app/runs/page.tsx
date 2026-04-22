@@ -78,7 +78,7 @@ function StatusBadge({ status }: { status: string }) {
     awaiting_fix: { color: 'bg-warn animate-pulse', label: 'awaiting fix' },
     succeeded: { color: 'bg-success', label: 'succeeded' },
     failed: { color: 'bg-danger', label: 'failed' },
-    rolled_back: { color: 'bg-danger', label: 'rolled back' },
+    rolled_back: { color: 'bg-warn', label: 'rolled back' },
   };
   const c = config[status] ?? { color: 'bg-muted', label: status };
   return (

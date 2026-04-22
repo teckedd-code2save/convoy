@@ -569,8 +569,9 @@ async function runStatus(runId?: string): Promise<void> {
       return;
     }
 
+    const statusLabel = run.status === 'rolled_back' ? pc.yellow('rolled_back') : `(${run.status})`;
     process.stdout.write(
-      `${pc.bold(pc.cyan(SYMBOL.run))} ${pc.bold(`Run ${run.id.slice(0, 8)}`)} ${pc.dim(`(${run.status})`)}\n`,
+      `${pc.bold(pc.cyan(SYMBOL.run))} ${pc.bold(`Run ${run.id.slice(0, 8)}`)} ${pc.dim(statusLabel)}\n`,
     );
     process.stdout.write(`  ${pc.dim('Repository:')} ${run.repoUrl}\n`);
     if (run.platform) process.stdout.write(`  ${pc.dim('Platform:')}   ${run.platform}\n`);
@@ -582,6 +583,14 @@ async function runStatus(runId?: string): Promise<void> {
           run.completedAt.getTime() - run.startedAt.getTime(),
         )})\n`,
       );
+    }
+    if (run.status === 'rolled_back' && run.outcomeReason) {
+      process.stdout.write(
+        `  ${pc.yellow('Outcome:')}    rolled back${run.outcomeRestoredVersion !== null ? ` to v${run.outcomeRestoredVersion}` : ''}\n`,
+      );
+      process.stdout.write(`  ${pc.dim('Reason:')}     ${run.outcomeReason}\n`);
+    } else if (run.outcomeReason) {
+      process.stdout.write(`  ${pc.dim('Reason:')}     ${run.outcomeReason}\n`);
     }
 
     const events = store.listEvents(run.id);

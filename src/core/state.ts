@@ -59,6 +59,8 @@ interface RunRow {
   completed_at: string | null;
   live_url: string | null;
   plan_id: string | null;
+  outcome_reason: string | null;
+  outcome_restored_version: number | null;
 }
 
 interface RunEventRow {
@@ -89,6 +91,8 @@ function toRun(row: RunRow): Run {
     completedAt: row.completed_at ? new Date(row.completed_at) : null,
     liveUrl: row.live_url,
     planId: row.plan_id,
+    outcomeReason: row.outcome_reason,
+    outcomeRestoredVersion: row.outcome_restored_version,
   };
 }
 
@@ -119,6 +123,8 @@ export interface RunUpdates {
   platform?: Platform | null;
   liveUrl?: string | null;
   completedAt?: Date | null;
+  outcomeReason?: string | null;
+  outcomeRestoredVersion?: number | null;
 }
 
 export class RunStateStore {
@@ -140,6 +146,12 @@ export class RunStateStore {
       .map((c) => c.name);
     if (!cols.includes('plan_id')) {
       this.#db.exec('ALTER TABLE runs ADD COLUMN plan_id TEXT');
+    }
+    if (!cols.includes('outcome_reason')) {
+      this.#db.exec('ALTER TABLE runs ADD COLUMN outcome_reason TEXT');
+    }
+    if (!cols.includes('outcome_restored_version')) {
+      this.#db.exec('ALTER TABLE runs ADD COLUMN outcome_restored_version INTEGER');
     }
   }
 
@@ -167,7 +179,15 @@ export class RunStateStore {
     const row = this.#db
       .prepare<[string], RunRow>('SELECT * FROM runs WHERE id = ?')
       .get(id);
-    return row ? toRun(row) : null;
+    if (row) return toRun(row);
+    // Prefix match — accept first 7+ chars of the uuid.
+    if (id.length >= 7) {
+      const prefix = this.#db
+        .prepare<[string], RunRow>('SELECT * FROM runs WHERE id LIKE ? ORDER BY started_at DESC LIMIT 1')
+        .get(`${id}%`);
+      if (prefix) return toRun(prefix);
+    }
+    return null;
   }
 
   listRecentRuns(limit = 10): Run[] {
@@ -179,7 +199,7 @@ export class RunStateStore {
 
   updateRun(id: string, updates: RunUpdates): Run {
     const fields: string[] = [];
-    const values: (string | null)[] = [];
+    const values: (string | number | null)[] = [];
 
     if (updates.status !== undefined) {
       fields.push('status = ?');
@@ -196,6 +216,14 @@ export class RunStateStore {
     if (updates.completedAt !== undefined) {
       fields.push('completed_at = ?');
       values.push(updates.completedAt ? updates.completedAt.toISOString() : null);
+    }
+    if (updates.outcomeReason !== undefined) {
+      fields.push('outcome_reason = ?');
+      values.push(updates.outcomeReason);
+    }
+    if (updates.outcomeRestoredVersion !== undefined) {
+      fields.push('outcome_restored_version = ?');
+      values.push(updates.outcomeRestoredVersion);
     }
 
     if (fields.length === 0) {
