@@ -1,19 +1,23 @@
 import { randomUUID } from 'node:crypto';
+import { basename } from 'node:path';
 
 import type {
   ConvoyPlan,
   PlanApproval,
+  PlanDeployabilitySection,
   PlanEstimate,
+  PlanPlatformDecision,
   PlanPromotionSection,
   PlanRehearsalSection,
   PlanRollbackSection,
+  PlanRisk,
   PlanTarget,
 } from '../core/plan.js';
 import type { Platform } from '../core/types.js';
 
 import { draftAuthorSection } from './author.js';
 import { pickPlatform } from './picker.js';
-import { scanRepository, type ScanResult } from './scanner.js';
+import { scanRepository, repoName, type ScanResult } from './scanner.js';
 
 export interface BuildPlanOptions {
   repoUrl?: string;
@@ -24,55 +28,161 @@ export interface BuildPlanOptions {
 
 export function buildPlan(localPath: string, opts: BuildPlanOptions = {}): ConvoyPlan {
   const scan = scanRepository(localPath);
-  const platform = pickPlatform(scan, opts.platformOverride);
-  const author = draftAuthorSection(scan, platform.chosen);
+
+  const deployability = toPlanDeployability(scan);
+  const platform = resolvePlatform(scan, opts.platformOverride, deployability);
+  const author =
+    deployability.verdict === 'not-cloud-deployable'
+      ? { convoyAuthoredFiles: [], readOnlyPaths: [], note: 'Skipped — target is not a cloud-deployable web service.' }
+      : draftAuthorSection(scan, platform.chosen);
 
   const rehearsal = defaultRehearsal(scan, platform.chosen);
   const promotion = defaultPromotion();
   const rollback = defaultRollback(platform.chosen);
   const approvals = defaultApprovals();
   const estimate = defaultEstimate();
+  const risks = toPlanRisks(scan);
+  const summary = buildSummary(scan, platform, deployability);
 
   const target: PlanTarget = {
     repoUrl: opts.repoUrl ?? null,
     localPath,
+    name: repoName(localPath) || basename(localPath),
     branch: opts.branch ?? null,
     sha: opts.sha ?? null,
     mode: 'first-deploy',
+    ecosystem: scan.ecosystem,
+    framework: scan.framework,
+    topology: scan.topology,
+    readmeTitle: scan.readmeTitle,
+    readmeExcerpt: scan.readmeFirstPara,
   };
 
   return {
     id: randomUUID(),
     createdAt: new Date().toISOString(),
     target,
+    summary,
+    deployability,
     platform,
     author,
     rehearsal,
     promotion,
     rollback,
     approvals,
+    risks,
     estimate,
+    evidence: scan.evidence,
   };
 }
 
-function defaultRehearsal(_scan: ScanResult, platform: Platform): PlanRehearsalSection {
+function toPlanDeployability(scan: ScanResult): PlanDeployabilitySection {
+  return {
+    verdict: scan.deployability,
+    reason: scan.deployabilityReason,
+  };
+}
+
+function resolvePlatform(
+  scan: ScanResult,
+  override: Platform | undefined,
+  deployability: PlanDeployabilitySection,
+): PlanPlatformDecision {
+  if (deployability.verdict === 'not-cloud-deployable') {
+    return {
+      chosen: 'fly',
+      source: 'refused',
+      reason:
+        'Refused to pick a platform because this repo is not a cloud-deployable service. See the deployability verdict above.',
+      candidates: [],
+    };
+  }
+  return pickPlatform(scan, override);
+}
+
+function toPlanRisks(scan: ScanResult): PlanRisk[] {
+  return scan.risks.map((r) => ({ level: r.level, message: r.message }));
+}
+
+function buildSummary(
+  scan: ScanResult,
+  platform: PlanPlatformDecision,
+  deployability: PlanDeployabilitySection,
+): string {
+  if (deployability.verdict === 'not-cloud-deployable') {
+    return `${scan.readmeTitle ?? repoName(scan.localPath)} appears to be a ${describeEcosystem(scan)} target, which Convoy does not ship to cloud infrastructure.`;
+  }
+  const ecosystem = describeEcosystem(scan);
+  const frameworkPart = scan.framework ? ` running ${scan.framework}` : '';
+  const dataPart =
+    scan.dataLayer.length > 0 ? ` with ${scan.dataLayer.join(' + ')}` : '';
+  const platformPart = `Convoy will ship it to ${platform.chosen}`;
+  return `${scan.readmeTitle ?? repoName(scan.localPath)} is a ${ecosystem} project${frameworkPart}${dataPart}. ${platformPart}.`;
+}
+
+function describeEcosystem(scan: ScanResult): string {
+  switch (scan.ecosystem) {
+    case 'node':
+      return 'Node.js';
+    case 'python':
+      return 'Python';
+    case 'go':
+      return 'Go';
+    case 'rust':
+      return 'Rust';
+    case 'ruby':
+      return 'Ruby';
+    case 'php':
+      return 'PHP';
+    case 'dotnet':
+      return '.NET';
+    case 'java-jvm':
+      return 'JVM (Java)';
+    case 'elixir':
+      return 'Elixir';
+    case 'swift':
+      return 'Swift / iOS';
+    case 'kotlin-android':
+      return 'Kotlin / Android';
+    case 'dart-flutter':
+      return 'Dart / Flutter';
+    case 'static':
+      return 'static HTML';
+    case 'mixed':
+      return 'mixed-language';
+    default:
+      return 'unknown-ecosystem';
+  }
+}
+
+function defaultRehearsal(scan: ScanResult, platform: Platform): PlanRehearsalSection {
+  const validations: string[] = [
+    'image build succeeds',
+    'container boots and responds on the expected port',
+  ];
+  if (scan.healthPath) validations.push(`${scan.healthPath} returns 200`);
+  else validations.push('health probe on /health (TCP-only fallback if no route exists)');
+  if (scan.testCommand) validations.push(`smoke: ${scan.testCommand.slice(0, 40)}`);
+  validations.push('cold-start within envelope vs. baseline');
+  validations.push('60s synthetic load · p99 within tolerance');
+  if (scan.dataLayer.some((d) => d.includes('postgres') || d.includes('mysql'))) {
+    validations.push('migration dry-run against scratch data');
+  }
+
   return {
     enabled: true,
     targetDescriptor:
       platform === 'fly'
-        ? 'fly ephemeral app in iad, lifecycle ~5 min'
+        ? `fly ephemeral app \`${repoName(scan.localPath)}-rehearsal-<sha>\` in iad`
         : platform === 'railway'
           ? 'railway preview environment'
           : platform === 'vercel'
             ? 'vercel preview deployment'
-            : 'cloud run revision in us-central1 with suffix',
-    validations: [
-      'build succeeds',
-      'health endpoint returns 200',
-      'smoke tests',
-      'cold-start under envelope',
-      '60s synthetic load · p99 within baseline',
-    ],
+            : `cloud run revision \`${repoName(scan.localPath)}-rehearsal-<sha>\` in us-central1`,
+    buildCommand: scan.buildCommand,
+    startCommand: scan.startCommand,
+    expectedPort: scan.port,
+    validations,
     estimatedDurationSeconds: 300,
     estimatedCost: 'under $0.05 per rehearsal',
   };

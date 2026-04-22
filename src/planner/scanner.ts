@@ -1,10 +1,59 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { basename, join, relative } from 'node:path';
 
 import type { Platform } from '../core/types.js';
 
+export type Ecosystem =
+  | 'node'
+  | 'python'
+  | 'go'
+  | 'rust'
+  | 'swift'
+  | 'kotlin-android'
+  | 'java-jvm'
+  | 'ruby'
+  | 'php'
+  | 'dotnet'
+  | 'elixir'
+  | 'dart-flutter'
+  | 'static'
+  | 'mixed'
+  | 'unknown';
+
+export type Deployability =
+  | 'deployable-web-service'
+  | 'deployable-static-site'
+  | 'not-cloud-deployable'
+  | 'ambiguous';
+
+export type PackageManager =
+  | 'npm'
+  | 'pnpm'
+  | 'yarn'
+  | 'bun'
+  | 'pip'
+  | 'poetry'
+  | 'uv'
+  | 'cargo'
+  | 'go-mod'
+  | 'gem'
+  | 'composer'
+  | 'nuget'
+  | 'mix'
+  | 'pub'
+  | null;
+
+export type MonorepoTool = 'turbo' | 'nx' | 'pnpm-workspaces' | 'lerna' | 'yarn-workspaces' | null;
+
+export interface ScanRisk {
+  level: 'info' | 'warn' | 'block';
+  message: string;
+  evidence?: string;
+}
+
 export interface ScanResult {
   localPath: string;
+  ecosystem: Ecosystem;
   language: string | null;
   runtime: string | null;
   framework: string | null;
@@ -12,11 +61,29 @@ export interface ScanResult {
   dataLayer: string[];
   existingPlatform: Platform | null;
   hasDockerfile: boolean;
+  dockerfileBase: string | null;
   hasCi: boolean;
-  packageManager: 'npm' | 'pnpm' | 'yarn' | null;
+  packageManager: PackageManager;
   startCommand: string | null;
+  buildCommand: string | null;
+  devCommand: string | null;
+  testCommand: string | null;
   healthPath: string | null;
+  port: number | null;
+  scripts: Record<string, string>;
+  topLevelDirs: string[];
+  topLevelFiles: string[];
+  sourceDirs: string[];
+  testDirs: string[];
+  isMonorepo: boolean;
+  monorepoTool: MonorepoTool;
+  workspaces: string[];
+  readmeTitle: string | null;
+  readmeFirstPara: string | null;
+  deployability: Deployability;
+  deployabilityReason: string;
   evidence: string[];
+  risks: ScanRisk[];
 }
 
 const SKIP_DIRS = new Set([
@@ -24,20 +91,27 @@ const SKIP_DIRS = new Set([
   '.git',
   'dist',
   'build',
+  'out',
   '.next',
   '.turbo',
   '.vercel',
+  '.svelte-kit',
   'coverage',
   '.venv',
   'venv',
   '__pycache__',
   'target',
+  '.gradle',
+  '.idea',
+  '.vscode',
+  '.DerivedData',
+  'DerivedData',
+  '.build',
+  'Pods',
+  '.next',
+  '.cache',
 ]);
 
-/**
- * Walk a local repository and emit a structured ScanResult. Reads only —
- * never mutates the target directory.
- */
 export function scanRepository(localPath: string): ScanResult {
   if (!existsSync(localPath)) {
     throw new Error(`Path does not exist: ${localPath}`);
@@ -47,61 +121,132 @@ export function scanRepository(localPath: string): ScanResult {
     throw new Error(`Path is not a directory: ${localPath}`);
   }
 
-  const files = listFiles(localPath, localPath, 0, 3);
+  const topEntries = readTopLevel(localPath);
+  const { topLevelDirs, topLevelFiles } = topEntries;
+  const allFiles = listFiles(localPath, localPath, 0, 4);
   const evidence: string[] = [];
-
-  const result: ScanResult = {
-    localPath,
-    language: null,
-    runtime: null,
-    framework: null,
-    topology: 'unknown',
-    dataLayer: [],
-    existingPlatform: detectExistingPlatform(files, evidence),
-    hasDockerfile: files.includes('Dockerfile'),
-    hasCi: files.some((f) => f.startsWith('.github/workflows/')),
-    packageManager: null,
-    startCommand: null,
-    healthPath: null,
-    evidence,
-  };
+  const risks: ScanRisk[] = [];
 
   const packageJson = tryReadJson(localPath, 'package.json');
-  if (packageJson) {
-    result.language = 'typescript-or-javascript';
-    result.runtime = detectNodeVersion(packageJson) ?? 'node';
-    result.framework = detectJsFramework(packageJson);
-    result.packageManager = detectPackageManager(files);
-    result.startCommand = typeof packageJson['scripts']?.start === 'string' ? packageJson['scripts'].start : null;
-    evidence.push(`package.json · name=${String(packageJson['name'] ?? 'unknown')}`);
+  const scripts: Record<string, string> =
+    packageJson && typeof packageJson['scripts'] === 'object' && packageJson['scripts']
+      ? Object.fromEntries(
+          Object.entries(packageJson['scripts'] as Record<string, unknown>).filter(
+            ([, v]) => typeof v === 'string',
+          ) as [string, string][],
+        )
+      : {};
+
+  const ecosystem = detectEcosystem(topLevelFiles, topLevelDirs, allFiles, evidence);
+  const { language, runtime } = detectLanguageAndRuntime(ecosystem, packageJson);
+  const framework = detectFramework(ecosystem, packageJson, topLevelFiles, allFiles);
+  const packageManager = detectPackageManager(ecosystem, topLevelFiles);
+  const { isMonorepo, monorepoTool, workspaces } = detectMonorepo(topLevelFiles, packageJson);
+
+  const existingPlatform = detectExistingPlatform(topLevelFiles, evidence);
+  const hasDockerfile = topLevelFiles.includes('Dockerfile');
+  const dockerfileBase = hasDockerfile ? readDockerfileBase(localPath) : null;
+  const hasCi = topLevelDirs.includes('.github') && allFiles.some((f) => f.startsWith('.github/workflows/'));
+
+  const topology = inferTopology(ecosystem, framework, allFiles, packageJson);
+  const dataLayer = detectDataLayer(localPath, allFiles, packageJson, evidence);
+  const sourceDirs = detectSourceDirs(ecosystem, topLevelDirs);
+  const testDirs = detectTestDirs(topLevelDirs, allFiles);
+
+  const startCommand = scripts['start'] ?? scripts['serve'] ?? null;
+  const buildCommand = scripts['build'] ?? null;
+  const devCommand = scripts['dev'] ?? scripts['develop'] ?? null;
+  const testCommand = scripts['test'] ?? null;
+
+  const healthPath = detectHealthPath(localPath, allFiles);
+  const port = detectPort(packageJson, scripts, localPath, allFiles);
+
+  const readme = readReadmeExcerpt(localPath, topLevelFiles);
+
+  const { deployability, deployabilityReason } = determineDeployability(
+    ecosystem,
+    topology,
+    framework,
+    topLevelFiles,
+    isMonorepo,
+  );
+
+  collectRisks(
+    risks,
+    ecosystem,
+    framework,
+    dataLayer,
+    hasDockerfile,
+    healthPath,
+    testDirs,
+    scripts,
+    isMonorepo,
+  );
+
+  if (readme.title) evidence.push(`README title "${readme.title}"`);
+  if (packageJson?.['name']) evidence.push(`package.json name=${String(packageJson['name'])}`);
+  if (framework) evidence.push(`framework=${framework}`);
+  if (dockerfileBase) evidence.push(`Dockerfile base=${dockerfileBase}`);
+
+  return {
+    localPath,
+    ecosystem,
+    language,
+    runtime,
+    framework,
+    topology,
+    dataLayer,
+    existingPlatform,
+    hasDockerfile,
+    dockerfileBase,
+    hasCi,
+    packageManager,
+    startCommand,
+    buildCommand,
+    devCommand,
+    testCommand,
+    healthPath,
+    port,
+    scripts,
+    topLevelDirs,
+    topLevelFiles,
+    sourceDirs,
+    testDirs,
+    isMonorepo,
+    monorepoTool,
+    workspaces,
+    readmeTitle: readme.title,
+    readmeFirstPara: readme.firstPara,
+    deployability,
+    deployabilityReason,
+    evidence,
+    risks,
+  };
+}
+
+function readTopLevel(dir: string): { topLevelDirs: string[]; topLevelFiles: string[] } {
+  const topLevelDirs: string[] = [];
+  const topLevelFiles: string[] = [];
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return { topLevelDirs, topLevelFiles };
   }
-
-  if (files.includes('pyproject.toml') || files.includes('requirements.txt')) {
-    result.language = 'python';
-    result.runtime = 'python';
-    if (files.includes('pyproject.toml')) evidence.push('pyproject.toml');
-    if (files.includes('requirements.txt')) evidence.push('requirements.txt');
+  for (const entry of entries) {
+    if (entry === '.DS_Store') continue;
+    let st;
+    try {
+      st = statSync(join(dir, entry));
+    } catch {
+      continue;
+    }
+    if (st.isDirectory()) topLevelDirs.push(entry);
+    else topLevelFiles.push(entry);
   }
-
-  if (files.includes('go.mod')) {
-    result.language = 'go';
-    result.runtime = 'go';
-    evidence.push('go.mod');
-  }
-
-  if (files.includes('Cargo.toml')) {
-    result.language = 'rust';
-    result.runtime = 'rust';
-    evidence.push('Cargo.toml');
-  }
-
-  result.topology = inferTopology(files, packageJson, evidence);
-  result.dataLayer = detectDataLayer(files, packageJson, evidence);
-
-  if (result.hasDockerfile) evidence.push('Dockerfile present');
-  if (result.hasCi) evidence.push('.github/workflows present');
-
-  return result;
+  topLevelDirs.sort();
+  topLevelFiles.sort();
+  return { topLevelDirs, topLevelFiles };
 }
 
 function listFiles(base: string, dir: string, depth: number, maxDepth: number): string[] {
@@ -115,6 +260,7 @@ function listFiles(base: string, dir: string, depth: number, maxDepth: number): 
   }
   for (const entry of entries) {
     if (SKIP_DIRS.has(entry)) continue;
+    if (entry === '.DS_Store') continue;
     const abs = join(dir, entry);
     let st;
     try {
@@ -122,11 +268,10 @@ function listFiles(base: string, dir: string, depth: number, maxDepth: number): 
     } catch {
       continue;
     }
-    const rel = relative(base, abs);
     if (st.isDirectory()) {
       out.push(...listFiles(base, abs, depth + 1, maxDepth));
     } else {
-      out.push(rel.split('\\').join('/'));
+      out.push(relative(base, abs).split('\\').join('/'));
     }
   }
   return out;
@@ -141,35 +286,211 @@ function tryReadJson(base: string, relPath: string): Record<string, any> | null 
   }
 }
 
-function detectNodeVersion(pkg: Record<string, any>): string | null {
-  const engines = pkg['engines'];
-  if (engines && typeof engines === 'object' && typeof engines.node === 'string') {
-    return `node-${engines.node.replace(/[^\d.]/g, '')}`;
+function tryReadFile(base: string, relPath: string): string | null {
+  try {
+    return readFileSync(join(base, relPath), 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+function detectEcosystem(
+  topLevelFiles: string[],
+  topLevelDirs: string[],
+  allFiles: string[],
+  evidence: string[],
+): Ecosystem {
+  if (topLevelFiles.some((f) => f.endsWith('.xcodeproj') || f.endsWith('.xcworkspace'))) {
+    evidence.push('xcode project detected');
+    return 'swift';
+  }
+  if (
+    topLevelDirs.some((d) => d.endsWith('.xcodeproj') || d.endsWith('.xcworkspace')) ||
+    topLevelFiles.includes('Package.swift') ||
+    topLevelFiles.includes('Podfile')
+  ) {
+    evidence.push('swift/ios project markers');
+    return 'swift';
+  }
+  if (
+    topLevelFiles.includes('build.gradle.kts') ||
+    topLevelFiles.includes('settings.gradle.kts') ||
+    allFiles.some((f) => f.endsWith('/AndroidManifest.xml'))
+  ) {
+    evidence.push('gradle kotlin / android project');
+    return 'kotlin-android';
+  }
+  if (topLevelFiles.includes('pom.xml') || topLevelFiles.includes('build.gradle')) {
+    evidence.push('java/jvm project');
+    return 'java-jvm';
+  }
+  if (topLevelFiles.includes('package.json')) {
+    evidence.push('package.json present');
+    return 'node';
+  }
+  if (
+    topLevelFiles.includes('pyproject.toml') ||
+    topLevelFiles.includes('requirements.txt') ||
+    topLevelFiles.includes('Pipfile') ||
+    topLevelFiles.includes('setup.py')
+  ) {
+    evidence.push('python project markers');
+    return 'python';
+  }
+  if (topLevelFiles.includes('go.mod')) {
+    evidence.push('go.mod present');
+    return 'go';
+  }
+  if (topLevelFiles.includes('Cargo.toml')) {
+    evidence.push('Cargo.toml present');
+    return 'rust';
+  }
+  if (topLevelFiles.includes('Gemfile')) {
+    evidence.push('Gemfile present');
+    return 'ruby';
+  }
+  if (topLevelFiles.includes('composer.json')) {
+    evidence.push('composer.json present');
+    return 'php';
+  }
+  if (topLevelFiles.some((f) => f.endsWith('.csproj') || f.endsWith('.sln')) ||
+      topLevelDirs.includes('bin')) {
+    evidence.push('.NET project markers');
+    return 'dotnet';
+  }
+  if (topLevelFiles.includes('mix.exs')) {
+    evidence.push('Elixir mix project');
+    return 'elixir';
+  }
+  if (topLevelFiles.includes('pubspec.yaml')) {
+    evidence.push('Flutter/Dart project');
+    return 'dart-flutter';
+  }
+  if (topLevelFiles.includes('index.html') && topLevelFiles.length < 12) {
+    evidence.push('static html site');
+    return 'static';
+  }
+  return 'unknown';
+}
+
+function detectLanguageAndRuntime(
+  eco: Ecosystem,
+  pkg: Record<string, any> | null,
+): { language: string | null; runtime: string | null } {
+  switch (eco) {
+    case 'node': {
+      const engines = pkg?.['engines'];
+      const rawNode = typeof engines?.node === 'string' ? engines.node : '';
+      const major = rawNode.match(/\d+/)?.[0] ?? '20';
+      return { language: 'typescript-or-javascript', runtime: `node-${major}` };
+    }
+    case 'python':
+      return { language: 'python', runtime: 'python-3' };
+    case 'go':
+      return { language: 'go', runtime: 'go' };
+    case 'rust':
+      return { language: 'rust', runtime: 'rust' };
+    case 'swift':
+      return { language: 'swift', runtime: null };
+    case 'kotlin-android':
+      return { language: 'kotlin', runtime: null };
+    case 'java-jvm':
+      return { language: 'java', runtime: 'jvm' };
+    case 'ruby':
+      return { language: 'ruby', runtime: 'ruby' };
+    case 'php':
+      return { language: 'php', runtime: 'php' };
+    case 'dotnet':
+      return { language: 'csharp', runtime: 'dotnet' };
+    case 'elixir':
+      return { language: 'elixir', runtime: 'beam' };
+    case 'dart-flutter':
+      return { language: 'dart', runtime: null };
+    case 'static':
+      return { language: 'html', runtime: null };
+    default:
+      return { language: null, runtime: null };
+  }
+}
+
+function detectFramework(
+  eco: Ecosystem,
+  pkg: Record<string, any> | null,
+  topLevelFiles: string[],
+  allFiles: string[],
+): string | null {
+  if (eco === 'node' && pkg) {
+    const deps: Record<string, unknown> = {
+      ...(pkg['dependencies'] ?? {}),
+      ...(pkg['devDependencies'] ?? {}),
+    };
+    if (deps['next']) return 'next.js';
+    if (deps['nuxt']) return 'nuxt';
+    if (deps['@remix-run/node'] || deps['@remix-run/serve']) return 'remix';
+    if (deps['astro']) return 'astro';
+    if (deps['@nestjs/core']) return 'nest.js';
+    if (deps['fastify']) return 'fastify';
+    if (deps['express']) return 'express';
+    if (deps['hono']) return 'hono';
+    if (deps['svelte']) return 'sveltekit';
+    if (deps['vite']) return 'vite';
+  }
+  if (eco === 'python') {
+    if (allFiles.some((f) => /fastapi/i.test(f))) return 'fastapi';
+    if (allFiles.some((f) => /django/i.test(f) || f.endsWith('/manage.py'))) return 'django';
+    if (topLevelFiles.includes('manage.py')) return 'django';
+    if (allFiles.some((f) => /flask/i.test(f))) return 'flask';
+  }
+  if (eco === 'go') {
+    // Look for common frameworks
+    const mod = topLevelFiles.includes('go.mod');
+    if (mod) return 'go (stdlib or gin/echo)';
+  }
+  if (eco === 'ruby') {
+    if (allFiles.some((f) => f === 'config.ru' || f.includes('app/controllers/'))) return 'rails';
   }
   return null;
 }
 
-function detectJsFramework(pkg: Record<string, any>): string | null {
-  const deps: Record<string, unknown> = {
-    ...(pkg['dependencies'] ?? {}),
-    ...(pkg['devDependencies'] ?? {}),
-  };
-  if (deps['next']) return 'next.js';
-  if (deps['nuxt']) return 'nuxt';
-  if (deps['@remix-run/node']) return 'remix';
-  if (deps['express']) return 'express';
-  if (deps['fastify']) return 'fastify';
-  if (deps['@nestjs/core']) return 'nest.js';
-  if (deps['svelte']) return 'svelte';
-  if (deps['astro']) return 'astro';
+function detectPackageManager(eco: Ecosystem, files: string[]): PackageManager {
+  if (eco === 'node') {
+    if (files.includes('pnpm-lock.yaml')) return 'pnpm';
+    if (files.includes('yarn.lock')) return 'yarn';
+    if (files.includes('bun.lockb') || files.includes('bun.lock')) return 'bun';
+    if (files.includes('package-lock.json')) return 'npm';
+  }
+  if (eco === 'python') {
+    if (files.includes('uv.lock')) return 'uv';
+    if (files.includes('poetry.lock')) return 'poetry';
+    return 'pip';
+  }
+  if (eco === 'rust') return 'cargo';
+  if (eco === 'go') return 'go-mod';
+  if (eco === 'ruby') return 'gem';
+  if (eco === 'php') return 'composer';
+  if (eco === 'dotnet') return 'nuget';
+  if (eco === 'elixir') return 'mix';
+  if (eco === 'dart-flutter') return 'pub';
   return null;
 }
 
-function detectPackageManager(files: string[]): 'npm' | 'pnpm' | 'yarn' | null {
-  if (files.includes('pnpm-lock.yaml')) return 'pnpm';
-  if (files.includes('yarn.lock')) return 'yarn';
-  if (files.includes('package-lock.json')) return 'npm';
-  return null;
+function detectMonorepo(
+  files: string[],
+  pkg: Record<string, any> | null,
+): { isMonorepo: boolean; monorepoTool: MonorepoTool; workspaces: string[] } {
+  if (files.includes('turbo.json')) return { isMonorepo: true, monorepoTool: 'turbo', workspaces: pkgWorkspaces(pkg) };
+  if (files.includes('nx.json')) return { isMonorepo: true, monorepoTool: 'nx', workspaces: [] };
+  if (files.includes('pnpm-workspace.yaml')) return { isMonorepo: true, monorepoTool: 'pnpm-workspaces', workspaces: [] };
+  if (files.includes('lerna.json')) return { isMonorepo: true, monorepoTool: 'lerna', workspaces: pkgWorkspaces(pkg) };
+  if (pkg && Array.isArray(pkg['workspaces'])) return { isMonorepo: true, monorepoTool: 'yarn-workspaces', workspaces: pkgWorkspaces(pkg) };
+  return { isMonorepo: false, monorepoTool: null, workspaces: [] };
+}
+
+function pkgWorkspaces(pkg: Record<string, any> | null): string[] {
+  const ws = pkg?.['workspaces'];
+  if (Array.isArray(ws)) return ws as string[];
+  if (ws && typeof ws === 'object' && Array.isArray(ws.packages)) return ws.packages as string[];
+  return [];
 }
 
 function detectExistingPlatform(files: string[], evidence: string[]): Platform | null {
@@ -192,62 +513,278 @@ function detectExistingPlatform(files: string[], evidence: string[]): Platform |
   return null;
 }
 
+function readDockerfileBase(localPath: string): string | null {
+  const raw = tryReadFile(localPath, 'Dockerfile');
+  if (!raw) return null;
+  const fromLine = raw
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => /^FROM\s+/i.test(line));
+  if (!fromLine) return null;
+  const image = fromLine.replace(/^FROM\s+/i, '').split(' ')[0];
+  return image ?? null;
+}
+
 function inferTopology(
-  files: string[],
+  eco: Ecosystem,
+  framework: string | null,
+  allFiles: string[],
   pkg: Record<string, any> | null,
-  evidence: string[],
 ): ScanResult['topology'] {
+  const deps = pkg
+    ? { ...(pkg['dependencies'] ?? {}), ...(pkg['devDependencies'] ?? {}) }
+    : {};
   const hasWorker =
-    files.some((f) => /worker|queue|job/i.test(f)) ||
-    (pkg ? 'bullmq' in (pkg['dependencies'] ?? {}) : false);
+    allFiles.some((f) => /\b(worker|queue|job)s?\b/i.test(f)) ||
+    'bullmq' in deps ||
+    'bee-queue' in deps ||
+    'celery' in deps;
 
-  if (pkg && ('next' in (pkg['dependencies'] ?? {}))) {
-    if (hasWorker) {
-      evidence.push('next.js + worker signal');
-      return 'web+worker';
-    }
-    evidence.push('next.js → web');
-    return 'web';
+  if (eco === 'static') return 'static';
+  if (framework === 'next.js' || framework === 'nuxt' || framework === 'sveltekit' || framework === 'remix') {
+    return hasWorker ? 'web+worker' : 'web';
   }
-
-  if (files.includes('index.html') && !pkg) {
-    evidence.push('static site (index.html, no package.json)');
-    return 'static';
+  if (framework === 'astro' || framework === 'vite') return 'static';
+  if (framework === 'fastapi' || framework === 'django' || framework === 'flask') return hasWorker ? 'web+worker' : 'web';
+  if (framework === 'express' || framework === 'fastify' || framework === 'hono' || framework === 'nest.js') {
+    return hasWorker ? 'web+worker' : 'api';
   }
-
-  if (hasWorker) return 'web+worker';
-  if (pkg) return 'web';
-  return 'unknown';
+  if (eco === 'node' && pkg) return hasWorker ? 'web+worker' : 'web';
+  if (eco === 'rust' || eco === 'go' || eco === 'java-jvm') return 'api';
+  if (eco === 'swift' || eco === 'kotlin-android' || eco === 'dart-flutter') return 'unknown';
+  return hasWorker ? 'web+worker' : 'unknown';
 }
 
 function detectDataLayer(
+  localPath: string,
   files: string[],
   pkg: Record<string, any> | null,
   evidence: string[],
 ): string[] {
-  const found: string[] = [];
+  const found = new Set<string>();
   const deps: Record<string, unknown> = pkg
     ? { ...(pkg['dependencies'] ?? {}), ...(pkg['devDependencies'] ?? {}) }
     : {};
 
   if ('prisma' in deps || '@prisma/client' in deps) {
-    found.push('postgres-via-prisma');
+    found.add('postgres-via-prisma');
     evidence.push('prisma detected');
   }
-  if ('pg' in deps) found.push('postgres');
-  if ('mysql' in deps || 'mysql2' in deps) found.push('mysql');
-  if ('mongodb' in deps || 'mongoose' in deps) found.push('mongodb');
-  if ('redis' in deps || 'ioredis' in deps) found.push('redis');
-  if (files.includes('docker-compose.yml') || files.includes('docker-compose.yaml')) {
-    const raw = (() => {
-      try {
-        return readFileSync(join(files[0] ?? '', 'docker-compose.yml'), 'utf8');
-      } catch {
-        return '';
-      }
-    })();
-    if (/postgres/i.test(raw) && !found.includes('postgres')) found.push('postgres');
-    if (/redis/i.test(raw) && !found.includes('redis')) found.push('redis');
+  if ('pg' in deps || 'postgres' in deps) found.add('postgres');
+  if ('mysql' in deps || 'mysql2' in deps) found.add('mysql');
+  if ('mongodb' in deps || 'mongoose' in deps) found.add('mongodb');
+  if ('redis' in deps || 'ioredis' in deps) found.add('redis');
+  if ('@elastic/elasticsearch' in deps) found.add('elasticsearch');
+  if ('sqlite3' in deps || 'better-sqlite3' in deps) found.add('sqlite');
+
+  for (const cf of ['docker-compose.yml', 'docker-compose.yaml']) {
+    if (files.includes(cf)) {
+      const raw = tryReadFile(localPath, cf) ?? '';
+      if (/postgres/i.test(raw)) found.add('postgres');
+      if (/redis/i.test(raw)) found.add('redis');
+      if (/mongo/i.test(raw)) found.add('mongodb');
+      if (/elasticsearch|opensearch/i.test(raw)) found.add('elasticsearch');
+      if (/mysql/i.test(raw)) found.add('mysql');
+      evidence.push(`docker-compose references: ${[...found].join(', ') || 'none'}`);
+    }
   }
-  return Array.from(new Set(found));
+  return [...found];
+}
+
+function detectSourceDirs(eco: Ecosystem, topLevelDirs: string[]): string[] {
+  const common = ['src', 'app', 'lib', 'pages', 'components', 'server', 'api', 'routes', 'handlers'];
+  const swift = ['Sources', 'Tests', 'App', 'Shared'];
+  const python = ['src', 'app', 'api', 'backend'];
+  const rust = ['src', 'crates'];
+  const pool = eco === 'swift' ? swift : eco === 'python' ? python : eco === 'rust' ? rust : common;
+  return topLevelDirs.filter((d) => pool.includes(d));
+}
+
+function detectTestDirs(topLevelDirs: string[], allFiles: string[]): string[] {
+  const found = new Set<string>();
+  const patterns = ['tests', 'test', '__tests__', 'spec', 'specs', 'e2e', 'integration'];
+  for (const d of topLevelDirs) {
+    if (patterns.includes(d)) found.add(d);
+  }
+  if (allFiles.some((f) => /\.test\.(t|j)sx?$/.test(f) || /\.spec\.(t|j)sx?$/.test(f))) {
+    found.add('co-located *.test/*.spec files');
+  }
+  return [...found];
+}
+
+function detectHealthPath(localPath: string, allFiles: string[]): string | null {
+  const candidates = [
+    'app/api/health/route.ts',
+    'app/api/health/route.js',
+    'pages/api/health.ts',
+    'pages/api/health.js',
+    'src/routes/health.ts',
+    'src/health.ts',
+  ];
+  for (const c of candidates) {
+    if (allFiles.includes(c)) return '/api/health';
+  }
+  if (allFiles.some((f) => f.endsWith('health.ts') || f.endsWith('health.js'))) {
+    return '/health';
+  }
+  // Last-ditch: grep a small set of likely files
+  const routeFiles = allFiles.filter((f) => /routes?\.(t|j)sx?$|server\.(t|j)sx?$|main\.(t|j)sx?$/.test(f)).slice(0, 5);
+  for (const rf of routeFiles) {
+    const raw = tryReadFile(localPath, rf);
+    if (raw && /['"`]\/health['"`]/.test(raw)) return '/health';
+  }
+  return null;
+}
+
+function detectPort(
+  pkg: Record<string, any> | null,
+  scripts: Record<string, string>,
+  localPath: string,
+  allFiles: string[],
+): number | null {
+  for (const [, cmd] of Object.entries(scripts)) {
+    const m = cmd.match(/--port[= ](\d+)/);
+    if (m && m[1]) return Number(m[1]);
+  }
+  if (pkg?.['name'] === 'convoy') return null;
+  const dockerfile = tryReadFile(localPath, 'Dockerfile');
+  if (dockerfile) {
+    const m = dockerfile.match(/EXPOSE\s+(\d+)/);
+    if (m && m[1]) return Number(m[1]);
+  }
+  for (const f of allFiles.slice(0, 40)) {
+    if (/\.(t|j)sx?$/.test(f) && /(server|index|main)/i.test(f)) {
+      const raw = tryReadFile(localPath, f);
+      if (!raw) continue;
+      const m = raw.match(/listen\(\s*(\d+)/);
+      if (m && m[1]) return Number(m[1]);
+    }
+  }
+  return null;
+}
+
+function readReadmeExcerpt(
+  localPath: string,
+  topLevelFiles: string[],
+): { title: string | null; firstPara: string | null } {
+  const readmeName = topLevelFiles.find((f) => /^readme(\.md|\.markdown)?$/i.test(f));
+  if (!readmeName) return { title: null, firstPara: null };
+  const raw = tryReadFile(localPath, readmeName);
+  if (!raw) return { title: null, firstPara: null };
+  const lines = raw.split('\n').map((l) => l.trim());
+  const titleLine = lines.find((l) => l.startsWith('# '));
+  const title = titleLine ? titleLine.slice(2).trim() : null;
+  const paraLines: string[] = [];
+  let started = false;
+  for (const l of lines) {
+    if (!started && l.startsWith('# ')) continue;
+    if (!started && l === '') continue;
+    if (l.startsWith('#')) break;
+    if (l === '' && paraLines.length > 0) break;
+    if (l !== '') {
+      paraLines.push(l);
+      started = true;
+    }
+  }
+  const firstPara = paraLines.join(' ').slice(0, 240) || null;
+  return { title, firstPara };
+}
+
+function determineDeployability(
+  eco: Ecosystem,
+  topology: ScanResult['topology'],
+  framework: string | null,
+  topLevelFiles: string[],
+  isMonorepo: boolean,
+): { deployability: Deployability; deployabilityReason: string } {
+  if (eco === 'swift' || eco === 'kotlin-android' || eco === 'dart-flutter') {
+    return {
+      deployability: 'not-cloud-deployable',
+      deployabilityReason:
+        'This looks like a mobile or desktop app target. Convoy ships web services and static sites; app stores (App Store / Play Store / TestFlight / Firebase Distribution) are the right channel.',
+    };
+  }
+  if (eco === 'static') {
+    return {
+      deployability: 'deployable-static-site',
+      deployabilityReason: 'Static site — Convoy will deploy it to a CDN-backed platform.',
+    };
+  }
+  if (framework === 'astro' || framework === 'vite') {
+    return {
+      deployability: 'deployable-static-site',
+      deployabilityReason: `${framework} output is predominantly static; Convoy will treat it as a static site with server components where applicable.`,
+    };
+  }
+  if (topology === 'unknown' && !framework && !topLevelFiles.includes('Dockerfile')) {
+    return {
+      deployability: 'ambiguous',
+      deployabilityReason:
+        'Convoy could not confirm this is a deployable web service. No web framework, no Dockerfile, no obvious entry point. Override with --platform and add a Dockerfile if you intend to deploy this.',
+    };
+  }
+  if (isMonorepo) {
+    return {
+      deployability: 'deployable-web-service',
+      deployabilityReason:
+        'Detected a monorepo. Convoy will plan a deployment for the top-level service; pass --workspace=<pkg> in a later version to target a specific package.',
+    };
+  }
+  return {
+    deployability: 'deployable-web-service',
+    deployabilityReason: 'Deployable web service.',
+  };
+}
+
+function collectRisks(
+  risks: ScanRisk[],
+  eco: Ecosystem,
+  framework: string | null,
+  dataLayer: string[],
+  hasDockerfile: boolean,
+  healthPath: string | null,
+  testDirs: string[],
+  scripts: Record<string, string>,
+  isMonorepo: boolean,
+): void {
+  if (dataLayer.some((d) => d.includes('postgres') || d.includes('mysql'))) {
+    risks.push({
+      level: 'info',
+      message: 'Relational DB detected. Rehearsal will run a migration dry-run against scratch data before applying.',
+    });
+  }
+  if (!healthPath && framework) {
+    risks.push({
+      level: 'warn',
+      message: `No explicit health endpoint detected. Convoy will target /health; consider adding a real route or the platform's health check will rely on TCP only.`,
+    });
+  }
+  if (testDirs.length === 0 && !scripts['test']) {
+    risks.push({
+      level: 'info',
+      message: 'No test suite detected. Rehearsal will skip automated smoke tests and rely on health probes + synthetic load.',
+    });
+  }
+  if (hasDockerfile) {
+    risks.push({
+      level: 'info',
+      message: 'Existing Dockerfile detected. Convoy will use it as-is (developer-authored); it will not be rewritten.',
+    });
+  }
+  if (isMonorepo) {
+    risks.push({
+      level: 'warn',
+      message: 'Monorepo detected. First-pass plan targets the root; explicit workspace targeting is a follow-up feature.',
+    });
+  }
+  if (eco === 'unknown') {
+    risks.push({
+      level: 'block',
+      message: 'Ecosystem could not be identified. Convoy will not proceed to apply without a recognized project manifest (package.json, pyproject.toml, go.mod, Cargo.toml, etc.).',
+    });
+  }
+}
+
+export function repoName(localPath: string): string {
+  return basename(localPath).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'convoy-app';
 }
