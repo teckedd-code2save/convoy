@@ -266,6 +266,10 @@ interface ApplyOpts {
   injectFailure?: string;
   logs?: string;
   envFile?: string;
+  probePath?: string[];
+  probeRequests?: number;
+  probeConcurrency?: number;
+  env?: Record<string, string>;
 }
 
 async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
@@ -356,7 +360,11 @@ function buildRealRehearsalOpts(plan: ConvoyPlan, opts: ApplyOpts): RealRehearsa
   const buildCommand = rehearsal.buildCommand ?? undefined;
 
   const envFilePath = opts.envFile ?? `${plan.target.localPath}/.env.convoy-rehearsal`;
-  const env = existsSync(envFilePath) ? parseEnvFile(envFilePath) : {};
+  const fileEnv = existsSync(envFilePath) ? parseEnvFile(envFilePath) : {};
+  const env: Record<string, string> = { ...fileEnv, ...(opts.env ?? {}) };
+
+  const userProbePaths = opts.probePath && opts.probePath.length > 0 ? opts.probePath : null;
+  const probePaths = userProbePaths ?? [healthPath];
 
   const result: RealRehearsalOpt = {
     repoPath: plan.target.localPath,
@@ -365,9 +373,9 @@ function buildRealRehearsalOpts(plan: ConvoyPlan, opts: ApplyOpts): RealRehearsa
     healthPath,
     metricsPath,
     convoyAuthoredFiles: plan.author.convoyAuthoredFiles.map((f) => f.path),
-    probeRequests: 60,
-    probeConcurrency: 4,
-    probePaths: [metricsPath, healthPath],
+    probeRequests: opts.probeRequests ?? 60,
+    probeConcurrency: opts.probeConcurrency ?? 4,
+    probePaths,
     maxErrorRatePct: 1.0,
     maxP99Ms: 500,
   };
@@ -545,6 +553,19 @@ program
   .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary (triggers medic with fixture logs)')
   .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
   .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
+  .option(
+    '--probe-path <path>',
+    'probe path for real rehearsal load (repeatable; default: the detected health path)',
+    (value: string, acc: string[]) => [...acc, value],
+    [] as string[],
+  )
+  .option('--probe-requests <n>', 'number of requests in the real rehearsal probe', (v) => Number(v))
+  .option('--probe-concurrency <n>', 'concurrency in the real rehearsal probe', (v) => Number(v))
+  .option('--env <kv>', 'env var to pass to the subprocess, KEY=VALUE (repeatable)', (value: string, acc: Record<string, string>) => {
+    const idx = value.indexOf('=');
+    if (idx > 0) acc[value.slice(0, idx)] = value.slice(idx + 1);
+    return acc;
+  }, {} as Record<string, string>)
   .action(async (planId: string, options: ApplyOpts) => {
     await runApply(planId, options);
   });
