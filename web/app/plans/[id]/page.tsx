@@ -201,30 +201,50 @@ function Step({
 }
 
 function PlatformSection({ plan }: { plan: PlanSummary }) {
+  const advisory = computePlatformAdvisory(plan);
+  const sortedCandidates = [...plan.platform.candidates].sort((a, b) => b.score - a.score);
+
   return (
     <section className="space-y-4">
       <h2 className="text-sm font-semibold uppercase tracking-wider text-[color:var(--color-muted)]">
         Why this platform
       </h2>
-      <div className="border border-[color:var(--color-rule)] rounded-lg p-5 bg-white space-y-3">
-        <p className="leading-relaxed">{plan.platform.reason}</p>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 pt-2">
-          {plan.platform.candidates.map((c) => {
+      <div className="border border-[color:var(--color-rule)] rounded-lg p-5 bg-white space-y-4">
+        <div className="flex items-start gap-3">
+          <span className="inline-block w-2 h-2 rounded-full bg-[color:var(--color-accent)] mt-2 shrink-0" />
+          <div className="flex-1">
+            <div className="flex items-center gap-2">
+              <span className="font-mono font-semibold">{plan.platform.chosen}</span>
+              <SourceBadge source={plan.platform.source} />
+            </div>
+            <p className="leading-relaxed mt-1">{plan.platform.reason}</p>
+          </div>
+        </div>
+
+        {advisory ? (
+          <div className="flex items-start gap-3 p-3 rounded-md bg-[color:var(--color-warn)]/10 border border-[color:var(--color-warn)]/30">
+            <span className="text-[color:var(--color-warn)] text-sm font-semibold shrink-0">Advisory</span>
+            <div className="flex-1 text-sm leading-relaxed">{advisory}</div>
+          </div>
+        ) : null}
+
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 pt-1">
+          {sortedCandidates.map((c) => {
             const chosen = c.platform === plan.platform.chosen;
             return (
               <div
                 key={c.platform}
-                className={`border rounded-md p-3 ${chosen ? 'border-[color:var(--color-accent)] bg-[color:var(--color-accent)]/5' : 'border-[color:var(--color-rule)]'}`}
+                className={`border rounded-md p-3 relative ${chosen ? 'border-[color:var(--color-accent)] bg-[color:var(--color-accent)]/5 ring-1 ring-[color:var(--color-accent)]/30' : 'border-[color:var(--color-rule)]'}`}
               >
+                {chosen ? (
+                  <span className="absolute -top-2 left-3 text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-[color:var(--color-accent)] text-white font-semibold">
+                    chosen
+                  </span>
+                ) : null}
                 <div className="flex items-center justify-between">
                   <span className="font-mono text-sm font-semibold">{c.platform}</span>
-                  <span className="text-xs text-[color:var(--color-muted)]">{c.score}</span>
+                  <span className="text-xs text-[color:var(--color-muted)] font-mono tabular-nums">{c.score}</span>
                 </div>
-                {chosen ? (
-                  <div className="text-[10px] text-[color:var(--color-accent)] mt-1 uppercase tracking-wider font-medium">
-                    chosen
-                  </div>
-                ) : null}
                 <div className="text-xs text-[color:var(--color-muted)] mt-2 line-clamp-3">{c.reason}</div>
               </div>
             );
@@ -233,6 +253,39 @@ function PlatformSection({ plan }: { plan: PlanSummary }) {
       </div>
     </section>
   );
+}
+
+function SourceBadge({ source }: { source: string }) {
+  const styles: Record<string, string> = {
+    override: 'bg-[color:var(--color-accent)]/10 text-[color:var(--color-accent)]',
+    'existing-config': 'bg-[color:var(--color-warn)]/10 text-[color:var(--color-warn)]',
+    scored: 'bg-[color:var(--color-success)]/10 text-[color:var(--color-success)]',
+    refused: 'bg-[color:var(--color-danger)]/10 text-[color:var(--color-danger)]',
+  };
+  return (
+    <span className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded font-medium ${styles[source] ?? styles['scored']!}`}>
+      {source.replace('-', ' ')}
+    </span>
+  );
+}
+
+function computePlatformAdvisory(plan: PlanSummary): string | null {
+  if (plan.deployability.verdict === 'not-cloud-deployable') return null;
+  const candidates = plan.platform.candidates;
+  if (candidates.length === 0) return null;
+  const sorted = [...candidates].sort((a, b) => b.score - a.score);
+  const topScored = sorted[0];
+  if (!topScored || topScored.platform === plan.platform.chosen) return null;
+  const chosenScore = candidates.find((c) => c.platform === plan.platform.chosen)?.score ?? 0;
+  if (topScored.score - chosenScore < 10) return null;
+  const flag = `--platform=${topScored.platform}`;
+  if (plan.platform.source === 'existing-config') {
+    return `${topScored.platform} scored higher (${topScored.score} vs ${chosenScore}) on the heuristic. Convoy is honoring your existing config for ${plan.platform.chosen}. Rerun with ${flag} to switch platforms instead.`;
+  }
+  if (plan.platform.source === 'override') {
+    return `${topScored.platform} scored higher (${topScored.score} vs ${chosenScore}). You chose ${plan.platform.chosen} explicitly — this is just a note, not a correction.`;
+  }
+  return null;
 }
 
 function RisksSection({ risks }: { risks: PlanSummary['risks'] }) {

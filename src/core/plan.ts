@@ -205,9 +205,21 @@ export function renderPlan(plan: ConvoyPlan): string {
   L.push('');
 
   L.push('Why this platform');
-  const rankings = plan.platform.candidates.map((c) => `${c.platform} ${c.score}`).join(' · ');
-  L.push(`  ${plan.platform.chosen} chosen (${plan.platform.source})  —  ${rankings}`);
+  const rankings = plan.platform.candidates
+    .map((c) => {
+      const marker = c.platform === plan.platform.chosen ? '●' : '·';
+      return `${marker} ${c.platform} ${c.score}`;
+    })
+    .join('   ');
+  L.push(`  ${plan.platform.chosen} chosen (${plan.platform.source})`);
+  L.push(`  ${rankings}`);
   L.push(`  ${wrap(plan.platform.reason, 72, '  ').trim()}`);
+
+  const advisory = computePlatformAdvisory(plan);
+  if (advisory) {
+    L.push('');
+    L.push(`  Advisory: ${wrap(advisory, 72, '            ').trim()}`);
+  }
   L.push('');
 
   if (plan.risks.length > 0) {
@@ -229,6 +241,24 @@ export function renderPlan(plan: ConvoyPlan): string {
   L.push(`Estimated run: ${plan.estimate.runTimeMinutesMin}–${plan.estimate.runTimeMinutesMax} min · Opus spend $${plan.estimate.opusSpendUsdMin.toFixed(2)}–$${plan.estimate.opusSpendUsdMax.toFixed(2)}`);
 
   return L.join('\n');
+}
+
+export function computePlatformAdvisory(plan: ConvoyPlan): string | null {
+  if (plan.deployability.verdict === 'not-cloud-deployable') return null;
+  const candidates = plan.platform.candidates;
+  if (candidates.length === 0) return null;
+  const topScored = [...candidates].sort((a, b) => b.score - a.score)[0];
+  if (!topScored || topScored.platform === plan.platform.chosen) return null;
+  const chosenScore = candidates.find((c) => c.platform === plan.platform.chosen)?.score ?? 0;
+  if (topScored.score - chosenScore < 10) return null;
+  const flag = `--platform=${topScored.platform}`;
+  if (plan.platform.source === 'existing-config') {
+    return `${topScored.platform} scored higher (${topScored.score} vs ${chosenScore}) on the heuristic. Convoy is honoring your existing config for ${plan.platform.chosen}. Rerun with ${flag} to switch platforms instead.`;
+  }
+  if (plan.platform.source === 'override') {
+    return `${topScored.platform} scored higher (${topScored.score} vs ${chosenScore}). You chose ${plan.platform.chosen} explicitly — this is just a note, not a correction.`;
+  }
+  return null;
 }
 
 function wrap(text: string, width: number, indent: string): string {

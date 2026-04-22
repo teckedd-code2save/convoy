@@ -15,7 +15,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "dev": "tsx watch src/index.ts",
-    "convoy": "tsx src/cli.ts"
+    "convoy": "tsx --env-file-if-exists=.env src/cli.ts"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
