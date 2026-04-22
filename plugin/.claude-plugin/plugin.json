@@ -1,8 +1,9 @@
 {
   "name": "convoy",
-  "version": "0.0.1",
-  "description": "Deployment agent that rehearses, ships, and observes — without touching your code.",
-  "author": "serendepify",
+  "version": "0.1.0",
+  "description": "Deployment agent that rehearses, ships, and observes — without touching your code. Shells out to the Convoy CLI at $CONVOY_HOME (default: ~/convoy).",
+  "author": { "name": "serendepify" },
   "license": "MIT",
-  "homepage": "https://github.com/teckedd-code2save/convoy"
+  "homepage": "https://github.com/teckedd-code2save/convoy",
+  "keywords": ["deployment", "ci", "cd", "fly.io", "vercel", "github", "agent"]
 }

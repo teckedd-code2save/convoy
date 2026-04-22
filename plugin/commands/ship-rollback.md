@@ -1,28 +1,30 @@
 ---
-description: Roll back the most recent successful deployment for a service.
-argument-hint: <service-name> [--to=<release-id>]
+description: Roll back a deployed service to its previous healthy release. Privileged — always requires approval.
+argument-hint: <service-name-or-run-id>
 ---
 
-Trigger a rollback of a deployed service.
+Rollback is a privileged operation that reverts the production release without touching the newer images. Convoy supports it on Fly (redeploy the prior image via `fly deploy --image <ref> --strategy=immediate`) and Vercel (alias the prod domain to a prior deployment).
 
-## Arguments
+## Run the CLI
 
-- `$ARGUMENTS` — parse the service name (required) and optional target release.
-  - `--to=<release-id>` — roll back to a specific prior release. Defaults to the
-    release immediately before the current one.
+```bash
+cd "${CONVOY_HOME:-$HOME/convoy}" && npm run convoy -- rollback $ARGUMENTS
+```
 
-## Operating procedure
+> **Note:** the standalone `convoy rollback` CLI command is a placeholder today. Rollback is wired as an automatic response to observe-stage breach in the main pipeline — if a live deploy fails its bake window, Convoy calls the rollback path itself. For an **explicit** rollback of a healthy-but-unwanted release, run:
+>
+> **Fly:**
+> ```bash
+> fly releases --app <app-name>            # list versions + image refs
+> fly deploy --image <prior-ref> --strategy=immediate --app <app-name>
+> ```
+>
+> **Vercel:**
+> ```bash
+> vercel ls                                 # list deployments
+> vercel alias set <prior-deployment-url> <prod-alias>
+> ```
 
-1. Resolve the service to its current deployment and platform adapter.
-2. Identify the target rollback release. Verify the release exists and is reachable.
-3. Produce a summary: current release, target release, expected rollback duration,
-   any data-layer implications (e.g., reversed migrations needed).
-4. Pause for human approval (`rollback` approval kind). Rollback is a privileged
-   action and always requires confirmation.
-5. On approval, invoke the adapter's `rollback` method.
-6. Verify the restored release with an independent health check — not just the
-   platform's return code.
-7. Emit a rollback event and a receipt: restored release, duration, verification result.
+## Approvals
 
-If the rollback fails, do not retry automatically. Escalate to the human with the
-full context and suggested next steps.
+If an automatic rollback has already fired, the run's outcome is recorded in SQLite with the reason and restored version — check via `/convoy:ship-status <run-id>` or the web UI. No further action is needed to undo; the service is already serving the prior release.

@@ -1,21 +1,26 @@
 ---
-description: Show the live timeline of a Convoy run — stages, events, approvals, and current blockers.
-argument-hint: [run-id]
+description: Show the status of a Convoy run — most recent, or a specific run id.
+argument-hint: [run-id-or-prefix]
 ---
 
-Report the status of a Convoy run.
+Run the Convoy status command:
 
-## Behavior
+```bash
+cd "${CONVOY_HOME:-$HOME/convoy}" && npm run convoy -- status $ARGUMENTS
+```
 
-- If `$ARGUMENTS` is empty, show the status of the **most recent run**.
-- If a run ID is provided, show the status of that specific run.
+Surface the output verbatim. It includes:
 
-## What to report
+- Run id, status (`pending` / `running` / `awaiting_approval` / `awaiting_fix` / `succeeded` / `failed` / `rolled_back`)
+- Repository, platform, live URL
+- Per-stage success / failure markers
+- Pending approvals (with approval id)
+- Outcome reason and restored version when a run was rolled back
 
-1. Run header: id, repo URL, platform, start time, elapsed, status.
-2. Stage-by-stage summary with status per stage (scan, pick, author, rehearse, canary, promote, observe).
-3. Current blocker if any — pending approval, awaiting developer commit, waiting for bake window.
-4. Last five events with timestamps.
-5. A link to the web viewer if configured.
+If the user wants to see the full timeline, point them at:
 
-Keep it terse. One screen is better than a long scroll.
+```
+http://localhost:3737/runs/<run-id>
+```
+
+That page auto-refreshes every 1.5s while the run is live and renders the medic diagnosis card prominently when present.
