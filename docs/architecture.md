@@ -1,13 +1,79 @@
 # Architecture
 
+## System at a glance
+
+```mermaid
+flowchart TB
+  subgraph Operator[Operator surfaces]
+    CLI["Convoy CLI<br/>commander + tsx"]
+    Web["Web viewer<br/>Next.js 15 + Tailwind"]
+    Plugin["Claude Code plugin<br/>slash commands + subagents"]
+  end
+
+  subgraph Core[Convoy core]
+    Scanner["scanner<br/>ecosystem · deps · topology"]
+    Picker["picker<br/>existing config · override · scored"]
+    Author["author<br/>drafts only Convoy-owned files"]
+    Enricher["enricher (Opus 4.7)<br/>summary · reason · narrative · Dockerfile"]
+    Orch["orchestrator<br/>stage runner · approvals · abort"]
+    Medic["medic (Opus 4.7)<br/>log diagnosis · classification"]
+    Bus["event bus<br/>run · event · approval"]
+  end
+
+  subgraph Persistence[Persistence]
+    SQLite["SQLite<br/>runs · run_events · approvals"]
+    Plans["plans/*.json<br/>inspectable artifacts"]
+  end
+
+  subgraph Targets[Deployment targets]
+    Fly["fly"]
+    Railway["railway"]
+    Vercel["vercel"]
+    CloudRun["cloudrun"]
+  end
+
+  CLI --> Orch
+  Web --> SQLite
+  Plugin --> Orch
+
+  Orch --> Scanner
+  Scanner --> Picker
+  Picker --> Author
+  Author --> Enricher
+  Enricher --> Plans
+
+  Orch --> Bus
+  Bus --> SQLite
+
+  Orch -- "on failure" --> Medic
+  Medic --> Bus
+
+  Orch -. "deploy · ephemeral · logs · rollback" .-> Fly
+  Orch -. .-> Railway
+  Orch -. .-> Vercel
+  Orch -. .-> CloudRun
+
+  SQLite --> CLI
+  SQLite --> Web
+```
+
 ## Pipeline
 
 A Convoy run is a sequence of stages. Each stage produces evidence; the next stage runs only if the evidence passes policy.
 
-```
-scan → pick → author → rehearse → canary → promote → observe
-                        │           │         │         │
-                        └─ medic ───┴─ rollback ────────┘
+```mermaid
+flowchart LR
+  scan --> pick
+  pick --> author
+  author --> rehearse
+  rehearse --> canary
+  canary --> promote
+  promote --> observe
+  rehearse -. breach .-> medic["medic<br/>diagnose"]
+  canary -. breach .-> rollback["rollback<br/>pre-staged"]
+  observe -. slo breach .-> rollback
+  medic -. config fix .-> rehearse
+  medic -. code issue .-> pause["pause: awaiting developer"]
 ```
 
 | Stage | Responsibility | Gate |
@@ -76,7 +142,28 @@ Run state — events, approvals, artifacts, decisions — is persisted in a sing
 
 ## Interfaces
 
-- **CLI and Claude Code plugin** — primary operator surface. `/convoy ship <repo>` and friends.
-- **Web viewer** — live timeline, approval cards, log tail, rollback controls. Server-sent events over `/api/runs/[id]/stream`.
-- **MCP servers** — one per integration, exposing tools to the agent.
-- **Audit log** — append-only, signed, replayable for incident review.
+- **CLI** — primary operator surface. `convoy plan`, `convoy apply`, `convoy plans`, `convoy status`.
+- **Web viewer** — plan detail with drafted-file previews, runs list, live run timeline with polling refresh, approval buttons via server actions, medic diagnosis cards.
+- **Claude Code plugin** — `/convoy ship`, `/convoy-status`, `/convoy-rollback` slash commands; six subagents (scanner, picker, author, deployer, medic, correlator) defined as markdown files with tool scopes.
+- **MCP servers** — platform adapters (github, fly, railway, vercel, cloudrun) — declared in the plugin manifest; implementation tracked in Day 4+ work.
+- **Audit log** — `run_events` table. Every state change, every Opus reasoning artifact, every approval decision is recorded with a timestamp and is replayable for incident review.
+
+## Approval loop
+
+```mermaid
+sequenceDiagram
+  participant User
+  participant CLI
+  participant SQLite
+  participant Web
+
+  CLI->>SQLite: INSERT approval (status=pending)
+  CLI->>SQLite: poll every 400ms
+  User->>Web: open /runs/[id]
+  Web->>SQLite: SELECT run, events, approvals
+  Web-->>User: render (with Approve button)
+  User->>Web: click Approve
+  Web->>SQLite: UPDATE approvals SET status=approved
+  SQLite-->>CLI: next poll sees status=approved
+  CLI->>CLI: continue pipeline
+```
