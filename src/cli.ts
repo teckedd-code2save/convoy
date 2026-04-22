@@ -2,13 +2,18 @@
 import { Command } from 'commander';
 import pc from 'picocolors';
 
+import { resolve } from 'node:path';
+
 import { ConvoyBus, type ConvoyBusEvent } from './core/bus.js';
 import { Orchestrator } from './core/orchestrator.js';
+import { PlanStore, renderPlan } from './core/plan.js';
 import { defaultStages, type OrchestratorOpts } from './core/stages.js';
 import { RunStateStore } from './core/state.js';
 import type { Platform, Run, RunEvent, StageName } from './core/types.js';
+import { buildPlan } from './planner/index.js';
 
 const STATE_PATH = process.env['CONVOY_STATE_PATH'] ?? '.convoy/state.db';
+const PLANS_DIR = process.env['CONVOY_PLANS_DIR'] ?? '.convoy/plans';
 const SUPPORTED_PLATFORMS: readonly Platform[] = ['fly', 'railway', 'vercel', 'cloudrun'];
 
 const SYMBOL = {
@@ -174,6 +179,55 @@ async function runShip(repoUrl: string, opts: ShipOpts): Promise<void> {
   }
 }
 
+interface PlanOpts {
+  platform?: string;
+  repoUrl?: string;
+  save?: boolean;
+  json?: boolean;
+}
+
+async function runPlan(path: string, opts: PlanOpts): Promise<void> {
+  let platformOverride: Platform | undefined;
+  if (opts.platform !== undefined) {
+    if (!isPlatform(opts.platform)) {
+      console.error(
+        pc.red(
+          `Unknown platform "${opts.platform}". Supported: ${SUPPORTED_PLATFORMS.join(', ')}`,
+        ),
+      );
+      process.exit(2);
+    }
+    platformOverride = opts.platform;
+  }
+
+  const absPath = resolve(path);
+  try {
+    const plan = buildPlan(absPath, {
+      ...(opts.repoUrl !== undefined && { repoUrl: opts.repoUrl }),
+      ...(platformOverride !== undefined && { platformOverride }),
+    });
+
+    if (opts.json) {
+      process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
+    } else {
+      process.stdout.write(`${renderPlan(plan)}\n`);
+    }
+
+    if (opts.save) {
+      const store = new PlanStore(PLANS_DIR);
+      const saved = store.save(plan);
+      process.stdout.write(`\n${pc.dim('Saved plan to')} ${saved}\n`);
+      process.stdout.write(
+        `${pc.dim('Apply with')} ${pc.bold(`convoy apply ${plan.id}`)} ${pc.dim('(not yet implemented)')}\n`,
+      );
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(pc.red(`plan failed: ${message}`));
+    process.exitCode = 1;
+  }
+}
+
 async function runStatus(runId?: string): Promise<void> {
   const store = new RunStateStore(STATE_PATH);
   try {
@@ -251,6 +305,17 @@ program
   .option('--no-auto-approve', 'wait for external approval decisions instead of auto-approving in dry-run')
   .action(async (repoUrl: string, options: { platform?: string; live?: boolean; autoApprove: boolean }) => {
     await runShip(repoUrl, options);
+  });
+
+program
+  .command('plan <path>')
+  .description('Produce an inspectable plan of what `convoy apply` would do. Reads the target path; does not write or deploy anything.')
+  .option('--platform <platform>', 'explicit platform choice: fly | railway | vercel | cloudrun')
+  .option('--repo-url <url>', 'annotate the plan with a remote repo URL (does not fetch)')
+  .option('--save', 'persist the plan to .convoy/plans/<id>.json', false)
+  .option('--json', 'output the raw plan as JSON instead of the human-readable render', false)
+  .action(async (path: string, options: { platform?: string; repoUrl?: string; save?: boolean; json?: boolean }) => {
+    await runPlan(path, options);
   });
 
 program
