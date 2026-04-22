@@ -16,6 +16,7 @@ export interface OrchestratorOpts {
   platformOverride?: Platform;
   autoApprove?: boolean;
   injectFailure?: InjectFailureOpt;
+  planId?: string | null;
 }
 
 export type InjectFailureOpt = {

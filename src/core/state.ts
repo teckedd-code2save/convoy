@@ -23,7 +23,8 @@ const SCHEMA = `
     status         TEXT NOT NULL,
     started_at     TEXT NOT NULL,
     completed_at   TEXT,
-    live_url       TEXT
+    live_url       TEXT,
+    plan_id        TEXT
   );
 
   CREATE TABLE IF NOT EXISTS run_events (
@@ -57,6 +58,7 @@ interface RunRow {
   started_at: string;
   completed_at: string | null;
   live_url: string | null;
+  plan_id: string | null;
 }
 
 interface RunEventRow {
@@ -86,6 +88,7 @@ function toRun(row: RunRow): Run {
     startedAt: new Date(row.started_at),
     completedAt: row.completed_at ? new Date(row.completed_at) : null,
     liveUrl: row.live_url,
+    planId: row.plan_id,
   };
 }
 
@@ -127,19 +130,37 @@ export class RunStateStore {
     this.#db.pragma('journal_mode = WAL');
     this.#db.pragma('foreign_keys = ON');
     this.#db.exec(SCHEMA);
+    this.#migrate();
   }
 
-  createRun(repoUrl: string): Run {
+  #migrate(): void {
+    const cols = this.#db
+      .prepare<[], { name: string }>('PRAGMA table_info(runs)')
+      .all()
+      .map((c) => c.name);
+    if (!cols.includes('plan_id')) {
+      this.#db.exec('ALTER TABLE runs ADD COLUMN plan_id TEXT');
+    }
+  }
+
+  createRun(repoUrl: string, planId?: string | null): Run {
     const id = randomUUID();
     const now = new Date().toISOString();
     this.#db
       .prepare(
-        'INSERT INTO runs (id, repo_url, status, started_at) VALUES (?, ?, ?, ?)',
+        'INSERT INTO runs (id, repo_url, status, started_at, plan_id) VALUES (?, ?, ?, ?, ?)',
       )
-      .run(id, repoUrl, 'pending' satisfies RunStatus, now);
+      .run(id, repoUrl, 'pending' satisfies RunStatus, now, planId ?? null);
     const run = this.getRun(id);
     if (!run) throw new Error(`Run ${id} missing after insert`);
     return run;
+  }
+
+  listRunsForPlan(planId: string): Run[] {
+    const rows = this.#db
+      .prepare<[string], RunRow>('SELECT * FROM runs WHERE plan_id = ? ORDER BY started_at DESC')
+      .all(planId);
+    return rows.map(toRun);
   }
 
   getRun(id: string): Run | null {

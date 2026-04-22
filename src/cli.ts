@@ -290,6 +290,7 @@ async function runApply(
     dryRun: true,
     autoApprove: opts.autoApprove,
     platformOverride: plan.platform.chosen,
+    planId: plan.id,
   };
 
   if (opts.injectFailure === 'rehearse' || opts.injectFailure === 'canary') {

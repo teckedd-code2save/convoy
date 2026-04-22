@@ -20,7 +20,7 @@ export class Orchestrator {
   }
 
   async run(repoUrl: string, opts: OrchestratorOpts): Promise<Run> {
-    const created = this.#store.createRun(repoUrl);
+    const created = this.#store.createRun(repoUrl, opts.planId ?? null);
     this.#bus.emit({ type: 'run.created', run: created });
 
     const started = this.#store.updateRun(created.id, { status: 'running' });

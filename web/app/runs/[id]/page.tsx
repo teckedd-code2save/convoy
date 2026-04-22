@@ -29,6 +29,14 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
             ← Runs
           </a>
           <span className="font-mono text-xs text-muted">{run.id.slice(0, 8)}</span>
+          {run.planId ? (
+            <a
+              href={`/plans/${run.planId}`}
+              className="text-xs text-accent hover:underline font-mono"
+            >
+              plan {run.planId.slice(0, 8)} ↗
+            </a>
+          ) : null}
         </div>
         <div className="flex items-center gap-3 flex-wrap">
           <h1 className="text-3xl font-semibold tracking-tight truncate">{run.repoUrl}</h1>

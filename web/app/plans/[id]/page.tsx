@@ -1,6 +1,7 @@
 import { notFound } from 'next/navigation';
 
 import { getPlan, type PlanAuthoredFile, type PlanSummary } from '@/lib/plans';
+import { listRunsForPlan, type RunRow } from '@/lib/runs';
 
 export const dynamic = 'force-dynamic';
 
@@ -10,6 +11,7 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
   if (!plan) notFound();
 
   const notDeployable = plan.deployability.verdict === 'not-cloud-deployable';
+  const runs = listRunsForPlan(plan.id);
 
   return (
     <article className="space-y-10">
@@ -33,6 +35,8 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
       </header>
 
       <Summary plan={plan} notDeployable={notDeployable} />
+
+      {runs.length > 0 ? <RunsForPlan runs={runs} /> : null}
 
       {notDeployable ? null : (
         <>
@@ -61,6 +65,65 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
       )}
     </article>
   );
+}
+
+function RunsForPlan({ runs }: { runs: RunRow[] }) {
+  return (
+    <section className="space-y-4">
+      <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">
+        Runs from this plan ({runs.length})
+      </h2>
+      <ul className="divide-y divide-rule border border-rule rounded-lg overflow-hidden bg-card">
+        {runs.map((run) => (
+          <li key={run.id}>
+            <a
+              href={`/runs/${run.id}`}
+              className="flex items-center gap-6 px-5 py-3 hover:bg-rule/40 transition-colors"
+            >
+              <span className="font-mono text-xs text-muted shrink-0 w-20">
+                {run.id.slice(0, 8)}
+              </span>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap text-sm">
+                  <RunStatusBadge status={run.status} />
+                  {run.liveUrl ? (
+                    <span className="font-mono text-xs text-accent truncate">{run.liveUrl}</span>
+                  ) : null}
+                </div>
+              </div>
+              <div className="text-xs text-muted shrink-0">{formatDelta(run.startedAt)}</div>
+            </a>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function RunStatusBadge({ status }: { status: string }) {
+  const config: Record<string, { color: string; label: string }> = {
+    pending: { color: 'bg-muted', label: 'pending' },
+    running: { color: 'bg-accent animate-pulse', label: 'running' },
+    awaiting_approval: { color: 'bg-warn animate-pulse', label: 'awaiting approval' },
+    succeeded: { color: 'bg-success', label: 'succeeded' },
+    failed: { color: 'bg-danger', label: 'failed' },
+    rolled_back: { color: 'bg-danger', label: 'rolled back' },
+  };
+  const c = config[status] ?? { color: 'bg-muted', label: status };
+  return (
+    <span className="inline-flex items-center gap-1.5 text-xs font-medium">
+      <span className={`w-1.5 h-1.5 rounded-full ${c.color}`} />
+      {c.label}
+    </span>
+  );
+}
+
+function formatDelta(iso: string): string {
+  const delta = Date.now() - new Date(iso).getTime();
+  if (delta < 60_000) return 'just now';
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)}m ago`;
+  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)}h ago`;
+  return new Date(iso).toISOString().slice(0, 10);
 }
 
 function Summary({ plan, notDeployable }: { plan: PlanSummary; notDeployable: boolean }) {

@@ -15,6 +15,7 @@ export interface RunRow {
   startedAt: string;
   completedAt: string | null;
   liveUrl: string | null;
+  planId: string | null;
 }
 
 export interface EventRow {
@@ -46,30 +47,51 @@ function openDb(): Database.Database | null {
   }
 }
 
+type RawRunRow = {
+  id: string;
+  repo_url: string;
+  platform: string | null;
+  status: string;
+  started_at: string;
+  completed_at: string | null;
+  live_url: string | null;
+  plan_id: string | null;
+};
+
+function toRunRow(r: RawRunRow): RunRow {
+  return {
+    id: r.id,
+    repoUrl: r.repo_url,
+    platform: r.platform,
+    status: r.status,
+    startedAt: r.started_at,
+    completedAt: r.completed_at,
+    liveUrl: r.live_url,
+    planId: r.plan_id,
+  };
+}
+
 export function listRuns(limit = 30): RunRow[] {
   const db = openDb();
   if (!db) return [];
   try {
     const rows = db
-      .prepare<[number], {
-        id: string;
-        repo_url: string;
-        platform: string | null;
-        status: string;
-        started_at: string;
-        completed_at: string | null;
-        live_url: string | null;
-      }>('SELECT * FROM runs ORDER BY started_at DESC LIMIT ?')
+      .prepare<[number], RawRunRow>('SELECT * FROM runs ORDER BY started_at DESC LIMIT ?')
       .all(limit);
-    return rows.map((r) => ({
-      id: r.id,
-      repoUrl: r.repo_url,
-      platform: r.platform,
-      status: r.status,
-      startedAt: r.started_at,
-      completedAt: r.completed_at,
-      liveUrl: r.live_url,
-    }));
+    return rows.map(toRunRow);
+  } finally {
+    db.close();
+  }
+}
+
+export function listRunsForPlan(planId: string): RunRow[] {
+  const db = openDb();
+  if (!db) return [];
+  try {
+    const rows = db
+      .prepare<[string], RawRunRow>('SELECT * FROM runs WHERE plan_id = ? ORDER BY started_at DESC')
+      .all(planId);
+    return rows.map(toRunRow);
   } finally {
     db.close();
   }
@@ -80,60 +102,18 @@ export function getRun(id: string): RunRow | null {
   if (!db) return null;
   try {
     const row = db
-      .prepare<[string], {
-        id: string;
-        repo_url: string;
-        platform: string | null;
-        status: string;
-        started_at: string;
-        completed_at: string | null;
-        live_url: string | null;
-      }>('SELECT * FROM runs WHERE id = ?')
+      .prepare<[string], RawRunRow>('SELECT * FROM runs WHERE id = ?')
       .get(id);
-    if (!row) {
-      // Prefix match fallback
-      const all = db
-        .prepare<[], { id: string }>('SELECT id FROM runs ORDER BY started_at DESC LIMIT 100')
-        .all();
-      const match = all.find((r) => r.id.startsWith(id));
-      if (!match) return null;
-      return getRunInternal(db, match.id);
-    }
-    return {
-      id: row.id,
-      repoUrl: row.repo_url,
-      platform: row.platform,
-      status: row.status,
-      startedAt: row.started_at,
-      completedAt: row.completed_at,
-      liveUrl: row.live_url,
-    };
+    if (row) return toRunRow(row);
+    // Prefix match fallback
+    const all = db
+      .prepare<[], RawRunRow>('SELECT * FROM runs ORDER BY started_at DESC LIMIT 100')
+      .all();
+    const match = all.find((r) => r.id.startsWith(id));
+    return match ? toRunRow(match) : null;
   } finally {
     db.close();
   }
-}
-
-function getRunInternal(db: Database.Database, id: string): RunRow {
-  const row = db
-    .prepare<[string], {
-      id: string;
-      repo_url: string;
-      platform: string | null;
-      status: string;
-      started_at: string;
-      completed_at: string | null;
-      live_url: string | null;
-    }>('SELECT * FROM runs WHERE id = ?')
-    .get(id)!;
-  return {
-    id: row.id,
-    repoUrl: row.repo_url,
-    platform: row.platform,
-    status: row.status,
-    startedAt: row.started_at,
-    completedAt: row.completed_at,
-    liveUrl: row.live_url,
-  };
 }
 
 export function listEvents(runId: string): EventRow[] {

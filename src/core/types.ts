@@ -48,6 +48,7 @@ export interface Run {
   startedAt: Date;
   completedAt: Date | null;
   liveUrl: string | null;
+  planId: string | null;
 }
 
 export interface RunEvent {
