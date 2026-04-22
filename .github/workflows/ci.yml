@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  typecheck-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Smoke — ship dry-run
+        env:
+          CONVOY_STATE_PATH: ${{ runner.temp }}/convoy-state.db
+        run: npm run convoy -- ship https://github.com/convoy/smoke-test
+
+      - name: Smoke — status
+        env:
+          CONVOY_STATE_PATH: ${{ runner.temp }}/convoy-state.db
+        run: npm run convoy -- status
