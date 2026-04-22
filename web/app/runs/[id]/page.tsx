@@ -69,10 +69,125 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
         </section>
       ) : null}
 
+      <DiagnosisSection events={events} />
+
       <StagesSection events={events} />
 
       <TimelineSection events={events} />
     </article>
+  );
+}
+
+interface MedicDiagnosis {
+  rootCause: string;
+  classification: 'config' | 'code' | 'infrastructure' | 'unknown';
+  confidence: 'high' | 'medium' | 'low';
+  location?: { file: string; line?: number };
+  reproduction?: string;
+  suggestedFix?: { file: string; owned: 'convoy' | 'developer'; description: string; patch?: string };
+  narrative: string;
+  source: 'ai' | 'skipped-no-key' | 'error';
+}
+
+function DiagnosisSection({ events }: { events: EventRow[] }) {
+  const diagnoses = events.filter((e) => e.kind === 'diagnosis');
+  if (diagnoses.length === 0) return null;
+  return (
+    <section className="space-y-3">
+      <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">
+        Medic&apos;s diagnosis
+      </h2>
+      <div className="space-y-4">
+        {diagnoses.map((e) => (
+          <DiagnosisCard key={e.id} diagnosis={e.payload as MedicDiagnosis} createdAt={e.createdAt} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function DiagnosisCard({ diagnosis, createdAt }: { diagnosis: MedicDiagnosis; createdAt: string }) {
+  const classColors: Record<string, string> = {
+    code: 'border-warn/50 bg-warn/5',
+    config: 'border-accent/50 bg-accent/5',
+    infrastructure: 'border-accent/50 bg-accent/5',
+    unknown: 'border-muted/40 bg-card',
+  };
+  const classBadge: Record<string, string> = {
+    code: 'bg-warn/10 text-warn',
+    config: 'bg-accent/10 text-accent',
+    infrastructure: 'bg-accent/10 text-accent',
+    unknown: 'bg-rule text-muted',
+  };
+  return (
+    <div className={`border rounded-lg p-5 space-y-4 ${classColors[diagnosis.classification] ?? classColors.unknown}`}>
+      <div className="flex items-start gap-3 flex-wrap">
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="inline-block w-2 h-2 rounded-full bg-warn animate-pulse" />
+          <span className="text-xs font-semibold uppercase tracking-wider text-warn">Medic</span>
+        </div>
+        <span className={`text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded ${classBadge[diagnosis.classification] ?? classBadge.unknown}`}>
+          {diagnosis.classification}
+        </span>
+        <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-rule text-muted">
+          confidence: {diagnosis.confidence}
+        </span>
+        {diagnosis.source === 'ai' ? (
+          <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-accent/10 text-accent">
+            opus
+          </span>
+        ) : null}
+        <span className="text-xs text-muted ml-auto">{new Date(createdAt).toLocaleTimeString()}</span>
+      </div>
+
+      <div className="space-y-2">
+        <h3 className="text-sm font-semibold uppercase tracking-wider text-muted">Root cause</h3>
+        <p className="leading-relaxed">{diagnosis.rootCause}</p>
+      </div>
+
+      {diagnosis.location ? (
+        <div className="font-mono text-sm bg-card border border-rule rounded-md px-3 py-2">
+          {diagnosis.location.file}
+          {diagnosis.location.line ? `:${diagnosis.location.line}` : ''}
+        </div>
+      ) : null}
+
+      <div className="space-y-2">
+        <h3 className="text-sm font-semibold uppercase tracking-wider text-muted">What I see</h3>
+        <p className="leading-relaxed text-sm">{diagnosis.narrative}</p>
+      </div>
+
+      {diagnosis.reproduction ? (
+        <div className="space-y-2">
+          <h3 className="text-sm font-semibold uppercase tracking-wider text-muted">Reproduction</h3>
+          <pre className="text-xs font-mono bg-ink text-paper rounded-md p-3 overflow-auto">{diagnosis.reproduction}</pre>
+        </div>
+      ) : null}
+
+      {diagnosis.suggestedFix ? (
+        <div className="space-y-2">
+          <h3 className="text-sm font-semibold uppercase tracking-wider text-muted">
+            Suggested fix{' '}
+            <span className={`ml-2 text-[10px] font-medium px-1.5 py-0.5 rounded ${diagnosis.suggestedFix.owned === 'developer' ? 'bg-warn/10 text-warn' : 'bg-accent/10 text-accent'}`}>
+              {diagnosis.suggestedFix.owned}-owned
+            </span>
+          </h3>
+          <p className="leading-relaxed text-sm">{diagnosis.suggestedFix.description}</p>
+          <div className="text-xs font-mono text-muted">{diagnosis.suggestedFix.file}</div>
+          {diagnosis.suggestedFix.patch ? (
+            <pre className="text-xs font-mono bg-ink text-paper rounded-md p-3 overflow-auto max-h-80">
+              {diagnosis.suggestedFix.patch}
+            </pre>
+          ) : null}
+        </div>
+      ) : null}
+
+      {diagnosis.classification === 'code' ? (
+        <div className="text-xs text-muted bg-rule/50 rounded-md px-3 py-2 leading-relaxed">
+          Convoy will not modify your code. Push a fix and the pipeline resumes from the last clean stage.
+        </div>
+      ) : null}
+    </div>
   );
 }
 
