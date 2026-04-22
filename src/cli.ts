@@ -4,10 +4,12 @@ import pc from 'picocolors';
 
 import { resolve } from 'node:path';
 
+import { existsSync, readFileSync } from 'node:fs';
+
 import { ConvoyBus, type ConvoyBusEvent } from './core/bus.js';
 import { Orchestrator } from './core/orchestrator.js';
 import { PlanStore, renderPlan, type ConvoyPlan } from './core/plan.js';
-import { defaultStages, type OrchestratorOpts } from './core/stages.js';
+import { defaultStages, type OrchestratorOpts, type RealRehearsalOpt } from './core/stages.js';
 import { RunStateStore } from './core/state.js';
 import type { Platform, Run, RunEvent, StageName } from './core/types.js';
 import { buildPlan } from './planner/index.js';
@@ -258,10 +260,15 @@ function startThinking(): { stop: () => void } {
   };
 }
 
-async function runApply(
-  planId: string,
-  opts: { autoApprove: boolean; injectFailure?: string; logs?: string },
-): Promise<void> {
+interface ApplyOpts {
+  autoApprove: boolean;
+  realRehearsal?: boolean;
+  injectFailure?: string;
+  logs?: string;
+  envFile?: string;
+}
+
+async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
   const plans = new PlanStore(PLANS_DIR);
   const plan = resolvePlan(plans, planId);
 
@@ -295,7 +302,7 @@ async function runApply(
   const unsubscribe = attachRenderer(bus, startedAt);
 
   const orchestratorOpts: OrchestratorOpts = {
-    dryRun: true,
+    dryRun: !opts.realRehearsal,
     autoApprove: opts.autoApprove,
     platformOverride: plan.platform.chosen,
     planId: plan.id,
@@ -311,6 +318,18 @@ async function runApply(
     };
   }
 
+  if (opts.realRehearsal) {
+    const real = buildRealRehearsalOpts(plan, opts);
+    if (!real) {
+      console.error(pc.red('Could not build a real rehearsal config from this plan — missing start command.'));
+      process.exit(2);
+    }
+    orchestratorOpts.realRehearsal = real;
+    process.stdout.write(
+      `${pc.dim('Real rehearsal:')} ${pc.bold(`${real.startCommand}`)} on port ${real.port}\n`,
+    );
+  }
+
   const repoUrl = plan.target.repoUrl ?? plan.target.localPath;
   try {
     const run = await orchestrator.run(repoUrl, orchestratorOpts);
@@ -323,6 +342,65 @@ async function runApply(
     unsubscribe();
     store.close();
   }
+}
+
+function buildRealRehearsalOpts(plan: ConvoyPlan, opts: ApplyOpts): RealRehearsalOpt | null {
+  const rehearsal = plan.rehearsal;
+  const startCommand = rehearsal.startCommand;
+  if (!startCommand) return null;
+
+  const port = rehearsal.expectedPort ?? 8080;
+  const healthPath = '/health';
+  const metricsPath = '/metrics';
+  const installCommand = detectInstallCommand(plan);
+  const buildCommand = rehearsal.buildCommand ?? undefined;
+
+  const envFilePath = opts.envFile ?? `${plan.target.localPath}/.env.convoy-rehearsal`;
+  const env = existsSync(envFilePath) ? parseEnvFile(envFilePath) : {};
+
+  const result: RealRehearsalOpt = {
+    repoPath: plan.target.localPath,
+    startCommand,
+    port,
+    healthPath,
+    metricsPath,
+    convoyAuthoredFiles: plan.author.convoyAuthoredFiles.map((f) => f.path),
+    probeRequests: 60,
+    probeConcurrency: 4,
+    probePaths: [metricsPath, healthPath],
+    maxErrorRatePct: 1.0,
+    maxP99Ms: 500,
+  };
+  if (installCommand) result.installCommand = installCommand;
+  if (buildCommand) result.buildCommand = buildCommand;
+  if (Object.keys(env).length > 0) result.env = env;
+  return result;
+}
+
+function detectInstallCommand(plan: ConvoyPlan): string | null {
+  const path = plan.target.localPath;
+  if (existsSync(`${path}/pnpm-lock.yaml`)) return 'pnpm install --frozen-lockfile';
+  if (existsSync(`${path}/yarn.lock`)) return 'yarn install --frozen-lockfile';
+  if (existsSync(`${path}/bun.lockb`) || existsSync(`${path}/bun.lock`)) return 'bun install --frozen-lockfile';
+  if (existsSync(`${path}/package-lock.json`)) return 'npm ci';
+  if (existsSync(`${path}/requirements.txt`)) return 'pip install -r requirements.txt';
+  if (existsSync(`${path}/pyproject.toml`)) return 'pip install .';
+  return null;
+}
+
+function parseEnvFile(path: string): Record<string, string> {
+  const raw = readFileSync(path, 'utf8');
+  const out: Record<string, string> = {};
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const idx = trimmed.indexOf('=');
+    if (idx === -1) continue;
+    const k = trimmed.slice(0, idx).trim();
+    const v = trimmed.slice(idx + 1).trim().replace(/^['"]|['"]$/g, '');
+    if (k) out[k] = v;
+  }
+  return out;
 }
 
 function resolvePlan(plans: PlanStore, idOrPrefix: string): ConvoyPlan | null {
@@ -463,9 +541,11 @@ program
   .command('apply <planId>')
   .description('Execute a saved plan. Reads .convoy/plans/<planId>.json and runs the pipeline.')
   .option('--no-auto-approve', 'wait for external approval decisions instead of auto-approving')
-  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary (triggers medic with real logs)')
+  .option('--real-rehearsal', 'run the target locally as a subprocess, probe real metrics, feed real logs to medic')
+  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary (triggers medic with fixture logs)')
   .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
-  .action(async (planId: string, options: { autoApprove: boolean; injectFailure?: string; logs?: string }) => {
+  .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
+  .action(async (planId: string, options: ApplyOpts) => {
     await runApply(planId, options);
   });
 

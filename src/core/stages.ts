@@ -1,5 +1,6 @@
 import type { ConvoyBus } from './bus.js';
 import { diagnose } from './medic.js';
+import { RehearsalRunner, type MetricsSnapshot } from './rehearsal-runner.js';
 import type { RunStateStore } from './state.js';
 import type {
   Approval,
@@ -17,6 +18,24 @@ export interface OrchestratorOpts {
   autoApprove?: boolean;
   injectFailure?: InjectFailureOpt;
   planId?: string | null;
+  realRehearsal?: RealRehearsalOpt;
+}
+
+export interface RealRehearsalOpt {
+  repoPath: string;
+  installCommand?: string;
+  buildCommand?: string;
+  startCommand: string;
+  port: number;
+  healthPath: string;
+  metricsPath?: string;
+  env?: Record<string, string>;
+  probeRequests?: number;
+  probeConcurrency?: number;
+  probePaths?: string[];
+  maxErrorRatePct?: number;
+  maxP99Ms?: number;
+  convoyAuthoredFiles?: string[];
 }
 
 export type InjectFailureOpt = {
@@ -89,7 +108,11 @@ abstract class BaseStage implements Stage {
     ctx.bus.emit({ type: 'approval.requested', approval });
     this.emit(ctx, 'progress', { awaiting_approval: kind, approval_id: approval.id });
 
-    if (ctx.opts.dryRun && (ctx.opts.autoApprove ?? true)) {
+    // Default: auto-approve unless explicitly disabled. Decouples from dry-run
+    // mode so real-rehearsal runs can still be driven to completion without
+    // a human click when --no-auto-approve isn't set.
+    const autoApprove = ctx.opts.autoApprove ?? true;
+    if (autoApprove) {
       await this.sleep(400, ctx.signal);
       const decided = ctx.store.decideApproval(approval.id, 'approved');
       ctx.bus.emit({ type: 'approval.decided', approval: decided });
@@ -194,6 +217,10 @@ export class RehearseStage extends BaseStage {
   readonly name = 'rehearse' as const;
 
   override async run(ctx: StageContext): Promise<unknown> {
+    if (ctx.opts.realRehearsal) {
+      return this.#runReal(ctx, ctx.opts.realRehearsal);
+    }
+
     this.emit(ctx, 'started', {});
     this.emit(ctx, 'progress', { phase: 'ephemeral.creating' });
     await this.sleep(1200, ctx.signal);
@@ -250,6 +277,67 @@ export class RehearseStage extends BaseStage {
       ephemeral_url: ephemeralUrl,
     };
     this.emit(ctx, 'finished', result);
+    return result;
+  }
+
+  async #runReal(ctx: StageContext, cfg: RealRehearsalOpt): Promise<unknown> {
+    this.emit(ctx, 'started', { mode: 'real-local', target: cfg.repoPath });
+
+    const runner = new RehearsalRunner(
+      {
+        repoPath: cfg.repoPath,
+        startCommand: cfg.startCommand,
+        port: cfg.port,
+        healthPath: cfg.healthPath,
+        ...(cfg.installCommand !== undefined && { installCommand: cfg.installCommand }),
+        ...(cfg.buildCommand !== undefined && { buildCommand: cfg.buildCommand }),
+        ...(cfg.metricsPath !== undefined && { metricsPath: cfg.metricsPath }),
+        ...(cfg.env !== undefined && { env: cfg.env }),
+      },
+      {
+        maxErrorRatePct: cfg.maxErrorRatePct ?? 1.0,
+        maxP99Ms: cfg.maxP99Ms ?? 500,
+      },
+      (phase, payload) => {
+        this.emit(ctx, 'progress', { phase, ...(payload ?? {}) });
+      },
+    );
+
+    const rehearsal = await runner.run(
+      {
+        requests: cfg.probeRequests ?? 60,
+        concurrency: cfg.probeConcurrency ?? 4,
+        paths: cfg.probePaths ?? [cfg.healthPath],
+        timeoutMs: 5000,
+      },
+      ctx.signal,
+    );
+
+    if (!rehearsal.ok) {
+      this.emit(ctx, 'progress', { phase: 'medic.invoked' });
+      const diagnosis = await diagnose({
+        stage: 'rehearse',
+        phase: 'real_local',
+        repoPath: cfg.repoPath,
+        convoyAuthoredFiles: cfg.convoyAuthoredFiles ?? [],
+        logs: rehearsal.logs,
+        metrics: {
+          ...(rehearsal.metricsAfter ?? rehearsal.metricsBefore ?? {}) as Record<string, unknown>,
+        },
+        errorMessage: rehearsal.reason ?? 'rehearsal failed',
+      });
+      this.emit(ctx, 'diagnosis', diagnosis);
+      throw new RehearsalBreachError(diagnosis);
+    }
+
+    const result = {
+      healthy: true,
+      duration_ms: rehearsal.durationMs,
+      metricsBefore: rehearsal.metricsBefore,
+      metricsAfter: rehearsal.metricsAfter,
+      log_lines: rehearsal.logs.length,
+    };
+    this.emit(ctx, 'finished', result as unknown as Record<string, unknown>);
     return result;
   }
 }
