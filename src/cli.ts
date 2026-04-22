@@ -6,7 +6,7 @@ import { resolve } from 'node:path';
 
 import { ConvoyBus, type ConvoyBusEvent } from './core/bus.js';
 import { Orchestrator } from './core/orchestrator.js';
-import { PlanStore, renderPlan } from './core/plan.js';
+import { PlanStore, renderPlan, type ConvoyPlan } from './core/plan.js';
 import { defaultStages, type OrchestratorOpts } from './core/stages.js';
 import { RunStateStore } from './core/state.js';
 import type { Platform, Run, RunEvent, StageName } from './core/types.js';
@@ -223,7 +223,7 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
       const saved = store.save(plan);
       process.stdout.write(`\n${pc.dim('Saved plan to')} ${saved}\n`);
       process.stdout.write(
-        `${pc.dim('Apply with')} ${pc.bold(`convoy apply ${plan.id}`)} ${pc.dim('(not yet implemented)')}\n`,
+        `${pc.dim('Apply with')} ${pc.bold(`npm run convoy -- apply ${plan.id.slice(0, 8)}`)}\n`,
       );
     }
   } catch (err) {
@@ -248,6 +248,95 @@ function startThinking(): { stop: () => void } {
       process.stdout.write('\r\x1b[2K');
     },
   };
+}
+
+async function runApply(planId: string, opts: { autoApprove: boolean }): Promise<void> {
+  const plans = new PlanStore(PLANS_DIR);
+  const plan = resolvePlan(plans, planId);
+
+  if (!plan) {
+    console.error(pc.red(`Plan not found: ${planId}`));
+    console.error(pc.dim(`Looked in ${PLANS_DIR}. Run \`convoy plans\` to list saved plans.`));
+    process.exit(2);
+  }
+
+  if (plan.deployability.verdict === 'not-cloud-deployable') {
+    console.error(
+      pc.red(`Plan ${plan.id.slice(0, 8)} is not deployable: ${plan.deployability.reason}`),
+    );
+    process.exit(2);
+  }
+
+  process.stdout.write(
+    `${pc.dim('Applying plan')} ${pc.bold(plan.id.slice(0, 8))} ${pc.dim('—')} ${plan.target.name} ${pc.dim('→')} ${pc.cyan(plan.platform.chosen)}\n`,
+  );
+  if (plan.target.readmeTitle) {
+    process.stdout.write(`${pc.dim(`  "${plan.target.readmeTitle}"`)}\n`);
+  }
+  process.stdout.write(`${pc.dim(`  ${plan.author.convoyAuthoredFiles.length} file(s) to author · rehearse before production`)}\n`);
+
+  const store = new RunStateStore(STATE_PATH);
+  const bus = new ConvoyBus();
+  const stages = defaultStages();
+  const orchestrator = new Orchestrator(store, bus, stages);
+
+  const startedAt = new Date();
+  const unsubscribe = attachRenderer(bus, startedAt);
+
+  const orchestratorOpts: OrchestratorOpts = {
+    dryRun: true,
+    autoApprove: opts.autoApprove,
+    platformOverride: plan.platform.chosen,
+  };
+
+  const repoUrl = plan.target.repoUrl ?? plan.target.localPath;
+  try {
+    const run = await orchestrator.run(repoUrl, orchestratorOpts);
+    attachPlanReference(store, run.id, plan.id);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(pc.red(`\nrun terminated: ${message}`));
+    process.exitCode = 1;
+  } finally {
+    unsubscribe();
+    store.close();
+  }
+}
+
+function resolvePlan(plans: PlanStore, idOrPrefix: string): ConvoyPlan | null {
+  const exact = plans.load(idOrPrefix);
+  if (exact) return exact;
+  for (const id of plans.listRecent(50)) {
+    if (id.startsWith(idOrPrefix)) {
+      const match = plans.load(id);
+      if (match) return match;
+    }
+  }
+  return null;
+}
+
+function attachPlanReference(store: RunStateStore, runId: string, planId: string): void {
+  store.appendEvent(runId, 'scan', 'log', { plan_id: planId, note: 'applied from saved plan' });
+}
+
+function runListPlans(): void {
+  const plans = new PlanStore(PLANS_DIR);
+  const ids = plans.listRecent(20);
+  if (ids.length === 0) {
+    console.error(pc.yellow('No saved plans found. Run `convoy plan <path> --save` to create one.'));
+    process.exitCode = 1;
+    return;
+  }
+  process.stdout.write(`${pc.bold('Recent plans')}\n`);
+  for (const id of ids) {
+    const plan = plans.load(id);
+    if (!plan) continue;
+    const short = id.slice(0, 8);
+    const name = plan.target.name;
+    const platform = plan.platform.chosen;
+    const verdict = plan.deployability.verdict === 'not-cloud-deployable' ? pc.red('refused') : pc.green(platform);
+    process.stdout.write(`  ${pc.bold(short)}  ${name.padEnd(22)}  ${verdict}  ${pc.dim(plan.createdAt)}\n`);
+  }
 }
 
 async function runStatus(runId?: string): Promise<void> {
@@ -346,6 +435,21 @@ program
   .description('Show the status of a run (defaults to most recent).')
   .action(async (runId?: string) => {
     await runStatus(runId);
+  });
+
+program
+  .command('apply <planId>')
+  .description('Execute a saved plan. Reads .convoy/plans/<planId>.json and runs the pipeline.')
+  .option('--no-auto-approve', 'wait for external approval decisions instead of auto-approving')
+  .action(async (planId: string, options: { autoApprove: boolean }) => {
+    await runApply(planId, options);
+  });
+
+program
+  .command('plans')
+  .description('List recent saved plans.')
+  .action(() => {
+    runListPlans();
   });
 
 program
