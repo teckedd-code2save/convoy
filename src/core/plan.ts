@@ -24,6 +24,14 @@ export interface ConvoyPlan {
   risks: PlanRisk[];
   estimate: PlanEstimate;
   evidence: string[];
+  shipNarrative: PlanShipStep[];
+}
+
+export interface PlanShipStep {
+  step: number;
+  kind: 'action' | 'approval';
+  text: string;
+  details?: string[];
 }
 
 export interface PlanTarget {
@@ -188,28 +196,15 @@ export function renderPlan(plan: ConvoyPlan): string {
   }
   L.push('');
 
-  L.push('How it ships');
-  const step = (n: number, text: string) => L.push(`  ${String(n).padStart(2)}. ${text}`);
-  step(1, `[approval] ${plan.approvals.find((a) => a.kind === 'merge_pr')?.description ?? 'PR merge required.'}`);
-  const rehearseBits: string[] = [`Rehearse on ${plan.rehearsal.targetDescriptor}`];
-  if (plan.rehearsal.buildCommand) rehearseBits.push(`build \`${plan.rehearsal.buildCommand}\``);
-  if (plan.rehearsal.startCommand) rehearseBits.push(`start \`${plan.rehearsal.startCommand}\``);
-  if (plan.rehearsal.expectedPort !== null) rehearseBits.push(`port ${plan.rehearsal.expectedPort}`);
-  step(2, rehearseBits.join(' · '));
-  const validationLines = plan.rehearsal.validations;
-  if (validationLines.length === 0) {
-    step(3, 'Validate (no specific checks configured)');
-  } else {
-    step(3, `Validate on the twin:`);
-    for (const v of validationLines) {
-      L.push(`       · ${v}`);
+  L.push('How I\'ll ship this');
+  for (const s of plan.shipNarrative) {
+    const marker = s.kind === 'approval' ? '[approval]' : '          ';
+    const head = s.kind === 'approval' ? `${marker} ${s.text}` : s.text;
+    L.push(`  ${String(s.step).padStart(2)}. ${head}`);
+    if (s.details) {
+      for (const d of s.details) L.push(`        · ${d}`);
     }
   }
-  step(4, `[approval] ${plan.approvals.find((a) => a.kind === 'promote')?.description ?? 'Promote approval required.'}`);
-  step(5, `Canary ${plan.promotion.canary.trafficPercent}% for ${plan.promotion.canary.bakeWindowSeconds}s · halt on ${plan.promotion.haltOn[0] ?? 'SLO breach'}`);
-  const steps = plan.promotion.steps.map((s) => `${s.trafficPercent}%`).join(' → ');
-  step(6, `Promote ${steps} with ${plan.promotion.steps[0]?.bakeWindowSeconds ?? 30}s bake per step`);
-  step(7, `Observe — auto-rollback via \`${plan.rollback.strategy}\` (~${plan.rollback.estimatedSeconds}s) if any halt condition fires`);
   L.push('');
 
   L.push('Why this platform');

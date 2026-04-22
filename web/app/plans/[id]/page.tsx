@@ -104,83 +104,15 @@ function AuthorSection({ files }: { files: PlanAuthoredFile[] }) {
 }
 
 function ShipSection({ plan }: { plan: PlanSummary }) {
-  const mergeApproval = plan.approvals.find((a) => a.kind === 'merge_pr');
-  const promoteApproval = plan.approvals.find((a) => a.kind === 'promote');
+  const narrative = plan.shipNarrative ?? [];
+  if (narrative.length === 0) return null;
   return (
     <section className="space-y-4">
-      <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">How it ships</h2>
-      <ol className="space-y-3">
-        <Step index={1} kind="approval" text={mergeApproval?.description ?? 'PR merge required.'} />
-        <Step
-          index={2}
-          kind="action"
-          text={
-            <>
-              Rehearse on <span className="font-mono text-sm">{plan.rehearsal.targetDescriptor}</span>
-              {plan.rehearsal.buildCommand ? (
-                <>
-                  {' '}
-                  · build <code className="text-sm">{plan.rehearsal.buildCommand}</code>
-                </>
-              ) : null}
-              {plan.rehearsal.startCommand ? (
-                <>
-                  {' '}
-                  · start <code className="text-sm">{plan.rehearsal.startCommand}</code>
-                </>
-              ) : null}
-              {plan.rehearsal.expectedPort ? <> · port {plan.rehearsal.expectedPort}</> : null}
-            </>
-          }
-        />
-        <Step
-          index={3}
-          kind="action"
-          text={
-            <>
-              Validate on the twin:
-              <ul className="mt-2 space-y-1.5 text-sm text-muted">
-                {plan.rehearsal.validations.map((v, i) => (
-                  <li key={i} className="pl-4 relative">
-                    <span className="absolute left-0 text-muted">·</span>
-                    <span dangerouslySetInnerHTML={{ __html: escapeInlineCode(v) }} />
-                  </li>
-                ))}
-              </ul>
-            </>
-          }
-        />
-        <Step index={4} kind="approval" text={promoteApproval?.description ?? 'Promote approval required.'} />
-        <Step
-          index={5}
-          kind="action"
-          text={
-            <>
-              Canary {plan.promotion.canary.trafficPercent}% for {plan.promotion.canary.bakeWindowSeconds}s — halt on{' '}
-              <em>{plan.promotion.haltOn[0] ?? 'SLO breach'}</em>
-            </>
-          }
-        />
-        <Step
-          index={6}
-          kind="action"
-          text={
-            <>
-              Promote {plan.promotion.steps.map((s) => `${s.trafficPercent}%`).join(' → ')} with{' '}
-              {plan.promotion.steps[0]?.bakeWindowSeconds ?? 30}s bake per step
-            </>
-          }
-        />
-        <Step
-          index={7}
-          kind="action"
-          text={
-            <>
-              Observe — auto-rollback via <code className="text-sm">{plan.rollback.strategy}</code> (~
-              {plan.rollback.estimatedSeconds}s) if any halt condition fires
-            </>
-          }
-        />
+      <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">How I&apos;ll ship this</h2>
+      <ol className="space-y-4">
+        {narrative.map((s) => (
+          <Step key={s.step} index={s.step} kind={s.kind} text={s.text} details={s.details ?? []} />
+        ))}
       </ol>
     </section>
   );
@@ -198,23 +130,44 @@ function Step({
   index,
   kind,
   text,
+  details,
 }: {
   index: number;
   kind: 'action' | 'approval';
   text: React.ReactNode;
+  details?: string[];
 }) {
   return (
     <li className="flex items-start gap-4">
-      <span className="shrink-0 w-6 h-6 rounded-full bg-rule text-muted text-xs font-medium flex items-center justify-center mt-0.5">
+      <span
+        className={`shrink-0 w-6 h-6 rounded-full text-xs font-medium flex items-center justify-center mt-0.5 ${kind === 'approval' ? 'bg-warn text-white' : 'bg-rule text-muted'}`}
+      >
         {index}
       </span>
-      <div className="flex-1 pt-0.5">
-        {kind === 'approval' ? (
-          <span className="inline-block text-[10px] uppercase tracking-wider font-medium text-warn bg-warn/10 px-1.5 py-0.5 rounded mr-2">
-            approval
+      <div className="flex-1 pt-0.5 space-y-2">
+        <div className="flex items-start gap-2">
+          {kind === 'approval' ? (
+            <span className="inline-block text-[10px] uppercase tracking-wider font-medium text-warn bg-warn/10 px-1.5 py-0.5 rounded shrink-0 mt-0.5">
+              approval
+            </span>
+          ) : null}
+          <span
+            className="leading-relaxed"
+            dangerouslySetInnerHTML={typeof text === 'string' ? { __html: escapeInlineCode(text) } : undefined}
+          >
+            {typeof text === 'string' ? undefined : text}
           </span>
+        </div>
+        {details && details.length > 0 ? (
+          <ul className="space-y-1.5 text-sm text-muted">
+            {details.map((d, i) => (
+              <li key={i} className="pl-4 relative">
+                <span className="absolute left-0 text-muted">·</span>
+                <span dangerouslySetInnerHTML={{ __html: escapeInlineCode(d) }} />
+              </li>
+            ))}
+          </ul>
         ) : null}
-        {text}
       </div>
     </li>
   );

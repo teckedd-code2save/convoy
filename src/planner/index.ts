@@ -11,6 +11,7 @@ import type {
   PlanRehearsalSection,
   PlanRollbackSection,
   PlanRisk,
+  PlanShipStep,
   PlanTarget,
 } from '../core/plan.js';
 import type { Platform } from '../core/types.js';
@@ -53,6 +54,7 @@ export async function buildPlan(
   const estimate = defaultEstimate();
   const risks = toPlanRisks(scan);
   const summary = buildSummary(scan, platform, deployability);
+  const shipNarrative = defaultShipNarrative(scan, platform.chosen, rehearsal, promotion, rollback, author.convoyAuthoredFiles.length);
 
   const target: PlanTarget = {
     repoUrl: opts.repoUrl ?? null,
@@ -83,6 +85,7 @@ export async function buildPlan(
     risks,
     estimate,
     evidence: scan.evidence,
+    shipNarrative,
   };
 
   if (deployability.verdict === 'not-cloud-deployable') {
@@ -280,6 +283,83 @@ function defaultApprovals(): PlanApproval[] {
       required: true,
     },
   ];
+}
+
+function defaultShipNarrative(
+  scan: ScanResult,
+  platform: Platform,
+  rehearsal: PlanRehearsalSection,
+  promotion: PlanPromotionSection,
+  rollback: PlanRollbackSection,
+  authoredCount: number,
+): PlanShipStep[] {
+  const steps: PlanShipStep[] = [];
+  const pm = scan.packageManager ?? 'npm';
+  const buildCmd = rehearsal.buildCommand ? `\`${rehearsal.buildCommand}\`` : 'your build';
+  const startCmd = rehearsal.startCommand ? `\`${rehearsal.startCommand}\`` : 'your start command';
+  const hasPrisma =
+    scan.dataLayer.some((d) => d.includes('prisma')) || scan.topLevelDirs.includes('prisma');
+  const hasMigrations =
+    hasPrisma || scan.topLevelDirs.includes('migrations') || scan.dataLayer.some((d) => d.includes('postgres') || d.includes('mysql'));
+
+  steps.push({
+    step: 1,
+    kind: 'approval',
+    text: authoredCount > 0
+      ? `I'll open a pull request with ${authoredCount} file${authoredCount === 1 ? '' : 's'} I drafted. You review the diff and merge — I don't merge on my own.`
+      : `I'll open a pull request (or skip — your repo already has everything I need). You merge.`,
+  });
+
+  const rehearseDetails: string[] = [`install with ${pm} on a scratch volume`];
+  if (rehearsal.buildCommand) rehearseDetails.push(`run ${buildCmd}`);
+  if (hasPrisma) rehearseDetails.push('`prisma generate` during image build');
+  if (hasMigrations) rehearseDetails.push('run migrations against scratch schema and measure lock duration');
+  rehearseDetails.push(
+    scan.startCommand
+      ? `boot via ${startCmd} and wait for ${scan.healthPath ?? '/health'} to return 200`
+      : `boot and wait for ${scan.healthPath ?? '/health'} to return 200`,
+  );
+  if (scan.testCommand) rehearseDetails.push(`run your smoke suite: \`${scan.testCommand}\``);
+  rehearseDetails.push('probe with 60s of synthetic load and compare p99 to the last healthy baseline');
+  rehearseDetails.push('then tear the twin down');
+
+  steps.push({
+    step: 2,
+    kind: 'action',
+    text: `I'll rehearse on ${rehearsal.targetDescriptor} before anything real happens.`,
+    details: rehearseDetails,
+  });
+
+  steps.push({
+    step: 3,
+    kind: 'approval',
+    text: `If rehearsal is clean, I'll ask you to promote. No canary traffic without your yes.`,
+  });
+
+  const promoteSteps = promotion.steps.map((s) => `${s.trafficPercent}%`).join(' → ');
+  const firstBake = promotion.steps[0]?.bakeWindowSeconds ?? 30;
+  steps.push({
+    step: 4,
+    kind: 'action',
+    text: `On approval, I'll start a canary at ${promotion.canary.trafficPercent}% of traffic for a ${promotion.canary.bakeWindowSeconds}s bake.`,
+    details: [
+      `I halt the promotion the moment any of these fire: ${promotion.haltOn.join('; ')}`,
+    ],
+  });
+
+  steps.push({
+    step: 5,
+    kind: 'action',
+    text: `If the canary holds, I'll step it up: ${promoteSteps} with a ${firstBake}s bake between each step — watching the same signals every time.`,
+  });
+
+  steps.push({
+    step: 6,
+    kind: 'action',
+    text: `Once I'm at 100%, I'll keep watching for the observe window. If anything breaches, I roll back via \`${rollback.strategy}\` in about ${rollback.estimatedSeconds}s — no one has to page anyone.`,
+  });
+
+  return steps;
 }
 
 function defaultEstimate(): PlanEstimate {

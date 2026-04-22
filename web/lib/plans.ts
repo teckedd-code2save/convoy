@@ -14,6 +14,13 @@ export interface PlanPlatformCandidate {
   reason: string;
 }
 
+export interface PlanShipStep {
+  step: number;
+  kind: 'action' | 'approval';
+  text: string;
+  details?: string[];
+}
+
 export interface PlanSummary {
   id: string;
   createdAt: string;
@@ -39,6 +46,7 @@ export interface PlanSummary {
   author: {
     convoyAuthoredFiles: PlanAuthoredFile[];
   };
+  shipNarrative: PlanShipStep[];
   rehearsal: {
     targetDescriptor: string;
     buildCommand: string | null;
