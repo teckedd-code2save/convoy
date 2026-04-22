@@ -19,6 +19,7 @@ import {
 import { RunStateStore } from './core/state.js';
 import type { Platform, Run, RunEvent, StageName } from './core/types.js';
 import { buildPlan } from './planner/index.js';
+import { resolveTarget } from './planner/target-resolver.js';
 
 const STATE_PATH = process.env['CONVOY_STATE_PATH'] ?? '.convoy/state.db';
 const PLANS_DIR = process.env['CONVOY_PLANS_DIR'] ?? '.convoy/plans';
@@ -217,11 +218,24 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
     platformOverride = opts.platform;
   }
 
-  const absPath = resolve(path);
   const thinking = opts.json ? null : startThinking();
   try {
-    const { plan, enrichmentSource } = await buildPlan(absPath, {
-      ...(opts.repoUrl !== undefined && { repoUrl: opts.repoUrl }),
+    const resolved = await resolveTarget(path, {
+      onProgress: (phase, detail) => {
+        if (!opts.json) {
+          thinking?.stop();
+          const line = detail ? `  ${pc.dim(phase)} ${detail}` : `  ${pc.dim(phase)}`;
+          process.stdout.write(`${line}\n`);
+        }
+      },
+    });
+
+    const inferredRepoUrl = opts.repoUrl ?? resolved.repoUrl ?? undefined;
+
+    const { plan, enrichmentSource } = await buildPlan(resolved.localPath, {
+      ...(inferredRepoUrl !== undefined && { repoUrl: inferredRepoUrl }),
+      ...(resolved.branch !== undefined && { branch: resolved.branch }),
+      ...(resolved.sha !== undefined && { sha: resolved.sha }),
       ...(platformOverride !== undefined && { platformOverride }),
       ai: opts.noAi ? { disable: true } : {},
     });

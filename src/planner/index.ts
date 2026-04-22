@@ -20,6 +20,7 @@ import { draftAuthorSection } from './author.js';
 import { enrichPlan, type EnrichmentOptions } from './enricher.js';
 import { pickPlatform } from './picker.js';
 import { scanRepository, repoName, type ScanResult } from './scanner.js';
+import { resolveTarget, type ResolveOptions, type TargetResolution } from './target-resolver.js';
 
 export interface BuildPlanOptions {
   repoUrl?: string;
@@ -371,5 +372,5 @@ function defaultEstimate(): PlanEstimate {
   };
 }
 
-export { scanRepository, pickPlatform, draftAuthorSection };
-export type { ScanResult };
+export { scanRepository, pickPlatform, draftAuthorSection, resolveTarget };
+export type { ScanResult, TargetResolution, ResolveOptions };

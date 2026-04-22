@@ -17,3 +17,6 @@ coverage/
 *.swp
 .convoy/state.db
 .convoy/state.db-journal
+.convoy/clones/
+.convoy/cache/
+.convoy/plans/
