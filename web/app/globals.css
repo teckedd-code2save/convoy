@@ -3,6 +3,7 @@
 @theme {
   --color-ink: #0b0d10;
   --color-paper: #fafaf9;
+  --color-card: #ffffff;
   --color-muted: #6b7280;
   --color-rule: #e5e7eb;
   --color-accent: #0f6fff;
@@ -31,7 +32,7 @@ code {
   font-family: var(--font-mono);
 }
 
-:where(a) {
+a {
   color: inherit;
   text-decoration: none;
 }

@@ -15,20 +15,20 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
     <article className="space-y-10">
       <header className="space-y-3">
         <div className="flex items-center gap-3">
-          <a href="/" className="text-sm text-[color:var(--color-muted)] hover:text-[color:var(--color-ink)]">
+          <a href="/" className="text-sm text-muted hover:text-ink">
             ← Plans
           </a>
-          <span className="font-mono text-xs text-[color:var(--color-muted)]">{plan.id.slice(0, 8)}</span>
+          <span className="font-mono text-xs text-muted">{plan.id.slice(0, 8)}</span>
         </div>
         <h1 className="text-3xl font-semibold tracking-tight">{plan.target.name}</h1>
-        <div className="flex flex-wrap items-center gap-2 text-sm text-[color:var(--color-muted)]">
+        <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
           <Tag>{plan.target.ecosystem}</Tag>
           {plan.target.framework ? <Tag>{plan.target.framework}</Tag> : null}
           <span>·</span>
           <span>{plan.target.repoUrl ?? plan.target.localPath}</span>
         </div>
         {plan.target.readmeTitle ? (
-          <p className="text-[color:var(--color-muted)] italic">&quot;{plan.target.readmeTitle}&quot;</p>
+          <p className="text-muted italic">&quot;{plan.target.readmeTitle}&quot;</p>
         ) : null}
       </header>
 
@@ -46,15 +46,15 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
       <EvidenceSection evidence={plan.evidence} />
 
       {notDeployable ? null : (
-        <div className="flex items-center gap-4 pt-6 border-t border-[color:var(--color-rule)]">
+        <div className="flex items-center gap-4 pt-6 border-t border-rule">
           <button
             disabled
             title="Apply from CLI: npm run convoy -- apply <id>"
-            className="px-4 py-2 rounded-md bg-[color:var(--color-ink)] text-white text-sm font-medium opacity-60 cursor-not-allowed"
+            className="px-4 py-2 rounded-md bg-ink text-white text-sm font-medium opacity-60 cursor-not-allowed"
           >
             Apply plan →
           </button>
-          <code className="text-xs text-[color:var(--color-muted)]">
+          <code className="text-xs text-muted">
             npm run convoy -- apply {plan.id.slice(0, 8)}
           </code>
         </div>
@@ -68,7 +68,7 @@ function Summary({ plan, notDeployable }: { plan: PlanSummary; notDeployable: bo
     <section className="space-y-3">
       <p className="text-lg leading-relaxed">{plan.summary}</p>
       {notDeployable ? (
-        <p className="text-sm text-[color:var(--color-danger)]">{plan.deployability.reason}</p>
+        <p className="text-sm text-danger">{plan.deployability.reason}</p>
       ) : null}
     </section>
   );
@@ -78,22 +78,22 @@ function AuthorSection({ files }: { files: PlanAuthoredFile[] }) {
   if (files.length === 0) return null;
   return (
     <section className="space-y-4">
-      <h2 className="text-sm font-semibold uppercase tracking-wider text-[color:var(--color-muted)]">
+      <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">
         What Convoy will author
       </h2>
-      <div className="border border-[color:var(--color-rule)] rounded-lg overflow-hidden divide-y divide-[color:var(--color-rule)] bg-white">
+      <div className="border border-rule rounded-lg overflow-hidden divide-y divide-rule bg-card">
         {files.map((file) => (
           <details key={file.path} className="group">
-            <summary className="flex items-center gap-4 px-5 py-3 cursor-pointer hover:bg-[color:var(--color-rule)]/30 select-none">
-              <span className="text-[color:var(--color-success)] font-mono">+</span>
+            <summary className="flex items-center gap-4 px-5 py-3 cursor-pointer hover:bg-rule/30 select-none">
+              <span className="text-success font-mono">+</span>
               <span className="font-mono text-sm font-medium">{file.path}</span>
-              <span className="text-xs text-[color:var(--color-muted)] ml-auto">
+              <span className="text-xs text-muted ml-auto">
                 {file.lines} lines — {file.summary}
               </span>
-              <span className="text-[color:var(--color-muted)] text-xs group-open:hidden">view</span>
-              <span className="text-[color:var(--color-muted)] text-xs hidden group-open:inline">hide</span>
+              <span className="text-muted text-xs group-open:hidden">view</span>
+              <span className="text-muted text-xs hidden group-open:inline">hide</span>
             </summary>
-            <pre className="px-5 py-4 text-xs overflow-auto bg-[#0b0d10] text-[#fafaf9] leading-relaxed">
+            <pre className="px-5 py-4 text-xs overflow-auto bg-ink text-paper leading-relaxed">
               <code>{file.contentPreview}</code>
             </pre>
           </details>
@@ -108,7 +108,7 @@ function ShipSection({ plan }: { plan: PlanSummary }) {
   const promoteApproval = plan.approvals.find((a) => a.kind === 'promote');
   return (
     <section className="space-y-4">
-      <h2 className="text-sm font-semibold uppercase tracking-wider text-[color:var(--color-muted)]">How it ships</h2>
+      <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">How it ships</h2>
       <ol className="space-y-3">
         <Step index={1} kind="approval" text={mergeApproval?.description ?? 'PR merge required.'} />
         <Step
@@ -136,7 +136,19 @@ function ShipSection({ plan }: { plan: PlanSummary }) {
         <Step
           index={3}
           kind="action"
-          text={<>Validate: {plan.rehearsal.validations.slice(0, 4).join(' · ')}</>}
+          text={
+            <>
+              Validate on the twin:
+              <ul className="mt-2 space-y-1.5 text-sm text-muted">
+                {plan.rehearsal.validations.map((v, i) => (
+                  <li key={i} className="pl-4 relative">
+                    <span className="absolute left-0 text-muted">·</span>
+                    <span dangerouslySetInnerHTML={{ __html: escapeInlineCode(v) }} />
+                  </li>
+                ))}
+              </ul>
+            </>
+          }
         />
         <Step index={4} kind="approval" text={promoteApproval?.description ?? 'Promote approval required.'} />
         <Step
@@ -174,6 +186,14 @@ function ShipSection({ plan }: { plan: PlanSummary }) {
   );
 }
 
+function escapeInlineCode(input: string): string {
+  const escaped = input
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  return escaped.replace(/`([^`]+)`/g, '<code class="px-1 py-0.5 bg-rule rounded text-xs">$1</code>');
+}
+
 function Step({
   index,
   kind,
@@ -185,12 +205,12 @@ function Step({
 }) {
   return (
     <li className="flex items-start gap-4">
-      <span className="shrink-0 w-6 h-6 rounded-full bg-[color:var(--color-rule)] text-[color:var(--color-muted)] text-xs font-medium flex items-center justify-center mt-0.5">
+      <span className="shrink-0 w-6 h-6 rounded-full bg-rule text-muted text-xs font-medium flex items-center justify-center mt-0.5">
         {index}
       </span>
       <div className="flex-1 pt-0.5">
         {kind === 'approval' ? (
-          <span className="inline-block text-[10px] uppercase tracking-wider font-medium text-[color:var(--color-warn)] bg-[color:var(--color-warn)]/10 px-1.5 py-0.5 rounded mr-2">
+          <span className="inline-block text-[10px] uppercase tracking-wider font-medium text-warn bg-warn/10 px-1.5 py-0.5 rounded mr-2">
             approval
           </span>
         ) : null}
@@ -206,12 +226,12 @@ function PlatformSection({ plan }: { plan: PlanSummary }) {
 
   return (
     <section className="space-y-4">
-      <h2 className="text-sm font-semibold uppercase tracking-wider text-[color:var(--color-muted)]">
+      <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">
         Why this platform
       </h2>
-      <div className="border border-[color:var(--color-rule)] rounded-lg p-5 bg-white space-y-4">
+      <div className="border border-rule rounded-lg p-5 bg-card space-y-4">
         <div className="flex items-start gap-3">
-          <span className="inline-block w-2 h-2 rounded-full bg-[color:var(--color-accent)] mt-2 shrink-0" />
+          <span className="inline-block w-2 h-2 rounded-full bg-accent mt-2 shrink-0" />
           <div className="flex-1">
             <div className="flex items-center gap-2">
               <span className="font-mono font-semibold">{plan.platform.chosen}</span>
@@ -222,8 +242,8 @@ function PlatformSection({ plan }: { plan: PlanSummary }) {
         </div>
 
         {advisory ? (
-          <div className="flex items-start gap-3 p-3 rounded-md bg-[color:var(--color-warn)]/10 border border-[color:var(--color-warn)]/30">
-            <span className="text-[color:var(--color-warn)] text-sm font-semibold shrink-0">Advisory</span>
+          <div className="flex items-start gap-3 p-3 rounded-md bg-warn/10 border border-warn/30">
+            <span className="text-warn text-sm font-semibold shrink-0">Advisory</span>
             <div className="flex-1 text-sm leading-relaxed">{advisory}</div>
           </div>
         ) : null}
@@ -234,18 +254,18 @@ function PlatformSection({ plan }: { plan: PlanSummary }) {
             return (
               <div
                 key={c.platform}
-                className={`border rounded-md p-3 relative ${chosen ? 'border-[color:var(--color-accent)] bg-[color:var(--color-accent)]/5 ring-1 ring-[color:var(--color-accent)]/30' : 'border-[color:var(--color-rule)]'}`}
+                className={`border rounded-md p-3 relative ${chosen ? 'border-accent bg-accent/5 ring-1 ring-accent/30' : 'border-rule'}`}
               >
                 {chosen ? (
-                  <span className="absolute -top-2 left-3 text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-[color:var(--color-accent)] text-white font-semibold">
+                  <span className="absolute -top-2 left-3 text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-accent text-white font-semibold">
                     chosen
                   </span>
                 ) : null}
                 <div className="flex items-center justify-between">
                   <span className="font-mono text-sm font-semibold">{c.platform}</span>
-                  <span className="text-xs text-[color:var(--color-muted)] font-mono tabular-nums">{c.score}</span>
+                  <span className="text-xs text-muted font-mono tabular-nums">{c.score}</span>
                 </div>
-                <div className="text-xs text-[color:var(--color-muted)] mt-2 line-clamp-3">{c.reason}</div>
+                <div className="text-xs text-muted mt-2 line-clamp-3">{c.reason}</div>
               </div>
             );
           })}
@@ -257,10 +277,10 @@ function PlatformSection({ plan }: { plan: PlanSummary }) {
 
 function SourceBadge({ source }: { source: string }) {
   const styles: Record<string, string> = {
-    override: 'bg-[color:var(--color-accent)]/10 text-[color:var(--color-accent)]',
-    'existing-config': 'bg-[color:var(--color-warn)]/10 text-[color:var(--color-warn)]',
-    scored: 'bg-[color:var(--color-success)]/10 text-[color:var(--color-success)]',
-    refused: 'bg-[color:var(--color-danger)]/10 text-[color:var(--color-danger)]',
+    override: 'bg-accent/10 text-accent',
+    'existing-config': 'bg-warn/10 text-warn',
+    scored: 'bg-success/10 text-success',
+    refused: 'bg-danger/10 text-danger',
   };
   return (
     <span className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded font-medium ${styles[source] ?? styles['scored']!}`}>
@@ -292,7 +312,7 @@ function RisksSection({ risks }: { risks: PlanSummary['risks'] }) {
   if (risks.length === 0) return null;
   return (
     <section className="space-y-4">
-      <h2 className="text-sm font-semibold uppercase tracking-wider text-[color:var(--color-muted)]">Risks</h2>
+      <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">Risks</h2>
       <ul className="space-y-2">
         {risks.map((risk, i) => (
           <li key={i} className="flex items-start gap-3 text-sm">
@@ -307,9 +327,9 @@ function RisksSection({ risks }: { risks: PlanSummary['risks'] }) {
 
 function RiskBadge({ level }: { level: string }) {
   const styles: Record<string, string> = {
-    block: 'bg-[color:var(--color-danger)]/10 text-[color:var(--color-danger)]',
-    warn: 'bg-[color:var(--color-warn)]/10 text-[color:var(--color-warn)]',
-    info: 'bg-[color:var(--color-accent)]/10 text-[color:var(--color-accent)]',
+    block: 'bg-danger/10 text-danger',
+    warn: 'bg-warn/10 text-warn',
+    info: 'bg-accent/10 text-accent',
   };
   return (
     <span className={`shrink-0 text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded ${styles[level] ?? styles['info']!}`}>
@@ -322,8 +342,8 @@ function EvidenceSection({ evidence }: { evidence: string[] }) {
   if (evidence.length === 0) return null;
   return (
     <section className="space-y-4">
-      <h2 className="text-sm font-semibold uppercase tracking-wider text-[color:var(--color-muted)]">Evidence</h2>
-      <ul className="font-mono text-xs text-[color:var(--color-muted)] space-y-1">
+      <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">Evidence</h2>
+      <ul className="font-mono text-xs text-muted space-y-1">
         {evidence.slice(0, 10).map((e, i) => (
           <li key={i}>· {e}</li>
         ))}
@@ -334,7 +354,7 @@ function EvidenceSection({ evidence }: { evidence: string[] }) {
 
 function Tag({ children }: { children: React.ReactNode }) {
   return (
-    <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-[color:var(--color-rule)] text-[color:var(--color-muted)] font-medium">
+    <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-rule text-muted font-medium">
       {children}
     </span>
   );

@@ -6,9 +6,13 @@ import { repoName, type PackageManager, type ScanResult } from './scanner.js';
 export function draftAuthorSection(scan: ScanResult, platform: Platform): PlanAuthorSection {
   const files: PlanAuthoredFile[] = [];
 
-  if (!scan.hasDockerfile) {
-    files.push(draftDockerfile(scan));
+  // Vercel builds from source natively — a Dockerfile is misleading noise.
+  // Everyone else needs a container image.
+  const platformNeedsDockerfile = platform !== 'vercel';
+  if (platformNeedsDockerfile && !scan.hasDockerfile) {
+    files.push(draftDockerfile(scan, platform));
   }
+
   if (platform === 'fly' && scan.existingPlatform !== 'fly') {
     files.push(draftFlyToml(scan));
   }
@@ -28,7 +32,13 @@ export function draftAuthorSection(scan: ScanResult, platform: Platform): PlanAu
   return { convoyAuthoredFiles: files };
 }
 
-function draftDockerfile(scan: ScanResult): PlanAuthoredFile {
+function usesPrisma(scan: ScanResult): boolean {
+  return scan.dataLayer.some((d) => d.includes('prisma')) ||
+    scan.topLevelDirs.includes('prisma') ||
+    scan.topLevelFiles.includes('prisma.config.ts');
+}
+
+function draftDockerfile(scan: ScanResult, _platform: Platform): PlanAuthoredFile {
   const content =
     scan.ecosystem === 'python'
       ? pythonDockerfile(scan)
@@ -42,7 +52,7 @@ function draftDockerfile(scan: ScanResult): PlanAuthoredFile {
               ? jvmDockerfile()
               : scan.ecosystem === 'static'
                 ? staticDockerfile()
-                : nodeDockerfile(nodeMajorFromRuntime(scan.runtime), scan.packageManager ?? 'npm', scan.port ?? 8080, scan.buildCommand, scan.startCommand);
+                : draftNodeDockerfile(scan);
   return {
     path: 'Dockerfile',
     lines: content.split('\n').length,
@@ -51,51 +61,170 @@ function draftDockerfile(scan: ScanResult): PlanAuthoredFile {
   };
 }
 
-function nodeMajorFromRuntime(runtime: string | null): string {
-  if (!runtime || !runtime.startsWith('node-')) return '20';
-  const match = runtime.match(/\d+/);
-  return match?.[0] ?? '20';
+function draftNodeDockerfile(scan: ScanResult): string {
+  const nodeMajor = nodeMajorFromRuntime(scan.runtime);
+  const pm = scan.packageManager ?? 'npm';
+  const port = scan.port ?? 3000;
+  const hasPrisma = usesPrisma(scan);
+
+  if (scan.framework === 'next.js') {
+    return nextjsStandaloneDockerfile(nodeMajor, pm, port, hasPrisma);
+  }
+  if (scan.framework === 'vite' || scan.framework === 'astro') {
+    return staticBuildDockerfile(nodeMajor, pm, scan.buildCommand);
+  }
+  if (scan.framework === 'sveltekit' || scan.framework === 'nuxt' || scan.framework === 'remix') {
+    return nextjsLikeDockerfile(nodeMajor, pm, port, scan.startCommand, hasPrisma);
+  }
+  return nodeServerDockerfile(nodeMajor, pm, port, scan.buildCommand, scan.startCommand, hasPrisma);
 }
 
-function nodeDockerfile(
+function pmRun(pm: PackageManager): string {
+  return pm === 'pnpm' ? 'pnpm' : pm === 'yarn' ? 'yarn' : pm === 'bun' ? 'bun' : 'npm';
+}
+
+function installStep(pm: PackageManager): string {
+  switch (pm) {
+    case 'pnpm':
+      return 'RUN corepack enable && pnpm install --frozen-lockfile';
+    case 'yarn':
+      return 'RUN corepack enable && yarn install --frozen-lockfile';
+    case 'bun':
+      return 'RUN npm i -g bun && bun install --frozen-lockfile';
+    default:
+      return 'RUN npm ci';
+  }
+}
+
+function copyLockfiles(): string {
+  return 'COPY package.json package-lock.json* pnpm-lock.yaml* yarn.lock* bun.lockb* ./';
+}
+
+function nextjsStandaloneDockerfile(
   nodeMajor: string,
   pm: PackageManager,
   port: number,
-  build: string | null,
-  start: string | null,
+  hasPrisma: boolean,
 ): string {
-  const install =
-    pm === 'pnpm'
-      ? 'RUN corepack enable && pnpm install --frozen-lockfile'
-      : pm === 'yarn'
-        ? 'RUN corepack enable && yarn install --frozen-lockfile'
-        : pm === 'bun'
-          ? 'RUN npm i -g bun && bun install'
-          : 'RUN npm ci';
-  const buildLine = build ? `RUN ${pm === 'pnpm' ? 'pnpm' : pm === 'yarn' ? 'yarn' : pm === 'bun' ? 'bun' : 'npm'} run build` : '# no build script detected';
-  const startLine = start
-    ? `CMD ["${pm === 'pnpm' ? 'pnpm' : pm === 'yarn' ? 'yarn' : pm === 'bun' ? 'bun' : 'npm'}", "start"]`
-    : `CMD ["node", "dist/index.js"]`;
+  const pmCmd = pmRun(pm);
+  const prismaStep = hasPrisma ? `RUN npx prisma generate\n` : '';
+  return `# Next.js standalone output — smallest runtime image.
+# Requires \`output: 'standalone'\` in next.config.{js,mjs,ts}.
+FROM node:${nodeMajor}-alpine AS deps
+WORKDIR /app
+${copyLockfiles()}
+${installStep(pm)}
+
+FROM node:${nodeMajor}-alpine AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+${prismaStep}RUN ${pmCmd} run build
+
+FROM node:${nodeMajor}-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+ENV PORT=${port}
+ENV HOSTNAME=0.0.0.0
+COPY --from=build /app/public ./public
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/.next/static ./.next/static
+EXPOSE ${port}
+CMD ["node", "server.js"]
+`;
+}
+
+function nextjsLikeDockerfile(
+  nodeMajor: string,
+  pm: PackageManager,
+  port: number,
+  start: string | null,
+  hasPrisma: boolean,
+): string {
+  const pmCmd = pmRun(pm);
+  const prismaStep = hasPrisma ? `RUN npx prisma generate\n` : '';
+  const cmd = start ? `CMD ["${pmCmd}", "start"]` : `CMD ["${pmCmd}", "run", "start"]`;
   return `FROM node:${nodeMajor}-alpine AS base
 WORKDIR /app
 
 FROM base AS deps
-COPY package*.json pnpm-lock.yaml* yarn.lock* bun.lockb* ./
-${install}
+${copyLockfiles()}
+${installStep(pm)}
 
 FROM base AS build
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-${buildLine}
+${prismaStep}RUN ${pmCmd} run build
 
 FROM base AS runtime
 ENV NODE_ENV=production
 ENV PORT=${port}
 COPY --from=build /app ./
 EXPOSE ${port}
-${startLine}
+${cmd}
 `;
 }
+
+function staticBuildDockerfile(nodeMajor: string, pm: PackageManager, build: string | null): string {
+  const pmCmd = pmRun(pm);
+  const buildStep = build ? `RUN ${pmCmd} run build` : `RUN ${pmCmd} run build`;
+  return `# Static build — served by nginx.
+FROM node:${nodeMajor}-alpine AS build
+WORKDIR /app
+${copyLockfiles()}
+${installStep(pm)}
+COPY . .
+${buildStep}
+
+FROM nginx:alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80
+`;
+}
+
+function nodeServerDockerfile(
+  nodeMajor: string,
+  pm: PackageManager,
+  port: number,
+  build: string | null,
+  start: string | null,
+  hasPrisma: boolean,
+): string {
+  const pmCmd = pmRun(pm);
+  const buildStep = build ? `RUN ${pmCmd} run build` : `# no build script detected`;
+  const prismaStep = hasPrisma ? `RUN npx prisma generate\n` : '';
+  const cmd = start
+    ? `CMD ["${pmCmd}", "start"]`
+    : build
+      ? `CMD ["node", "dist/index.js"]`
+      : `CMD ["node", "index.js"]`;
+  return `FROM node:${nodeMajor}-alpine AS base
+WORKDIR /app
+
+FROM base AS deps
+${copyLockfiles()}
+${installStep(pm)}
+
+FROM base AS build
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+${prismaStep}${buildStep}
+
+FROM base AS runtime
+ENV NODE_ENV=production
+ENV PORT=${port}
+COPY --from=build /app ./
+EXPOSE ${port}
+${cmd}
+`;
+}
+
+function nodeMajorFromRuntime(runtime: string | null): string {
+  if (!runtime || !runtime.startsWith('node-')) return '20';
+  const match = runtime.match(/\d+/);
+  return match?.[0] ?? '20';
+}
+
 
 function pythonDockerfile(scan: ScanResult): string {
   const startFromScripts = scan.scripts['start'] ?? null;
@@ -199,7 +328,17 @@ function summarizeDockerfile(scan: ScanResult): string {
       return 'nginx:alpine serving static assets';
     default: {
       const major = nodeMajorFromRuntime(scan.runtime);
-      return `node:${major}-alpine · ${scan.packageManager ?? 'npm'} · multi-stage`;
+      const pm = scan.packageManager ?? 'npm';
+      if (scan.framework === 'next.js') {
+        return `node:${major}-alpine · ${pm} · Next.js standalone${usesPrisma(scan) ? ' + prisma generate' : ''}`;
+      }
+      if (scan.framework === 'vite' || scan.framework === 'astro') {
+        return `node:${major}-alpine build → nginx:alpine static serve`;
+      }
+      if (scan.framework) {
+        return `node:${major}-alpine · ${pm} · ${scan.framework}${usesPrisma(scan) ? ' + prisma generate' : ''}`;
+      }
+      return `node:${major}-alpine · ${pm} · server (no framework detected)`;
     }
   }
 }

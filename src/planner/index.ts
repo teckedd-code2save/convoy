@@ -173,18 +173,43 @@ function describeEcosystem(scan: ScanResult): string {
 }
 
 function defaultRehearsal(scan: ScanResult, platform: Platform): PlanRehearsalSection {
-  const validations: string[] = [
-    'image build succeeds',
-    'container boots and responds on the expected port',
-  ];
-  if (scan.healthPath) validations.push(`${scan.healthPath} returns 200`);
-  else validations.push('health probe on /health (TCP-only fallback if no route exists)');
-  if (scan.testCommand) validations.push(`smoke: ${scan.testCommand.slice(0, 40)}`);
-  validations.push('cold-start within envelope vs. baseline');
-  validations.push('60s synthetic load · p99 within tolerance');
-  if (scan.dataLayer.some((d) => d.includes('postgres') || d.includes('mysql'))) {
-    validations.push('migration dry-run against scratch data');
+  const validations: string[] = [];
+
+  const pm = scan.packageManager;
+  if (pm) validations.push(`${pm} install on the twin (lockfile-frozen)`);
+
+  if (scan.hasDockerfile) {
+    validations.push(`your Dockerfile (base ${scan.dockerfileBase ?? 'unknown'}) builds clean`);
+  } else if (platform === 'vercel') {
+    validations.push(`Vercel build${scan.buildCommand ? ` (\`${scan.buildCommand}\`)` : ''} succeeds`);
+  } else {
+    validations.push(`Convoy-drafted Dockerfile builds clean${scan.buildCommand ? ` (\`${scan.buildCommand}\`)` : ''}`);
   }
+
+  const usesPrisma =
+    scan.dataLayer.some((d) => d.includes('prisma')) || scan.topLevelDirs.includes('prisma');
+  if (usesPrisma) {
+    validations.push('`prisma generate` runs during image build');
+    validations.push('`prisma migrate deploy` dry-run against scratch data (measures lock duration)');
+  }
+
+  validations.push(
+    scan.startCommand
+      ? `service boots via \`${scan.startCommand}\` on port ${scan.port ?? 8080}`
+      : `container boots on port ${scan.port ?? 8080} and accepts connections`,
+  );
+
+  if (scan.healthPath) validations.push(`GET ${scan.healthPath} returns 200 within envelope`);
+  else validations.push('TCP health probe (no health route detected — worth adding one)');
+
+  if (scan.testCommand) {
+    validations.push(`smoke suite: \`${scan.testCommand}\``);
+  } else {
+    validations.push('no test command found — rehearsal skips the smoke suite');
+  }
+
+  validations.push('cold-start latency within envelope vs. the last healthy release');
+  validations.push('60s synthetic load · p99 within baseline tolerance · no new error fingerprints');
 
   return {
     enabled: true,
@@ -192,9 +217,9 @@ function defaultRehearsal(scan: ScanResult, platform: Platform): PlanRehearsalSe
       platform === 'fly'
         ? `fly ephemeral app \`${repoName(scan.localPath)}-rehearsal-<sha>\` in iad`
         : platform === 'railway'
-          ? 'railway preview environment'
+          ? `railway preview of \`${repoName(scan.localPath)}\` with scratch add-ons`
           : platform === 'vercel'
-            ? 'vercel preview deployment'
+            ? `vercel preview deployment for \`${repoName(scan.localPath)}\``
             : `cloud run revision \`${repoName(scan.localPath)}-rehearsal-<sha>\` in us-central1`,
     buildCommand: scan.buildCommand,
     startCommand: scan.startCommand,

@@ -196,7 +196,15 @@ export function renderPlan(plan: ConvoyPlan): string {
   if (plan.rehearsal.startCommand) rehearseBits.push(`start \`${plan.rehearsal.startCommand}\``);
   if (plan.rehearsal.expectedPort !== null) rehearseBits.push(`port ${plan.rehearsal.expectedPort}`);
   step(2, rehearseBits.join(' · '));
-  step(3, `Validate: ${plan.rehearsal.validations.slice(0, 4).join(' · ')}${plan.rehearsal.validations.length > 4 ? ' · ...' : ''}`);
+  const validationLines = plan.rehearsal.validations;
+  if (validationLines.length === 0) {
+    step(3, 'Validate (no specific checks configured)');
+  } else {
+    step(3, `Validate on the twin:`);
+    for (const v of validationLines) {
+      L.push(`       · ${v}`);
+    }
+  }
   step(4, `[approval] ${plan.approvals.find((a) => a.kind === 'promote')?.description ?? 'Promote approval required.'}`);
   step(5, `Canary ${plan.promotion.canary.trafficPercent}% for ${plan.promotion.canary.bakeWindowSeconds}s · halt on ${plan.promotion.haltOn[0] ?? 'SLO breach'}`);
   const steps = plan.promotion.steps.map((s) => `${s.trafficPercent}%`).join(' → ');
