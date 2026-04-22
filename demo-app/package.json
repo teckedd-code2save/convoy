@@ -1,0 +1,26 @@
+{
+  "name": "convoy-demo-orders",
+  "version": "1.0.0",
+  "description": "Tiny Express orders service used as the target of Convoy demos. Ships with an intentional buggy mode that surfaces under load.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc",
+    "traffic": "tsx scripts/traffic.ts",
+    "test": "tsx --test src/**/*.test.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^5.0.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
