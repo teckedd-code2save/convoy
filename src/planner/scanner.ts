@@ -51,8 +51,17 @@ export interface ScanRisk {
   evidence?: string;
 }
 
+export interface SubService {
+  name: string;
+  path: string;
+  ecosystem: Ecosystem;
+  framework: string | null;
+  manifest: string;
+}
+
 export interface ScanResult {
   localPath: string;
+  scanRoot: string;
   ecosystem: Ecosystem;
   language: string | null;
   runtime: string | null;
@@ -78,6 +87,7 @@ export interface ScanResult {
   isMonorepo: boolean;
   monorepoTool: MonorepoTool;
   workspaces: string[];
+  subServices: SubService[];
   readmeTitle: string | null;
   readmeFirstPara: string | null;
   deployability: Deployability;
@@ -112,7 +122,11 @@ const SKIP_DIRS = new Set([
   '.cache',
 ]);
 
-export function scanRepository(localPath: string): ScanResult {
+export interface ScanOptions {
+  workspace?: string;
+}
+
+export function scanRepository(localPath: string, opts: ScanOptions = {}): ScanResult {
   if (!existsSync(localPath)) {
     throw new Error(`Path does not exist: ${localPath}`);
   }
@@ -121,13 +135,19 @@ export function scanRepository(localPath: string): ScanResult {
     throw new Error(`Path is not a directory: ${localPath}`);
   }
 
-  const topEntries = readTopLevel(localPath);
+  const rootPath = localPath;
+  const scanPath = opts.workspace ? join(localPath, opts.workspace) : localPath;
+  if (opts.workspace && !existsSync(scanPath)) {
+    throw new Error(`Workspace path does not exist: ${scanPath}`);
+  }
+
+  const topEntries = readTopLevel(scanPath);
   const { topLevelDirs, topLevelFiles } = topEntries;
-  const allFiles = listFiles(localPath, localPath, 0, 4);
+  const allFiles = listFiles(scanPath, scanPath, 0, 4);
   const evidence: string[] = [];
   const risks: ScanRisk[] = [];
 
-  const packageJson = tryReadJson(localPath, 'package.json');
+  const packageJson = tryReadJson(scanPath, 'package.json');
   const scripts: Record<string, string> =
     packageJson && typeof packageJson['scripts'] === 'object' && packageJson['scripts']
       ? Object.fromEntries(
@@ -137,19 +157,32 @@ export function scanRepository(localPath: string): ScanResult {
         )
       : {};
 
-  const ecosystem = detectEcosystem(topLevelFiles, topLevelDirs, allFiles, evidence);
+  let ecosystem = detectEcosystem(topLevelFiles, topLevelDirs, allFiles, evidence);
+  const subServices = ecosystem === 'unknown'
+    ? detectSubServices(scanPath, topLevelDirs, evidence)
+    : [];
+
+  // If root has no ecosystem but child dirs do, promote the first child's
+  // ecosystem so the plan isn't useless. Record a monorepo/multi-service
+  // risk so the picker can warn.
+  if (ecosystem === 'unknown' && subServices.length > 0) {
+    ecosystem = subServices[0]!.ecosystem;
+    evidence.push(`inferred ecosystem from ${subServices[0]!.path}/${subServices[0]!.manifest}`);
+  }
+
   const { language, runtime } = detectLanguageAndRuntime(ecosystem, packageJson);
-  const framework = detectFramework(ecosystem, packageJson, topLevelFiles, allFiles);
+  const framework = detectFramework(ecosystem, packageJson, topLevelFiles, allFiles) ??
+    (subServices[0]?.framework ?? null);
   const packageManager = detectPackageManager(ecosystem, topLevelFiles);
-  const { isMonorepo, monorepoTool, workspaces } = detectMonorepo(topLevelFiles, packageJson);
+  const { isMonorepo, monorepoTool, workspaces } = detectMonorepo(topLevelFiles, packageJson, subServices);
 
   const existingPlatform = detectExistingPlatform(topLevelFiles, evidence);
   const hasDockerfile = topLevelFiles.includes('Dockerfile');
-  const dockerfileBase = hasDockerfile ? readDockerfileBase(localPath) : null;
+  const dockerfileBase = hasDockerfile ? readDockerfileBase(scanPath) : null;
   const hasCi = topLevelDirs.includes('.github') && allFiles.some((f) => f.startsWith('.github/workflows/'));
 
   const topology = inferTopology(ecosystem, framework, allFiles, packageJson);
-  const dataLayer = detectDataLayer(localPath, allFiles, packageJson, evidence);
+  const dataLayer = detectDataLayer(scanPath, allFiles, packageJson, evidence);
   const sourceDirs = detectSourceDirs(ecosystem, topLevelDirs);
   const testDirs = detectTestDirs(topLevelDirs, allFiles);
 
@@ -158,10 +191,10 @@ export function scanRepository(localPath: string): ScanResult {
   const devCommand = scripts['dev'] ?? scripts['develop'] ?? null;
   const testCommand = scripts['test'] ?? null;
 
-  const healthPath = detectHealthPath(localPath, allFiles);
-  const port = detectPort(packageJson, scripts, localPath, allFiles);
+  const healthPath = detectHealthPath(scanPath, allFiles);
+  const port = detectPort(packageJson, scripts, scanPath, allFiles);
 
-  const readme = readReadmeExcerpt(localPath, topLevelFiles);
+  const readme = readReadmeExcerpt(scanPath, topLevelFiles);
 
   const { deployability, deployabilityReason } = determineDeployability(
     ecosystem,
@@ -182,6 +215,13 @@ export function scanRepository(localPath: string): ScanResult {
     scripts,
     isMonorepo,
   );
+  if (subServices.length > 1 && !opts.workspace) {
+    risks.push({
+      level: 'warn',
+      message: `Multi-service repo detected: ${subServices.map((s) => s.path).join(', ')}. ` +
+        `This plan targets ${subServices[0]!.path}. Re-run with \`--workspace=<path>\` to plan a different service.`,
+    });
+  }
 
   if (readme.title) evidence.push(`README title "${readme.title}"`);
   if (packageJson?.['name']) evidence.push(`package.json name=${String(packageJson['name'])}`);
@@ -189,7 +229,8 @@ export function scanRepository(localPath: string): ScanResult {
   if (dockerfileBase) evidence.push(`Dockerfile base=${dockerfileBase}`);
 
   return {
-    localPath,
+    localPath: rootPath,
+    scanRoot: scanPath,
     ecosystem,
     language,
     runtime,
@@ -215,6 +256,7 @@ export function scanRepository(localPath: string): ScanResult {
     isMonorepo,
     monorepoTool,
     workspaces,
+    subServices,
     readmeTitle: readme.title,
     readmeFirstPara: readme.firstPara,
     deployability,
@@ -477,13 +519,120 @@ function detectPackageManager(eco: Ecosystem, files: string[]): PackageManager {
 function detectMonorepo(
   files: string[],
   pkg: Record<string, any> | null,
+  subServices: SubService[] = [],
 ): { isMonorepo: boolean; monorepoTool: MonorepoTool; workspaces: string[] } {
   if (files.includes('turbo.json')) return { isMonorepo: true, monorepoTool: 'turbo', workspaces: pkgWorkspaces(pkg) };
   if (files.includes('nx.json')) return { isMonorepo: true, monorepoTool: 'nx', workspaces: [] };
   if (files.includes('pnpm-workspace.yaml')) return { isMonorepo: true, monorepoTool: 'pnpm-workspaces', workspaces: [] };
   if (files.includes('lerna.json')) return { isMonorepo: true, monorepoTool: 'lerna', workspaces: pkgWorkspaces(pkg) };
   if (pkg && Array.isArray(pkg['workspaces'])) return { isMonorepo: true, monorepoTool: 'yarn-workspaces', workspaces: pkgWorkspaces(pkg) };
+  if (subServices.length >= 2) {
+    return { isMonorepo: true, monorepoTool: null, workspaces: subServices.map((s) => s.path) };
+  }
   return { isMonorepo: false, monorepoTool: null, workspaces: [] };
+}
+
+/**
+ * When the root has no recognized manifest, look one level deep for common
+ * sub-service directory conventions (backend, frontend, api, server, client,
+ * apps/*, packages/*, services/*) and sniff their ecosystems.
+ */
+function detectSubServices(
+  scanPath: string,
+  topLevelDirs: string[],
+  evidence: string[],
+): SubService[] {
+  const CANDIDATES = new Set([
+    'backend', 'frontend', 'api', 'server', 'client', 'web', 'app',
+    'service', 'services', 'apps', 'packages',
+  ]);
+
+  const out: SubService[] = [];
+  for (const dir of topLevelDirs) {
+    if (SKIP_DIRS.has(dir)) continue;
+    if (!CANDIDATES.has(dir.toLowerCase())) continue;
+    const absChild = join(scanPath, dir);
+
+    // For apps/ packages/ services/ — peek one more level and collect each child.
+    if (dir === 'apps' || dir === 'packages' || dir === 'services') {
+      let entries: string[];
+      try {
+        entries = readdirSync(absChild);
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        const grandPath = join(absChild, entry);
+        const sniffed = sniffSubService(grandPath, `${dir}/${entry}`);
+        if (sniffed) out.push(sniffed);
+      }
+      continue;
+    }
+
+    const sniffed = sniffSubService(absChild, dir);
+    if (sniffed) out.push(sniffed);
+  }
+
+  if (out.length > 0) {
+    evidence.push(`detected ${out.length} sub-service${out.length === 1 ? '' : 's'}: ${out.map((s) => s.path).join(', ')}`);
+  }
+  return out;
+}
+
+function sniffSubService(absPath: string, relPath: string): SubService | null {
+  let entries: string[];
+  try {
+    entries = readdirSync(absPath);
+  } catch {
+    return null;
+  }
+  const has = (name: string): boolean => entries.includes(name);
+
+  if (has('package.json')) {
+    const pkg = tryReadJson(absPath, 'package.json');
+    const framework = pkg ? detectJsFramework(pkg) : null;
+    return { name: relPath, path: relPath, ecosystem: 'node', framework, manifest: 'package.json' };
+  }
+  if (has('pyproject.toml') || has('requirements.txt') || has('Pipfile')) {
+    const manifest = has('pyproject.toml') ? 'pyproject.toml' : has('requirements.txt') ? 'requirements.txt' : 'Pipfile';
+    return { name: relPath, path: relPath, ecosystem: 'python', framework: null, manifest };
+  }
+  if (has('go.mod')) {
+    return { name: relPath, path: relPath, ecosystem: 'go', framework: null, manifest: 'go.mod' };
+  }
+  if (has('Cargo.toml')) {
+    return { name: relPath, path: relPath, ecosystem: 'rust', framework: null, manifest: 'Cargo.toml' };
+  }
+  if (has('Gemfile')) {
+    return { name: relPath, path: relPath, ecosystem: 'ruby', framework: null, manifest: 'Gemfile' };
+  }
+  if (has('composer.json')) {
+    return { name: relPath, path: relPath, ecosystem: 'php', framework: null, manifest: 'composer.json' };
+  }
+  if (has('pom.xml') || has('build.gradle')) {
+    const manifest = has('pom.xml') ? 'pom.xml' : 'build.gradle';
+    return { name: relPath, path: relPath, ecosystem: 'java-jvm', framework: null, manifest };
+  }
+  return null;
+}
+
+// JS framework detection needed from sniffSubService too; pull out helper.
+function detectJsFramework(pkg: Record<string, any>): string | null {
+  const deps: Record<string, unknown> = {
+    ...(pkg['dependencies'] ?? {}),
+    ...(pkg['devDependencies'] ?? {}),
+  };
+  if (deps['next']) return 'next.js';
+  if (deps['nuxt']) return 'nuxt';
+  if (deps['@remix-run/node'] || deps['@remix-run/serve']) return 'remix';
+  if (deps['astro']) return 'astro';
+  if (deps['@nestjs/core']) return 'nest.js';
+  if (deps['fastify']) return 'fastify';
+  if (deps['express']) return 'express';
+  if (deps['hono']) return 'hono';
+  if (deps['svelte']) return 'sveltekit';
+  if (deps['vite']) return 'vite';
+  return null;
 }
 
 function pkgWorkspaces(pkg: Record<string, any> | null): string[] {

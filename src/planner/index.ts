@@ -27,6 +27,7 @@ export interface BuildPlanOptions {
   branch?: string;
   sha?: string;
   platformOverride?: Platform;
+  workspace?: string;
   ai?: EnrichmentOptions;
 }
 
@@ -39,7 +40,7 @@ export async function buildPlan(
   localPath: string,
   opts: BuildPlanOptions = {},
 ): Promise<BuildPlanResult> {
-  const scan = scanRepository(localPath);
+  const scan = scanRepository(localPath, opts.workspace ? { workspace: opts.workspace } : {});
 
   const deployability = toPlanDeployability(scan);
   const platform = resolvePlatform(scan, opts.platformOverride, deployability);

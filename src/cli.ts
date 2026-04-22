@@ -199,6 +199,7 @@ async function runShip(repoUrl: string, opts: ShipOpts): Promise<void> {
 interface PlanOpts {
   platform?: string;
   repoUrl?: string;
+  workspace?: string;
   save?: boolean;
   json?: boolean;
   noAi?: boolean;
@@ -237,6 +238,7 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
       ...(resolved.branch !== undefined && { branch: resolved.branch }),
       ...(resolved.sha !== undefined && { sha: resolved.sha }),
       ...(platformOverride !== undefined && { platformOverride }),
+      ...(opts.workspace !== undefined && { workspace: opts.workspace }),
       ai: opts.noAi ? { disable: true } : {},
     });
     thinking?.stop();
@@ -660,9 +662,10 @@ program
 
 program
   .command('plan <path>')
-  .description('Produce an inspectable plan of what `convoy apply` would do. Reads the target path; does not write or deploy anything.')
+  .description('Produce an inspectable plan of what `convoy apply` would do. Reads the target path or GitHub URL; does not write or deploy anything.')
   .option('--platform <platform>', 'explicit platform choice: fly | railway | vercel | cloudrun')
   .option('--repo-url <url>', 'annotate the plan with a remote repo URL (does not fetch)')
+  .option('--workspace <subdir>', 'target a specific subdirectory (e.g. backend, apps/web) for monorepos')
   .option('--save', 'persist the plan to .convoy/plans/<id>.json', false)
   .option('--json', 'output the raw plan as JSON instead of the human-readable render', false)
   .option('--no-ai', 'skip the Opus narrative pass and use the deterministic output')
