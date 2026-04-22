@@ -60,8 +60,6 @@ export interface PlanPlatformCandidate {
 
 export interface PlanAuthorSection {
   convoyAuthoredFiles: PlanAuthoredFile[];
-  readOnlyPaths: PlanReadOnlyEntry[];
-  note: string;
 }
 
 export interface PlanAuthoredFile {
@@ -69,12 +67,6 @@ export interface PlanAuthoredFile {
   lines: number;
   summary: string;
   contentPreview: string;
-}
-
-export interface PlanReadOnlyEntry {
-  path: string;
-  kind: 'source-dir' | 'test-dir' | 'config' | 'manifest' | 'other';
-  note: string;
 }
 
 export interface PlanRehearsalSection {
@@ -160,87 +152,66 @@ export function renderPlan(plan: ConvoyPlan): string {
 
   L.push(`Convoy Plan ${plan.id.slice(0, 8)}`);
   L.push(''.padEnd(78, '─'));
-  L.push(`Target      ${plan.target.name}  (${plan.target.ecosystem}${plan.target.framework ? `, ${plan.target.framework}` : ''})`);
-  L.push(`Location    ${plan.target.repoUrl ?? plan.target.localPath}`);
-  if (plan.target.readmeTitle) L.push(`Described   "${plan.target.readmeTitle}"`);
+  L.push(`Target    ${plan.target.name}  (${plan.target.ecosystem}${plan.target.framework ? `, ${plan.target.framework}` : ''})`);
+  L.push(`Location  ${plan.target.repoUrl ?? plan.target.localPath}`);
+  if (plan.target.readmeTitle) L.push(`Described "${plan.target.readmeTitle}"`);
   if (plan.target.branch || plan.target.sha) {
-    L.push(`Revision    ${plan.target.branch ?? 'HEAD'}${plan.target.sha ? ` @ ${plan.target.sha.slice(0, 7)}` : ''}`);
+    L.push(`Revision  ${plan.target.branch ?? 'HEAD'}${plan.target.sha ? ` @ ${plan.target.sha.slice(0, 7)}` : ''}`);
   }
-  L.push(`Mode        ${plan.target.mode}`);
-  L.push(`Created     ${plan.createdAt}`);
+  L.push(`Created   ${plan.createdAt}`);
   L.push('');
+
+  if (plan.deployability.verdict === 'not-cloud-deployable') {
+    L.push(plan.summary);
+    L.push('');
+    L.push(`Reason: ${plan.deployability.reason}`);
+    if (plan.evidence.length > 0) {
+      L.push('');
+      L.push('Evidence');
+      for (const ev of plan.evidence.slice(0, 6)) L.push(`  · ${ev}`);
+    }
+    return L.join('\n');
+  }
 
   if (plan.summary) {
-    L.push('Summary');
-    L.push(`  ${plan.summary}`);
+    L.push(plan.summary);
     L.push('');
   }
 
-  L.push('Deployability');
-  L.push(`  Verdict     ${plan.deployability.verdict}`);
-  L.push(`  Why         ${wrap(plan.deployability.reason, 72, '              ').trim()}`);
+  L.push('What Convoy will author');
+  if (plan.author.convoyAuthoredFiles.length === 0) {
+    L.push('  (nothing — the repo already has a complete deployment surface)');
+  } else {
+    for (const file of plan.author.convoyAuthoredFiles) {
+      L.push(`  + ${file.path.padEnd(36)} ${String(file.lines).padStart(4)} lines  ${file.summary}`);
+    }
+  }
   L.push('');
 
-  if (plan.deployability.verdict !== 'not-cloud-deployable') {
-    L.push('Platform decision');
-    const rankings = plan.platform.candidates.map((c) => `${c.platform} ${c.score}`).join(' · ');
-    L.push(`  Candidates  ${rankings}`);
-    L.push(`  Chosen      ${plan.platform.chosen}  (${plan.platform.source})`);
-    L.push(`  Reason      ${wrap(plan.platform.reason, 72, '              ').trim()}`);
-    L.push('');
+  L.push('How it ships');
+  const step = (n: number, text: string) => L.push(`  ${String(n).padStart(2)}. ${text}`);
+  step(1, `[approval] ${plan.approvals.find((a) => a.kind === 'merge_pr')?.description ?? 'PR merge required.'}`);
+  const rehearseBits: string[] = [`Rehearse on ${plan.rehearsal.targetDescriptor}`];
+  if (plan.rehearsal.buildCommand) rehearseBits.push(`build \`${plan.rehearsal.buildCommand}\``);
+  if (plan.rehearsal.startCommand) rehearseBits.push(`start \`${plan.rehearsal.startCommand}\``);
+  if (plan.rehearsal.expectedPort !== null) rehearseBits.push(`port ${plan.rehearsal.expectedPort}`);
+  step(2, rehearseBits.join(' · '));
+  step(3, `Validate: ${plan.rehearsal.validations.slice(0, 4).join(' · ')}${plan.rehearsal.validations.length > 4 ? ' · ...' : ''}`);
+  step(4, `[approval] ${plan.approvals.find((a) => a.kind === 'promote')?.description ?? 'Promote approval required.'}`);
+  step(5, `Canary ${plan.promotion.canary.trafficPercent}% for ${plan.promotion.canary.bakeWindowSeconds}s · halt on ${plan.promotion.haltOn[0] ?? 'SLO breach'}`);
+  const steps = plan.promotion.steps.map((s) => `${s.trafficPercent}%`).join(' → ');
+  step(6, `Promote ${steps} with ${plan.promotion.steps[0]?.bakeWindowSeconds ?? 30}s bake per step`);
+  step(7, `Observe — auto-rollback via \`${plan.rollback.strategy}\` (~${plan.rollback.estimatedSeconds}s) if any halt condition fires`);
+  L.push('');
 
-    L.push('Files to author (Convoy-authored)');
-    if (plan.author.convoyAuthoredFiles.length === 0) {
-      L.push('  (none — repo already has a complete deployment surface)');
-    } else {
-      for (const file of plan.author.convoyAuthoredFiles) {
-        L.push(`  + ${file.path.padEnd(40)} ${String(file.lines).padStart(4)} lines  ${file.summary}`);
-      }
-    }
-    L.push('');
-
-    L.push('Files Convoy will NOT touch (developer-authored)');
-    if (plan.author.readOnlyPaths.length === 0) {
-      L.push('  (no developer directories detected at the target root)');
-    } else {
-      for (const entry of plan.author.readOnlyPaths) {
-        L.push(`  ~ ${entry.path.padEnd(40)} ${entry.note}`);
-      }
-    }
-    if (plan.author.note) L.push(`  ${plan.author.note}`);
-    L.push('');
-
-    L.push('Rehearsal');
-    L.push(`  Target        ${plan.rehearsal.targetDescriptor}`);
-    if (plan.rehearsal.buildCommand) L.push(`  Build         ${plan.rehearsal.buildCommand}`);
-    if (plan.rehearsal.startCommand) L.push(`  Start         ${plan.rehearsal.startCommand}`);
-    if (plan.rehearsal.expectedPort !== null) L.push(`  Port          ${plan.rehearsal.expectedPort}`);
-    L.push(`  Validations   ${plan.rehearsal.validations.join(' · ')}`);
-    L.push(`  Lifecycle     ~${plan.rehearsal.estimatedDurationSeconds}s · ${plan.rehearsal.estimatedCost}`);
-    L.push('');
-
-    L.push('Promotion');
-    L.push(`  Canary        ${plan.promotion.canary.trafficPercent}% · ${plan.promotion.canary.bakeWindowSeconds}s bake`);
-    const steps = plan.promotion.steps.map((s) => `${s.trafficPercent}%`).join(' → ');
-    L.push(`  Steps         ${steps}`);
-    L.push(`  Halt on       ${plan.promotion.haltOn.join(' · ')}`);
-    L.push('');
-
-    L.push('Rollback (pre-staged)');
-    L.push(`  Strategy      ${plan.rollback.strategy}`);
-    L.push(`  Target        ${plan.rollback.target}`);
-    L.push(`  ETA           ~${plan.rollback.estimatedSeconds}s if triggered`);
-    L.push('');
-
-    L.push('Approvals required');
-    for (const approval of plan.approvals) {
-      L.push(`  [ ] ${approval.kind.padEnd(18)} ${approval.description}`);
-    }
-    L.push('');
-  }
+  L.push('Why this platform');
+  const rankings = plan.platform.candidates.map((c) => `${c.platform} ${c.score}`).join(' · ');
+  L.push(`  ${plan.platform.chosen} chosen (${plan.platform.source})  —  ${rankings}`);
+  L.push(`  ${wrap(plan.platform.reason, 72, '  ').trim()}`);
+  L.push('');
 
   if (plan.risks.length > 0) {
-    L.push('Risk callouts');
+    L.push('Risks');
     for (const risk of plan.risks) {
       const tag = risk.level === 'block' ? 'BLOCK' : risk.level === 'warn' ? 'WARN ' : 'INFO ';
       L.push(`  [${tag}] ${risk.message}`);
@@ -250,14 +221,12 @@ export function renderPlan(plan: ConvoyPlan): string {
 
   if (plan.evidence.length > 0) {
     L.push('Evidence');
-    for (const ev of plan.evidence.slice(0, 8)) L.push(`  · ${ev}`);
-    if (plan.evidence.length > 8) L.push(`  · ... and ${plan.evidence.length - 8} more`);
+    for (const ev of plan.evidence.slice(0, 6)) L.push(`  · ${ev}`);
+    if (plan.evidence.length > 6) L.push(`  · ... and ${plan.evidence.length - 6} more`);
     L.push('');
   }
 
-  L.push('Estimates');
-  L.push(`  Run time      ${plan.estimate.runTimeMinutesMin}–${plan.estimate.runTimeMinutesMax} min`);
-  L.push(`  Opus spend    $${plan.estimate.opusSpendUsdMin.toFixed(2)}–$${plan.estimate.opusSpendUsdMax.toFixed(2)}`);
+  L.push(`Estimated run: ${plan.estimate.runTimeMinutesMin}–${plan.estimate.runTimeMinutesMax} min · Opus spend $${plan.estimate.opusSpendUsdMin.toFixed(2)}–$${plan.estimate.opusSpendUsdMax.toFixed(2)}`);
 
   return L.join('\n');
 }

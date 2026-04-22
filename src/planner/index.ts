@@ -43,7 +43,7 @@ export async function buildPlan(
   const platform = resolvePlatform(scan, opts.platformOverride, deployability);
   const author =
     deployability.verdict === 'not-cloud-deployable'
-      ? { convoyAuthoredFiles: [], readOnlyPaths: [], note: 'Skipped — target is not a cloud-deployable web service.' }
+      ? { convoyAuthoredFiles: [] }
       : draftAuthorSection(scan, platform.chosen);
 
   const rehearsal = defaultRehearsal(scan, platform.chosen);

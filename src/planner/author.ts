@@ -1,4 +1,4 @@
-import type { PlanAuthorSection, PlanAuthoredFile, PlanReadOnlyEntry } from '../core/plan.js';
+import type { PlanAuthorSection, PlanAuthoredFile } from '../core/plan.js';
 import type { Platform } from '../core/types.js';
 
 import { repoName, type PackageManager, type ScanResult } from './scanner.js';
@@ -25,99 +25,7 @@ export function draftAuthorSection(scan: ScanResult, platform: Platform): PlanAu
   files.push(draftEnvSchema(scan));
   files.push(draftConvoyManifest(files));
 
-  const readOnlyPaths = readOnlyFromScan(scan);
-  const note = readOnlyPaths.length === 0
-    ? 'Repo appears empty of obvious developer code at the root; Convoy will only create the files above.'
-    : 'The paths above are whatever Convoy observed at your repo root. Convoy will read them for context and never modify them.';
-
-  return { convoyAuthoredFiles: files, readOnlyPaths, note };
-}
-
-function readOnlyFromScan(scan: ScanResult): PlanReadOnlyEntry[] {
-  const entries: PlanReadOnlyEntry[] = [];
-  const seen = new Set<string>();
-
-  for (const dir of scan.sourceDirs) {
-    if (seen.has(dir)) continue;
-    seen.add(dir);
-    entries.push({
-      path: `${dir}/`,
-      kind: 'source-dir',
-      note: `developer code — Convoy reads, never writes`,
-    });
-  }
-  for (const dir of scan.testDirs) {
-    if (seen.has(dir)) continue;
-    seen.add(dir);
-    entries.push({
-      path: dir.includes(' ') ? dir : `${dir}/`,
-      kind: 'test-dir',
-      note: 'developer tests — Convoy reads for rehearsal validation, never writes',
-    });
-  }
-
-  const manifestFiles: { name: string; note: string }[] = [
-    { name: 'package.json', note: 'dependencies managed by the developer' },
-    { name: 'pnpm-lock.yaml', note: 'lockfile — developer-authored' },
-    { name: 'yarn.lock', note: 'lockfile — developer-authored' },
-    { name: 'package-lock.json', note: 'lockfile — developer-authored' },
-    { name: 'pyproject.toml', note: 'Python project manifest — developer-authored' },
-    { name: 'requirements.txt', note: 'Python requirements — developer-authored' },
-    { name: 'Pipfile', note: 'Python env manifest — developer-authored' },
-    { name: 'go.mod', note: 'Go module manifest — developer-authored' },
-    { name: 'go.sum', note: 'Go checksum file — developer-authored' },
-    { name: 'Cargo.toml', note: 'Rust manifest — developer-authored' },
-    { name: 'Cargo.lock', note: 'Rust lockfile — developer-authored' },
-    { name: 'Gemfile', note: 'Ruby manifest — developer-authored' },
-    { name: 'Gemfile.lock', note: 'Ruby lockfile — developer-authored' },
-    { name: 'composer.json', note: 'PHP manifest — developer-authored' },
-    { name: 'mix.exs', note: 'Elixir manifest — developer-authored' },
-    { name: 'pubspec.yaml', note: 'Dart manifest — developer-authored' },
-    { name: 'pom.xml', note: 'Maven manifest — developer-authored' },
-    { name: 'build.gradle', note: 'Gradle manifest — developer-authored' },
-    { name: 'build.gradle.kts', note: 'Gradle Kotlin manifest — developer-authored' },
-    { name: 'tsconfig.json', note: 'TypeScript config — developer-authored' },
-    { name: '.eslintrc.json', note: 'ESLint config — developer-authored' },
-    { name: '.prettierrc', note: 'Prettier config — developer-authored' },
-  ];
-  for (const { name, note } of manifestFiles) {
-    if (scan.topLevelFiles.includes(name)) {
-      entries.push({ path: name, kind: 'manifest', note });
-    }
-  }
-
-  if (scan.hasDockerfile) {
-    entries.push({ path: 'Dockerfile', kind: 'config', note: 'developer-authored — Convoy will use it as-is' });
-  }
-
-  if (scan.topLevelFiles.some((f) => /^readme/i.test(f))) {
-    const readme = scan.topLevelFiles.find((f) => /^readme/i.test(f))!;
-    entries.push({ path: readme, kind: 'other', note: 'Convoy reads it to understand the project' });
-  }
-
-  if (scan.topLevelFiles.includes('docker-compose.yml') || scan.topLevelFiles.includes('docker-compose.yaml')) {
-    const name = scan.topLevelFiles.find((f) => f === 'docker-compose.yml' || f === 'docker-compose.yaml')!;
-    entries.push({
-      path: name,
-      kind: 'config',
-      note: 'local dev orchestration — Convoy reads for data-layer hints, never writes',
-    });
-  }
-
-  const commonRead = ['prisma', 'migrations', 'db', 'config', 'public', 'static', 'assets'];
-  for (const dir of scan.topLevelDirs) {
-    if (seen.has(dir)) continue;
-    if (commonRead.includes(dir)) {
-      seen.add(dir);
-      entries.push({
-        path: `${dir}/`,
-        kind: 'other',
-        note: 'supporting asset directory — read-only',
-      });
-    }
-  }
-
-  return entries;
+  return { convoyAuthoredFiles: files };
 }
 
 function draftDockerfile(scan: ScanResult): PlanAuthoredFile {
