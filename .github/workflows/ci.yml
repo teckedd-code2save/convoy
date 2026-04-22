@@ -33,3 +33,6 @@ jobs:
         env:
           CONVOY_STATE_PATH: ${{ runner.temp }}/convoy-state.db
         run: npm run convoy -- status
+
+      - name: Smoke — plan (deterministic fallback)
+        run: npm run convoy -- plan . --no-ai

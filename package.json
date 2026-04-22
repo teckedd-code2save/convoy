@@ -24,6 +24,7 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.90.0",
     "better-sqlite3": "^12.9.0",
     "commander": "^14.0.3",
     "picocolors": "^1.1.1"

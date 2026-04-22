@@ -16,6 +16,7 @@ import type {
 import type { Platform } from '../core/types.js';
 
 import { draftAuthorSection } from './author.js';
+import { enrichPlan, type EnrichmentOptions } from './enricher.js';
 import { pickPlatform } from './picker.js';
 import { scanRepository, repoName, type ScanResult } from './scanner.js';
 
@@ -24,9 +25,18 @@ export interface BuildPlanOptions {
   branch?: string;
   sha?: string;
   platformOverride?: Platform;
+  ai?: EnrichmentOptions;
 }
 
-export function buildPlan(localPath: string, opts: BuildPlanOptions = {}): ConvoyPlan {
+export type BuildPlanResult = {
+  plan: ConvoyPlan;
+  enrichmentSource: 'ai' | 'cache' | 'skipped-no-key' | 'skipped-flag' | 'error' | 'deterministic';
+};
+
+export async function buildPlan(
+  localPath: string,
+  opts: BuildPlanOptions = {},
+): Promise<BuildPlanResult> {
   const scan = scanRepository(localPath);
 
   const deployability = toPlanDeployability(scan);
@@ -58,7 +68,7 @@ export function buildPlan(localPath: string, opts: BuildPlanOptions = {}): Convo
     readmeExcerpt: scan.readmeFirstPara,
   };
 
-  return {
+  const baseline: ConvoyPlan = {
     id: randomUUID(),
     createdAt: new Date().toISOString(),
     target,
@@ -74,6 +84,13 @@ export function buildPlan(localPath: string, opts: BuildPlanOptions = {}): Convo
     estimate,
     evidence: scan.evidence,
   };
+
+  if (deployability.verdict === 'not-cloud-deployable') {
+    return { plan: baseline, enrichmentSource: 'deterministic' };
+  }
+
+  const enriched = await enrichPlan(scan, baseline, opts.ai ?? {});
+  return { plan: enriched.plan, enrichmentSource: enriched.source };
 }
 
 function toPlanDeployability(scan: ScanResult): PlanDeployabilitySection {

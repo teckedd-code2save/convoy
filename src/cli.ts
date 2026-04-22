@@ -184,6 +184,7 @@ interface PlanOpts {
   repoUrl?: string;
   save?: boolean;
   json?: boolean;
+  noAi?: boolean;
 }
 
 async function runPlan(path: string, opts: PlanOpts): Promise<void> {
@@ -201,16 +202,20 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
   }
 
   const absPath = resolve(path);
+  const thinking = opts.json ? null : startThinking();
   try {
-    const plan = buildPlan(absPath, {
+    const { plan, enrichmentSource } = await buildPlan(absPath, {
       ...(opts.repoUrl !== undefined && { repoUrl: opts.repoUrl }),
       ...(platformOverride !== undefined && { platformOverride }),
+      ai: opts.noAi ? { disable: true } : {},
     });
+    thinking?.stop();
 
     if (opts.json) {
       process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
     } else {
       process.stdout.write(`${renderPlan(plan)}\n`);
+      process.stdout.write(`\n${pc.dim(`Narrative source: ${enrichmentSource}`)}\n`);
     }
 
     if (opts.save) {
@@ -222,10 +227,27 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
       );
     }
   } catch (err) {
+    thinking?.stop();
     const message = err instanceof Error ? err.message : String(err);
     console.error(pc.red(`plan failed: ${message}`));
     process.exitCode = 1;
   }
+}
+
+function startThinking(): { stop: () => void } {
+  if (!process.stdout.isTTY) return { stop: () => {} };
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let i = 0;
+  const timer = setInterval(() => {
+    process.stdout.write(`\r${pc.cyan(frames[i % frames.length])} ${pc.dim('analyzing repo...')}`);
+    i += 1;
+  }, 80);
+  return {
+    stop: () => {
+      clearInterval(timer);
+      process.stdout.write('\r\x1b[2K');
+    },
+  };
 }
 
 async function runStatus(runId?: string): Promise<void> {
@@ -314,7 +336,8 @@ program
   .option('--repo-url <url>', 'annotate the plan with a remote repo URL (does not fetch)')
   .option('--save', 'persist the plan to .convoy/plans/<id>.json', false)
   .option('--json', 'output the raw plan as JSON instead of the human-readable render', false)
-  .action(async (path: string, options: { platform?: string; repoUrl?: string; save?: boolean; json?: boolean }) => {
+  .option('--no-ai', 'skip the Opus narrative pass and use the deterministic output')
+  .action(async (path: string, options: PlanOpts) => {
     await runPlan(path, options);
   });
 
