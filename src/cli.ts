@@ -322,7 +322,7 @@ interface ApplyOpts {
   realRehearsal: boolean;
   realFly: boolean;
   demo?: boolean;
-  autoMerge?: boolean;
+  autoMerge: boolean;
   mergeMethod?: string;
   flyApp?: string;
   flyOrg?: string;
@@ -429,15 +429,18 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
   if (opts.realRehearsal) {
     if (!plan.rehearsal.startCommand) {
       report.realRehearsal = false;
-      report.hardFailures.push(
-        `real rehearsal: no start command detected for this target. ` +
-          `Add a \`start\` script or pass --no-real-rehearsal.`,
-      );
+      // Surface detected sub-services as remediation — the common case is a
+      // monorepo where the start command lives inside apps/* or packages/*.
+      const subPaths = extractMonorepoSuggestions(plan);
+      const workspaceHint = subPaths.length > 0
+        ? `This looks like a monorepo. Try --workspace=${subPaths[0]}${subPaths.length > 1 ? ` (other services: ${subPaths.slice(1).join(', ')})` : ''}.`
+        : 'Add a \`start\` script to the target, or pass --no-real-rehearsal.';
+      report.hardFailures.push(`real rehearsal: no start command detected. ${workspaceHint}`);
       report.checks.push({
         name: 'real rehearsal',
         ok: false,
         detail: 'no start command detected',
-        remedy: 'add a start script to the target, or pass --no-real-rehearsal',
+        remedy: workspaceHint,
       });
     } else {
       report.checks.push({
@@ -512,6 +515,24 @@ function renderPreflight(report: PreflightReport): void {
     }
   }
   process.stdout.write('\n');
+}
+
+/**
+ * Pull sub-service suggestions out of the plan's risks. The scanner emits a
+ * "Multi-service repo detected: apps/web, apps/worker" warn when it finds
+ * workspace members; parse that for --workspace hints in preflight output.
+ */
+function extractMonorepoSuggestions(plan: ConvoyPlan): string[] {
+  for (const risk of plan.risks) {
+    const match = risk.message.match(/Multi-service repo detected:\s*([^.]+)\./);
+    if (match && match[1]) {
+      return match[1]
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+    }
+  }
+  return [];
 }
 
 function autoFlyAppName(plan: ConvoyPlan): string {
@@ -601,7 +622,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
       })),
       prTitle: `convoy: deploy plumbing for ${plan.platform.chosen}`,
       prBody: buildPrBody(plan),
-      mergeOnApproval: opts.autoMerge === true,
+      mergeOnApproval: opts.autoMerge !== false,
       mergeMethod: method,
     };
     orchestratorOpts.realAuthor = realAuthor;
@@ -873,7 +894,7 @@ program
   .option('--no-real-author', 'stub the author stage instead of opening a real PR')
   .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
   .option('--no-real-fly', 'stub the deploy stages instead of deploying to Fly')
-  .option('--auto-merge', 'merge the authored PR automatically on approval')
+  .option('--no-auto-merge', 'on approval, wait for you to merge the PR on GitHub instead of merging automatically')
   .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
   .option('--fly-app <name>', 'Fly.io app name (auto-generated from target if omitted)')
   .option('--fly-org <org>', 'Fly.io organization (default: personal)')
@@ -927,7 +948,7 @@ program
   .option('--no-real-author', 'stub the author stage instead of opening a real PR')
   .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
   .option('--no-real-fly', 'stub the deploy stages instead of deploying to Fly')
-  .option('--auto-merge', 'merge the authored PR automatically on approval (default: wait for manual merge)')
+  .option('--no-auto-merge', 'on approval, wait for you to merge the PR on GitHub instead of merging automatically')
   .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
   .option('--fly-app <name>', 'Fly.io app name (auto-generated from target if omitted)')
   .option('--fly-org <org>', 'Fly.io organization (default: personal)')

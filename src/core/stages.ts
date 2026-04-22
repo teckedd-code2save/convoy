@@ -168,9 +168,6 @@ abstract class BaseStage implements Stage {
     ctx.bus.emit({ type: 'approval.requested', approval });
     this.emit(ctx, 'progress', { awaiting_approval: kind, approval_id: approval.id });
 
-    // Default: auto-approve unless explicitly disabled. Decouples from dry-run
-    // mode so real-rehearsal runs can still be driven to completion without
-    // a human click when --no-auto-approve isn't set.
     const autoApprove = ctx.opts.autoApprove ?? true;
     if (autoApprove) {
       await this.sleep(400, ctx.signal);
@@ -179,8 +176,9 @@ abstract class BaseStage implements Stage {
       return decided;
     }
 
-    const deadline = Date.now() + 5 * 60 * 1000;
-    while (Date.now() < deadline) {
+    // No timeout — operator drives from the web UI on their own schedule.
+    // Abort via Ctrl+C or killing the process if the run is no longer wanted.
+    while (true) {
       if (ctx.signal.aborted) throw new Error('aborted');
       await this.sleep(400);
       const current = ctx.store.getApproval(approval.id);
@@ -193,7 +191,6 @@ abstract class BaseStage implements Stage {
         return current;
       }
     }
-    throw new Error(`Approval ${kind} timed out`);
   }
 }
 
@@ -340,9 +337,9 @@ export class AuthorStage extends BaseStage {
       }
       this.emit(ctx, 'progress', { phase: 'pr.merged' });
     } else {
-      // Poll until someone merges or closes the PR manually.
-      const deadline = Date.now() + 10 * 60 * 1000;
-      while (Date.now() < deadline) {
+      // User opted out of auto-merge — poll indefinitely until someone merges
+      // or closes the PR. No timeout; they drive on their own schedule.
+      while (true) {
         if (ctx.signal.aborted) throw new Error('aborted');
         const status = await prStatus(pr.prUrl);
         if (status === 'merged') break;

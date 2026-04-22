@@ -158,7 +158,22 @@ export function scanRepository(localPath: string, opts: ScanOptions = {}): ScanR
       : {};
 
   let ecosystem = detectEcosystem(topLevelFiles, topLevelDirs, allFiles, evidence);
-  const subServices = ecosystem === 'unknown'
+
+  // Always probe for sub-services when the root looks like a workspace holder
+  // (pnpm-workspace.yaml / turbo.json / nx.json / lerna.json / package.json
+  // with workspaces[] or apps|packages|services dirs). Also run when
+  // ecosystem came back unknown so we can promote a child's ecosystem.
+  const hasWorkspaceMarker =
+    topLevelFiles.includes('pnpm-workspace.yaml') ||
+    topLevelFiles.includes('turbo.json') ||
+    topLevelFiles.includes('nx.json') ||
+    topLevelFiles.includes('lerna.json') ||
+    (packageJson && Array.isArray(packageJson['workspaces'])) ||
+    topLevelDirs.includes('apps') ||
+    topLevelDirs.includes('packages') ||
+    topLevelDirs.includes('services');
+
+  const subServices = hasWorkspaceMarker || ecosystem === 'unknown'
     ? detectSubServices(scanPath, topLevelDirs, evidence)
     : [];
 
