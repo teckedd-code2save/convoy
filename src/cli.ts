@@ -2,9 +2,10 @@
 import { Command } from 'commander';
 import pc from 'picocolors';
 
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
+import { setTimeout as sleepMs } from 'node:timers/promises';
 
 import { ConvoyBus, type ConvoyBusEvent } from './core/bus.js';
 import { Orchestrator } from './core/orchestrator.js';
@@ -45,6 +46,98 @@ async function openInBrowser(url: string): Promise<void> {
   } catch {
     // non-fatal — user can click the printed link
   }
+}
+
+async function probeWebViewer(timeoutMs = 800): Promise<boolean> {
+  try {
+    const res = await fetch(WEB_BASE, { signal: AbortSignal.timeout(timeoutMs) });
+    return res.status < 500;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * If the web viewer isn't reachable at WEB_BASE, try to spawn it from the
+ * `web/` dir next to the CLI. The URL the CLI prints becomes a broken
+ * promise otherwise — the operator clicks and gets ECONNREFUSED instead
+ * of the run timeline.
+ *
+ * Opt out with CONVOY_NO_AUTOSPAWN=1 or by pointing CONVOY_WEB_URL
+ * somewhere else (then we only probe, never spawn).
+ *
+ * The spawned server is detached+unref'd so it outlives the CLI process
+ * and survives across back-to-back `convoy apply` calls.
+ */
+async function ensureWebViewerRunning(webDir: string): Promise<{
+  up: boolean;
+  spawned: boolean;
+  note?: string;
+}> {
+  if (await probeWebViewer()) {
+    return { up: true, spawned: false };
+  }
+  if (process.env['CONVOY_NO_AUTOSPAWN'] === '1') {
+    return { up: false, spawned: false, note: 'CONVOY_NO_AUTOSPAWN=1 set — start web viewer manually' };
+  }
+  if (process.env['CONVOY_WEB_URL']) {
+    return { up: false, spawned: false, note: 'CONVOY_WEB_URL points to a remote viewer that is not responding' };
+  }
+  if (!existsSync(webDir)) {
+    return { up: false, spawned: false, note: `web viewer source not found at ${webDir}` };
+  }
+
+  const logDir = resolve(process.cwd(), '.convoy');
+  try {
+    mkdirSync(logDir, { recursive: true });
+  } catch {
+    // directory may exist; swallow
+  }
+  const logPath = resolve(logDir, 'web-server.log');
+
+  try {
+    const { spawn } = await import('node:child_process');
+    const logFd = openSync(logPath, 'a');
+    const proc = spawn('npm', ['run', 'dev'], {
+      cwd: webDir,
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+      env: { ...process.env },
+    });
+    proc.unref();
+  } catch (err) {
+    return {
+      up: false,
+      spawned: false,
+      note: `failed to spawn web viewer: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    await sleepMs(300);
+    if (await probeWebViewer(500)) {
+      return { up: true, spawned: true };
+    }
+  }
+  return {
+    up: false,
+    spawned: true,
+    note: `spawned web viewer but it did not respond within 8s (logs: ${logPath})`,
+  };
+}
+
+/**
+ * Resolve the `web/` directory relative to the CLI binary itself (works
+ * whether the user ran the CLI from the repo root or from a subdirectory).
+ */
+function convoyWebDir(): string {
+  // src/cli.ts → repo root is one dir up
+  const fromCwd = resolve(process.cwd(), 'web');
+  if (existsSync(fromCwd)) return fromCwd;
+  // When linked or run from elsewhere, fall back to the module URL
+  const moduleUrl = new URL('../web', import.meta.url);
+  return moduleUrl.pathname;
 }
 
 const SYMBOL = {
@@ -252,6 +345,13 @@ async function runShip(
     process.stdout.write(
       `${pc.dim('Plan')} ${pc.bold(plan.id.slice(0, 8))} ${pc.dim('saved')} ${pc.dim(`(narrative: ${enrichmentSource})`)}\n`,
     );
+
+    const viewer = await ensureWebViewerRunning(convoyWebDir());
+    if (viewer.spawned && viewer.up) {
+      process.stdout.write(`${pc.dim('Started web viewer at')} ${pc.cyan(WEB_BASE)}\n`);
+    } else if (!viewer.up && viewer.note) {
+      process.stdout.write(`${pc.yellow('!')} ${pc.dim(viewer.note)}\n`);
+    }
     process.stdout.write(`${pc.cyan('▶')} ${pc.dim('Plan in web UI:')} ${pc.cyan(planUrl)}\n`);
     process.stdout.write(
       `${pc.dim('Target:')} ${plan.target.name} ${pc.dim(`(${plan.target.ecosystem}${plan.target.framework ? `, ${plan.target.framework}` : ''})`)}\n`,
@@ -339,6 +439,13 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
       process.stdout.write(
         `${pc.dim('Apply with')} ${pc.bold(`npm run convoy -- apply ${plan.id.slice(0, 8)}`)}\n`,
       );
+
+      const viewer = await ensureWebViewerRunning(convoyWebDir());
+      if (viewer.spawned && viewer.up) {
+        process.stdout.write(`${pc.dim('Started web viewer at')} ${pc.cyan(WEB_BASE)}\n`);
+      } else if (!viewer.up && viewer.note) {
+        process.stdout.write(`${pc.yellow('!')} ${pc.dim(viewer.note)}\n`);
+      }
       process.stdout.write(`${pc.cyan('▶')} ${pc.dim('Inspect in the web UI:')} ${pc.cyan(url)}\n`);
       if (opts.open === true) void openInBrowser(url);
     }
@@ -815,6 +922,24 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
         `${pc.dim('Real Vercel deploy:')} ${pc.bold(cwd)} ${pc.dim(`(bake: ${realVercel.bakeWindowSeconds}s)`)}\n`,
       );
     }
+  }
+
+  // Make sure the web viewer is up before the orchestrator creates the run.
+  // The renderer will print "Watch live: http://localhost:3737/runs/<id>"
+  // as soon as run.created fires; if the server isn't ready the operator
+  // clicks a dead URL while the pipeline is already paused on an approval.
+  const viewer = await ensureWebViewerRunning(convoyWebDir());
+  if (viewer.spawned && viewer.up) {
+    process.stdout.write(
+      `${pc.dim('Started web viewer at')} ${pc.cyan(WEB_BASE)} ${pc.dim(`(logs: .convoy/web-server.log)`)}\n`,
+    );
+  } else if (!viewer.up && viewer.note) {
+    process.stdout.write(
+      `${pc.yellow('!')} ${pc.dim(`web viewer not reachable: ${viewer.note}`)}\n`,
+    );
+    process.stdout.write(
+      `  ${pc.dim(`approvals will block the pipeline. Start the viewer manually: cd web && npm run dev`)}\n`,
+    );
   }
 
   const repoUrl = plan.target.repoUrl ?? plan.target.localPath;
