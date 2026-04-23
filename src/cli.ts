@@ -4,8 +4,10 @@ import pc from 'picocolors';
 
 import { dirname, resolve } from 'node:path';
 
-import { existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
+import * as readline from 'node:readline/promises';
 import { setTimeout as sleepMs } from 'node:timers/promises';
+import { stdin, stdout } from 'node:process';
 
 import { ConvoyBus, type ConvoyBusEvent } from './core/bus.js';
 import { Orchestrator } from './core/orchestrator.js';
@@ -551,6 +553,12 @@ interface ApplyOpts {
   env?: Record<string, string>;
   open?: boolean;
   trustRepo?: boolean;
+  // Comma-split var names the operator self-declares are already present on
+  // the deploy target (e.g. set via platform console). Convoy trusts the
+  // declaration without probing the platform — no `fly secrets list` etc.
+  alreadySet?: string[];
+  recurring?: boolean;
+  platform?: string;
 }
 
 interface PreflightCheck {
@@ -624,72 +632,181 @@ const DATA_LAYER_EXPECTATIONS: DataLayerExpectation[] = [
 ];
 
 /**
- * Scans the target repo for data-layer dependencies (postgres/redis/mysql/
- * mongo) and checks that a connection string is staged somewhere Convoy
- * will pass to the deploy. Without this the app boots into prod with no
- * database, takes real traffic, and fails in the least-useful way.
- *
- * Warnings only — we don't hard-fail because the scan can false-positive
- * (test fixtures, docs references) and some operators wire data layers
- * outside `.env.convoy-secrets` via platform consoles.
+ * Extract env-var keys from a .env-style document (KEY=value or KEY= lines).
+ * Ignores comments and blank lines. Case-sensitive — env convention is
+ * UPPER_SNAKE but we don't enforce that here.
  */
-function appendDataLayerChecks(
+function extractEnvKeys(content: string): string[] {
+  const keys: string[] = [];
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const m = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+    if (m && m[1]) keys.push(m[1]);
+  }
+  return keys;
+}
+
+/**
+ * Compute the full set of env var keys the app needs for deployment, reading
+ * from two sources:
+ *
+ *  1. `.env.schema` — authored by Convoy during planning, carries the
+ *     scanner-derived data-layer contract (DATABASE_URL / REDIS_URL / etc.).
+ *  2. `.env.example` / `.env.local.example` — the target's own declared
+ *     contract. Checked in the service workspace first, then repo root.
+ *
+ * Returns both the key set and a human-readable source breakdown so the
+ * preflight row can show where each expectation came from.
+ *
+ * Pure local analysis — no platform queries.
+ */
+export function computeExpectedKeys(plan: ConvoyPlan): {
+  keys: Set<string>;
+  sources: string[];
+} {
+  const expected = new Set<string>();
+  const sources: string[] = [];
+
+  const schemaFile = plan.author.convoyAuthoredFiles.find((f) => f.path === '.env.schema');
+  if (schemaFile) {
+    const keys = extractEnvKeys(schemaFile.contentPreview);
+    keys.forEach((k) => expected.add(k));
+    if (keys.length > 0) sources.push(`.env.schema (${keys.length})`);
+  }
+
+  const targetCwd = plan.target.workspace
+    ? resolve(plan.target.localPath, plan.target.workspace)
+    : plan.target.localPath;
+  const exampleCandidates = ['.env.example', '.env.local.example'];
+  for (const cand of exampleCandidates) {
+    const paths = [resolve(targetCwd, cand), resolve(plan.target.localPath, cand)];
+    for (const p of paths) {
+      if (existsSync(p)) {
+        try {
+          const content = readFileSync(p, 'utf8');
+          const keys = extractEnvKeys(content);
+          keys.forEach((k) => expected.add(k));
+          if (keys.length > 0) sources.push(`${cand} (${keys.length})`);
+          break;
+        } catch {
+          // unreadable, skip
+        }
+      }
+    }
+  }
+
+  return { keys: expected, sources };
+}
+
+/**
+ * Compute the set of keys the operator has staged for this deploy, reading
+ * from (in precedence order):
+ *
+ *  1. `.env.convoy-secrets` file in repo root (values included)
+ *  2. `opts.env` (--env KEY=VALUE pairs, values included)
+ *  3. `.env.convoy-already-set` file — names only, declares platform-set
+ *  4. `opts.alreadySet` (--already-set=K1,K2 flag) — names only
+ *
+ * (3) and (4) are pure declarations. Convoy never reads their values from
+ * the platform; the operator is vouching that they're set somewhere Convoy
+ * doesn't need to know about. Written by `convoy stage-secrets` when the
+ * operator marks a var with '!'.
+ */
+export function computeStagedKeys(
+  plan: ConvoyPlan,
+  opts: ApplyOpts,
+): {
+  staged: Set<string>;
+  secretsPath: string;
+  alreadySetFilePath: string;
+  fromFile: string[];
+  fromCli: string[];
+  alreadySet: string[];
+} {
+  const secretsPath =
+    opts.flySecretsFile ?? `${plan.target.localPath}/.env.convoy-secrets`;
+  const alreadySetFilePath = `${plan.target.localPath}/.env.convoy-already-set`;
+
+  const fileSecrets = existsSync(secretsPath) ? parseEnvFile(secretsPath) : {};
+  const cliSecrets = opts.env ?? {};
+  const fileAlready = existsSync(alreadySetFilePath)
+    ? parseEnvFile(alreadySetFilePath)
+    : {};
+
+  const fromFile = Object.keys(fileSecrets);
+  const fromCli = Object.keys(cliSecrets);
+  const alreadySet = [
+    ...Object.keys(fileAlready),
+    ...(opts.alreadySet ?? []),
+  ];
+
+  const staged = new Set<string>();
+  fromFile.forEach((k) => staged.add(k));
+  fromCli.forEach((k) => staged.add(k));
+  alreadySet.forEach((k) => staged.add(k));
+
+  return { staged, secretsPath, alreadySetFilePath, fromFile, fromCli, alreadySet };
+}
+
+/**
+ * Generalized env-staging check. Reconciles expected vars against staged
+ * vars. No platform probes — see memory/feedback_no_autonomous_probing.md.
+ */
+function appendEnvStagingChecks(
   plan: ConvoyPlan,
   opts: ApplyOpts,
   report: PreflightReport,
 ): void {
-  let dataLayer: string[] = [];
-  try {
-    const scan = scanRepository(
-      plan.target.localPath,
-      plan.target.workspace ? { workspace: plan.target.workspace } : {},
-    );
-    dataLayer = scan.dataLayer;
-  } catch {
-    // Scan errored (repo moved, workspace missing, etc.). The existing
-    // preflight's other checks will surface the real problem. Skip data-
-    // layer check silently rather than emit a misleading warning.
+  const { keys: expected, sources } = computeExpectedKeys(plan);
+  if (expected.size === 0) return;
+
+  const { staged, secretsPath } = computeStagedKeys(plan, opts);
+
+  const missing = [...expected].filter((k) => !staged.has(k));
+  const have = expected.size - missing.length;
+  const sourcesStr = sources.length > 0 ? ` (sources: ${sources.join(', ')})` : '';
+
+  if (missing.length === 0) {
+    report.checks.push({
+      name: 'env staging',
+      ok: true,
+      detail: `${have}/${expected.size} expected vars staged or declared already-set${sourcesStr}`,
+    });
     return;
   }
 
-  if (dataLayer.length === 0) return;
-
-  const secretsPath =
-    opts.flySecretsFile ?? `${plan.target.localPath}/.env.convoy-secrets`;
-  const fileSecrets = existsSync(secretsPath) ? parseEnvFile(secretsPath) : {};
-  const cliSecrets = opts.env ?? {};
-  const combined: Record<string, string> = { ...fileSecrets, ...cliSecrets };
-
-  // Dedupe expectations so `[postgres, postgis]` doesn't fire the same
-  // warning twice — PostGIS is just a Postgres extension.
-  const alreadyReported = new Set<string>();
-  for (const ds of dataLayer) {
-    const spec = DATA_LAYER_EXPECTATIONS.find((e) => e.match.test(ds));
-    if (!spec || alreadyReported.has(spec.label)) continue;
-    alreadyReported.add(spec.label);
-
-    const match = spec.envVars.find((v) => combined[v] && combined[v]!.length > 0);
-    if (match) {
-      report.checks.push({
-        name: `${spec.label} wiring`,
-        ok: true,
-        detail: `${match} staged from ${existsSync(secretsPath) && fileSecrets[match] ? secretsPath : '--env'}`,
-      });
-      continue;
+  // Decorate the remedy with data-layer-specific advice when the missing
+  // keys happen to map to a known database wiring (postgres/redis/etc.).
+  const dataHints: string[] = [];
+  const seen = new Set<string>();
+  for (const key of missing) {
+    const dl = DATA_LAYER_EXPECTATIONS.find((e) => e.envVars.includes(key));
+    if (dl && !seen.has(dl.label) && plan.platform.chosen === 'fly' && dl.flyRemedy) {
+      seen.add(dl.label);
+      dataHints.push(`${dl.label} (${key}): ${dl.flyRemedy}`);
     }
-
-    const remedy =
-      plan.platform.chosen === 'fly' && spec.flyRemedy
-        ? spec.flyRemedy
-        : `stage a connection string: echo ${spec.envVars[0]}=... >> ${secretsPath}`;
-
-    report.checks.push({
-      name: `${spec.label} wiring`,
-      ok: false,
-      detail: `your app reads ${spec.label} (detected via scan: ${ds}) but no ${spec.envVars.join(' / ')} found`,
-      remedy,
-    });
   }
+
+  const interactiveHint = `convoy stage-secrets ${plan.id.slice(0, 8)}`;
+  const selfDeclareHint = `--already-set=${missing.join(',')}`;
+  const fileHint = `append to ${secretsPath}`;
+  const remedyParts = [
+    `${pc.bold(interactiveHint)} (interactive)`,
+    fileHint,
+    `or self-declare already set: ${selfDeclareHint}`,
+  ];
+  const remedy =
+    dataHints.length > 0
+      ? `${dataHints.join(' · ')} · OR ${remedyParts.join(' · ')}`
+      : remedyParts.join(' · ');
+
+  report.checks.push({
+    name: 'env staging',
+    ok: false,
+    detail: `${have}/${expected.size} vars staged${sourcesStr} — missing: ${missing.join(', ')}`,
+    remedy,
+  });
 }
 
 async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<PreflightReport> {
@@ -742,14 +859,14 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
     });
   }
 
-  // --- data layer provisioning ---
-  // If the repo scan shows a Postgres/Redis/MySQL/Mongo dependency but the
-  // operator hasn't staged a connection string for the deploy, they'll ship
-  // an app that boots without its database. Warn loudly — this is the kind
-  // of footgun that eats production at 2am.
-  // realFly in this codebase gates any real platform deploy (fly or vercel).
+  // --- env staging (generalized) ---
+  // Reconciles expected vars (from .env.schema + target .env.example) against
+  // staged (local secrets file + --env + operator's self-declared
+  // --already-set). No platform probing — operator is the source of truth
+  // for what's already on the target. realFly in this codebase gates any
+  // real platform deploy (fly or vercel).
   if (report.realFly && !opts.demo) {
-    appendDataLayerChecks(plan, opts, report);
+    appendEnvStagingChecks(plan, opts, report);
   }
 
   // --- real author ---
@@ -963,13 +1080,52 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     process.exit(2);
   }
 
+  // --platform override at apply time — re-scores the plan against the
+  // live scan. Validated here so a bad platform name fails fast before
+  // preflight burns network + API calls.
+  let platformOverride: Platform | undefined;
+  if (opts.platform !== undefined) {
+    if (!isPlatform(opts.platform)) {
+      console.error(
+        pc.red(`Unknown platform "${opts.platform}". Supported: ${SUPPORTED_PLATFORMS.join(', ')}`),
+      );
+      process.exit(2);
+    }
+    platformOverride = opts.platform;
+    if (platformOverride !== plan.platform.chosen) {
+      process.stdout.write(
+        `${pc.yellow('!')} ${pc.dim(`overriding plan's platform`)} ${pc.bold(plan.platform.chosen)} ${pc.dim('→')} ${pc.bold(platformOverride)} ${pc.dim('(re-scored at apply time)')}\n`,
+      );
+      plan.platform = {
+        ...plan.platform,
+        chosen: platformOverride,
+        source: 'override',
+        reason: `operator overrode at apply time via --platform=${platformOverride}`,
+      };
+    }
+  }
+
+  // --recurring is the operator's self-declaration that this target is
+  // already live. No platform probing; just carries the claim into the
+  // plan + preflight so messaging can adapt.
+  const recurring = opts.recurring === true || plan.target.mode === 'recurring';
+  if (recurring) {
+    plan.target = { ...plan.target, mode: 'recurring' };
+  }
+
+  const modeLabel = recurring ? pc.yellow('update') : pc.cyan('first-deploy');
   process.stdout.write(
-    `${pc.dim('Applying plan')} ${pc.bold(plan.id.slice(0, 8))} ${pc.dim('—')} ${plan.target.name} ${pc.dim('→')} ${pc.cyan(plan.platform.chosen)}\n`,
+    `${pc.dim('Applying plan')} ${pc.bold(plan.id.slice(0, 8))} ${pc.dim('—')} ${plan.target.name} ${pc.dim('→')} ${pc.cyan(plan.platform.chosen)} ${pc.dim('·')} ${modeLabel}\n`,
   );
   if (plan.target.readmeTitle) {
     process.stdout.write(`${pc.dim(`  "${plan.target.readmeTitle}"`)}\n`);
   }
   process.stdout.write(`${pc.dim(`  ${plan.author.convoyAuthoredFiles.length} file(s) to author · rehearse before production`)}\n`);
+  if (recurring) {
+    process.stdout.write(
+      `  ${pc.dim('Recurring mode — the app is already live. Convoy will respect existing config and only stage what you declare below.')}\n`,
+    );
+  }
 
   const store = new RunStateStore(STATE_PATH);
   const bus = new ConvoyBus();
@@ -995,6 +1151,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     autoApprove: opts.autoApprove === true,
     planId: plan.id,
     plan,
+    ...(platformOverride !== undefined && { platformOverride }),
   };
 
   if (opts.injectFailure === 'rehearse' || opts.injectFailure === 'canary') {
@@ -1242,6 +1399,144 @@ function attachPlanReference(store: RunStateStore, runId: string, planId: string
   store.appendEvent(runId, 'scan', 'log', { plan_id: planId, note: 'applied from saved plan' });
 }
 
+/**
+ * Interactive walkthrough for staging a plan's expected env vars. Computes
+ * expected keys from .env.schema + .env.example, subtracts what's already
+ * staged (secrets file + already-set file), and prompts the operator for
+ * each remaining var.
+ *
+ * Per var: value / '!' for already-set / empty for skip. Values are appended
+ * to .env.convoy-secrets. Already-set declarations go to
+ * .env.convoy-already-set so subsequent `convoy apply` runs pick them up
+ * without needing --already-set.
+ *
+ * No platform queries. The operator is the source of truth for what's on
+ * the platform.
+ */
+async function runStageSecrets(planId: string): Promise<void> {
+  const plans = new PlanStore(PLANS_DIR);
+  const plan = resolvePlan(plans, planId);
+  if (!plan) {
+    console.error(pc.red(`Plan not found: ${planId}`));
+    console.error(pc.dim(`Looked in ${PLANS_DIR}. Run \`convoy plans\` to list saved plans.`));
+    process.exit(2);
+  }
+
+  const { keys: expected, sources } = computeExpectedKeys(plan);
+  if (expected.size === 0) {
+    process.stdout.write(
+      `${pc.dim('No expected env vars — this plan has neither .env.schema nor a discoverable .env.example.')}\n`,
+    );
+    return;
+  }
+
+  // For stage-secrets we care about what's NOT yet declared anywhere local.
+  // Use computeStagedKeys without the --already-set CLI flag (we're deciding
+  // that here interactively) and without --env (also a runtime flag).
+  const emptyOpts: ApplyOpts = {
+    realAuthor: false,
+    realRehearsal: false,
+    realFly: false,
+    autoMerge: false,
+  };
+  const { staged, secretsPath, alreadySetFilePath, fromFile, alreadySet } =
+    computeStagedKeys(plan, emptyOpts);
+
+  const missing = [...expected].filter((k) => !staged.has(k));
+
+  process.stdout.write(
+    `${pc.bold(plan.target.name)} ${pc.dim('·')} ${pc.cyan(plan.platform.chosen)}\n`,
+  );
+  process.stdout.write(
+    `${pc.dim(`Expected vars: ${expected.size}`)}${sources.length > 0 ? pc.dim(` (sources: ${sources.join(', ')})`) : ''}\n`,
+  );
+  process.stdout.write(
+    `${pc.dim(`Already staged: ${fromFile.length} in ${secretsPath}, ${alreadySet.length} marked already-set`)}\n\n`,
+  );
+
+  if (missing.length === 0) {
+    process.stdout.write(`${pc.green('✓')} Nothing to do — all ${expected.size} expected vars are staged.\n`);
+    return;
+  }
+
+  process.stdout.write(
+    `${pc.yellow(`${missing.length} var${missing.length === 1 ? '' : 's'} need attention`)}${pc.dim(':')}\n`,
+  );
+  process.stdout.write(
+    `${pc.dim(`For each: enter a value, type '!' if already set on the platform, or press Enter to skip.`)}\n\n`,
+  );
+
+  if (!stdin.isTTY) {
+    process.stdout.write(
+      `${pc.red('stage-secrets requires an interactive terminal (stdin is not a TTY).')}\n`,
+    );
+    process.stdout.write(
+      `${pc.dim('Stage directly:')} ${pc.bold(`echo 'KEY=value' >> ${secretsPath}`)}\n`,
+    );
+    process.stdout.write(
+      `${pc.dim('Or declare already-set:')} ${pc.bold(`echo 'KEY=' >> ${alreadySetFilePath}`)}\n`,
+    );
+    process.exit(2);
+  }
+
+  const rl = readline.createInterface({ input: stdin, output: stdout });
+  const valuesToStage: Record<string, string> = {};
+  const toMarkAlreadySet: string[] = [];
+
+  try {
+    for (const key of missing) {
+      const answer = await rl.question(`  ${pc.cyan(key)} ${pc.dim('>')} `);
+      const trimmed = answer.trim();
+      if (trimmed === '!') {
+        toMarkAlreadySet.push(key);
+      } else if (trimmed.length > 0) {
+        valuesToStage[key] = trimmed;
+      }
+      // empty → skip silently
+    }
+  } finally {
+    rl.close();
+  }
+
+  process.stdout.write('\n');
+
+  if (Object.keys(valuesToStage).length > 0) {
+    const prior = existsSync(secretsPath) ? readFileSync(secretsPath, 'utf8') : '';
+    const separator = prior.length > 0 && !prior.endsWith('\n') ? '\n' : '';
+    const appended = Object.entries(valuesToStage)
+      .map(([k, v]) => `${k}=${v}`)
+      .join('\n');
+    appendFileSync(secretsPath, `${separator}${appended}\n`, 'utf8');
+    process.stdout.write(
+      `${pc.green('✓')} Wrote ${Object.keys(valuesToStage).length} value${Object.keys(valuesToStage).length === 1 ? '' : 's'} to ${secretsPath}\n`,
+    );
+  }
+
+  if (toMarkAlreadySet.length > 0) {
+    const prior = existsSync(alreadySetFilePath) ? readFileSync(alreadySetFilePath, 'utf8') : '';
+    const separator = prior.length > 0 && !prior.endsWith('\n') ? '\n' : '';
+    const appended = toMarkAlreadySet.map((k) => `${k}=`).join('\n');
+    appendFileSync(alreadySetFilePath, `${separator}${appended}\n`, 'utf8');
+    process.stdout.write(
+      `${pc.green('✓')} Marked ${toMarkAlreadySet.length} var${toMarkAlreadySet.length === 1 ? '' : 's'} as already-set on the platform: ${toMarkAlreadySet.join(', ')}\n`,
+    );
+    process.stdout.write(
+      `  ${pc.dim(`Recorded in ${alreadySetFilePath} — future apply runs will honor these without --already-set.`)}\n`,
+    );
+  }
+
+  const stillSkipped = missing.length - Object.keys(valuesToStage).length - toMarkAlreadySet.length;
+  if (stillSkipped > 0) {
+    process.stdout.write(
+      `${pc.yellow(`! ${stillSkipped} var${stillSkipped === 1 ? '' : 's'} skipped`)} ${pc.dim(`— preflight will still warn about them.`)}\n`,
+    );
+  }
+
+  process.stdout.write(
+    `\n${pc.dim('Next:')} ${pc.bold(`npm run convoy -- apply ${plan.id.slice(0, 8)}`)}\n`,
+  );
+}
+
 function runListPlans(): void {
   const plans = new PlanStore(PLANS_DIR);
   const ids = plans.listRecent(20);
@@ -1348,6 +1643,12 @@ program
   .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
   .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
   .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
+  .option(
+    '--already-set <keys>',
+    'comma-separated env var names the operator declares are already set on the deploy target (no platform queries). Example: --already-set=DATABASE_URL,CLERK_SECRET_KEY',
+    (value: string) => value.split(',').map((k) => k.trim()).filter((k) => k.length > 0),
+  )
+  .option('--recurring', 'declare this as an update to an already-live service (adjusts preflight tone; no platform probing)')
   .option('--no-ai', 'skip the Opus narrative pass')
   .option('--demo', 'scripted pipeline — no PR, no subprocess, no Fly deploy')
   .option('--no-real-author', 'stub the author stage instead of opening a real PR')
@@ -1406,6 +1707,13 @@ program
   .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
   .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
   .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
+  .option(
+    '--already-set <keys>',
+    'comma-separated env var names the operator declares are already set on the deploy target (no platform queries). Example: --already-set=DATABASE_URL,CLERK_SECRET_KEY',
+    (value: string) => value.split(',').map((k) => k.trim()).filter((k) => k.length > 0),
+  )
+  .option('--recurring', 'declare this as an update to an already-live service (adjusts preflight tone; no platform probing)')
+  .option('--platform <platform>', 'override the plan\'s chosen platform: fly | railway | vercel | cloudrun — re-scored at apply time')
   .option('--demo', 'scripted pipeline (no PR, no subprocess, no Fly deploy)')
   .option('--no-real-author', 'stub the author stage instead of opening a real PR')
   .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
@@ -1443,6 +1751,15 @@ program
   .description('List recent saved plans.')
   .action(() => {
     runListPlans();
+  });
+
+program
+  .command('stage-secrets <planId>')
+  .description(
+    "Interactive walkthrough for staging the deploy's env vars. For each expected var, enter a value, type '!' if it's already set on the platform, or press Enter to skip. Writes to .env.convoy-secrets and .env.convoy-already-set locally — no platform queries.",
+  )
+  .action(async (planId: string) => {
+    await runStageSecrets(planId);
   });
 
 program

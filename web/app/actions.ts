@@ -1,9 +1,19 @@
 'use server';
 
+import { spawn } from 'node:child_process';
+import { resolve } from 'node:path';
+
 import Anthropic from '@anthropic-ai/sdk';
 import { revalidatePath } from 'next/cache';
 
 import { appendChatTurn, listChatTurns } from '@/lib/medic-chat';
+import {
+  appendAlreadySet,
+  appendSecret,
+  unstageKey,
+  writeRecurringPref,
+} from '@/lib/plan-env';
+import { getPlan } from '@/lib/plans';
 import { decideApproval as decide, listEvents } from '@/lib/runs';
 
 const MEDIC_MODEL = 'claude-opus-4-7';
@@ -180,4 +190,155 @@ ${toolCallSummary || '(none recorded)'}`;
 
   revalidatePath(`/runs/${runId}`);
   return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// Config-confirmation panel actions (plan page).
+//
+// All actions are filesystem-local. Nothing here queries the deploy target.
+// The operator is the source of truth for what's set on the platform; we
+// record declarations and stage values locally so `convoy apply` can honor
+// them. See memory/feedback_no_autonomous_probing.md.
+// ---------------------------------------------------------------------------
+
+const VALID_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SUPPORTED_PLATFORMS_LIST = ['fly', 'railway', 'vercel', 'cloudrun'];
+
+/**
+ * Stage a KEY=value pair into the plan's .env.convoy-secrets file. If the
+ * key was previously marked already-set, this supersedes that declaration.
+ */
+export async function stageEnvVar(
+  planId: string,
+  key: string,
+  value: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId' };
+  if (!key || !VALID_ENV_KEY.test(key)) return { ok: false, reason: 'invalid env key' };
+  if (typeof value !== 'string' || value.length === 0) {
+    return { ok: false, reason: 'value cannot be empty' };
+  }
+  if (value.length > 8192) return { ok: false, reason: 'value too long (max 8192 chars)' };
+  if (value.includes('\n')) return { ok: false, reason: 'value cannot contain newlines' };
+
+  const plan = getPlan(planId);
+  if (!plan) return { ok: false, reason: 'plan not found' };
+
+  unstageKey(plan, key);
+  appendSecret(plan, key, value);
+  revalidatePath(`/plans/${planId}`);
+  return { ok: true };
+}
+
+/**
+ * Declare a key is already set on the platform. Convoy does not query the
+ * platform to verify — the operator is vouching. Written to
+ * .env.convoy-already-set which the CLI reads on apply (no flag needed).
+ */
+export async function markEnvVarAlreadySet(
+  planId: string,
+  key: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId' };
+  if (!key || !VALID_ENV_KEY.test(key)) return { ok: false, reason: 'invalid env key' };
+
+  const plan = getPlan(planId);
+  if (!plan) return { ok: false, reason: 'plan not found' };
+
+  unstageKey(plan, key);
+  appendAlreadySet(plan, key);
+  revalidatePath(`/plans/${planId}`);
+  return { ok: true };
+}
+
+export async function unstageEnvVar(
+  planId: string,
+  key: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId' };
+  if (!key || !VALID_ENV_KEY.test(key)) return { ok: false, reason: 'invalid env key' };
+
+  const plan = getPlan(planId);
+  if (!plan) return { ok: false, reason: 'plan not found' };
+
+  unstageKey(plan, key);
+  revalidatePath(`/plans/${planId}`);
+  return { ok: true };
+}
+
+export async function setRecurring(
+  planId: string,
+  recurring: boolean,
+): Promise<{ ok: boolean; reason?: string }> {
+  if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId' };
+  const plan = getPlan(planId);
+  if (!plan) return { ok: false, reason: 'plan not found' };
+  writeRecurringPref(plan, recurring === true);
+  revalidatePath(`/plans/${planId}`);
+  return { ok: true };
+}
+
+/**
+ * Re-plan the same target with a different platform, saving a new plan and
+ * returning its id so the client can redirect.
+ *
+ * Shells out to the CLI rather than importing buildPlan across the
+ * web/core boundary. Keeps web isolated from planner internals.
+ */
+export async function changePlanPlatform(
+  planId: string,
+  platform: string,
+): Promise<{ ok: boolean; newPlanId?: string; reason?: string }> {
+  if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId' };
+  if (!SUPPORTED_PLATFORMS_LIST.includes(platform)) {
+    return { ok: false, reason: `platform must be one of ${SUPPORTED_PLATFORMS_LIST.join(', ')}` };
+  }
+  const plan = getPlan(planId);
+  if (!plan) return { ok: false, reason: 'plan not found' };
+
+  const convoyHome = resolve(process.cwd(), '..');
+  const args = [
+    'run',
+    'convoy',
+    '--',
+    'plan',
+    plan.target.localPath,
+    '--save',
+    '--no-ai',
+    `--platform=${platform}`,
+  ];
+  if (plan.target.repoUrl) {
+    args.push(`--repo-url=${plan.target.repoUrl}`);
+  }
+
+  let stdout = '';
+  let stderr = '';
+  const exitCode = await new Promise<number>((resolveExit) => {
+    const proc = spawn('npm', args, {
+      cwd: convoyHome,
+      env: { ...process.env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    proc.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf8');
+    });
+    proc.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+    });
+    proc.on('close', (code) => resolveExit(code ?? 1));
+    proc.on('error', () => resolveExit(1));
+  });
+
+  if (exitCode !== 0) {
+    const last = (stderr || stdout).split('\n').slice(-6).join(' ').slice(0, 300);
+    return { ok: false, reason: `plan command exited ${exitCode}: ${last}` };
+  }
+
+  const match = stdout.match(/plans\/([0-9a-f-]{36})\.json/);
+  if (!match || !match[1]) {
+    return { ok: false, reason: 'plan saved but could not parse new plan id from CLI output' };
+  }
+
+  revalidatePath('/');
+  return { ok: true, newPlanId: match[1] };
 }

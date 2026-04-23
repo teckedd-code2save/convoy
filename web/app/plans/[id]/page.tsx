@@ -1,7 +1,16 @@
 import { notFound } from 'next/navigation';
 
+import {
+  computeExpectedKeys,
+  computeStagedState,
+  readRecurringPref,
+} from '@/lib/plan-env';
 import { getPlan, type PlanAuthoredFile, type PlanSummary } from '@/lib/plans';
 import { listRunsForPlan, type RunRow } from '@/lib/runs';
+
+import { ConfigPanel, type PanelRow } from './config-panel';
+
+const SUPPORTED_PLATFORMS = ['fly', 'railway', 'vercel', 'cloudrun'];
 
 export const dynamic = 'force-dynamic';
 
@@ -41,6 +50,7 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
       {notDeployable ? null : (
         <>
           <AuthorSection files={plan.author.convoyAuthoredFiles} />
+          <ConfigPanelSection plan={plan} />
           <ShipSection plan={plan} />
           <PlatformSection plan={plan} />
         </>
@@ -374,5 +384,40 @@ function Tag({ children }: { children: React.ReactNode }) {
     <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-rule text-muted font-medium">
       {children}
     </span>
+  );
+}
+
+/**
+ * Server component that loads expected + staged env state for a plan, then
+ * renders the client-side ConfigPanel. Every action the panel dispatches
+ * is filesystem-local — no platform probing. The operator self-declares
+ * what's already on the deploy target.
+ */
+function ConfigPanelSection({ plan }: { plan: PlanSummary }) {
+  const expected = computeExpectedKeys(plan);
+  const { stagedLocally, markedAlreadySet, secretsPath, alreadySetPath } =
+    computeStagedState(plan);
+  const recurring = readRecurringPref(plan);
+
+  const rows: PanelRow[] = expected.map((e) => ({
+    key: e.key,
+    source: e.source,
+    state: stagedLocally.has(e.key)
+      ? ('staged' as const)
+      : markedAlreadySet.has(e.key)
+        ? ('already-set' as const)
+        : ('missing' as const),
+  }));
+
+  return (
+    <ConfigPanel
+      planId={plan.id}
+      platform={plan.platform.chosen}
+      rows={rows}
+      recurring={recurring}
+      alternatives={SUPPORTED_PLATFORMS}
+      secretsPath={secretsPath}
+      alreadySetPath={alreadySetPath}
+    />
   );
 }
