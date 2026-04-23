@@ -1,9 +1,11 @@
 import { notFound } from 'next/navigation';
 
+import { listChatTurns, type MedicChatTurn } from '@/lib/medic-chat';
 import { getRun, listEvents, listApprovals, type EventRow, type ApprovalRow, type RunRow } from '@/lib/runs';
 
 import { AutoRefresher } from './refresher';
 import { ApprovalActions } from './approval-form';
+import { MedicChat } from './medic-chat';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,6 +18,7 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
 
   const events = listEvents(run.id);
   const approvals = listApprovals(run.id);
+  const chatTurns = listChatTurns(run.id);
   const pendingApprovals = approvals.filter((a) => a.status === 'pending');
   const isLive = run.status === 'running' || run.status === 'awaiting_approval';
 
@@ -81,7 +84,7 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
         </section>
       ) : null}
 
-      <DiagnosisSection events={events} />
+      <DiagnosisSection events={events} runId={run.id} chatTurns={chatTurns} />
 
       <MedicInvestigationSection events={events} />
 
@@ -129,9 +132,21 @@ interface MedicDiagnosis {
   source: 'ai' | 'skipped-no-key' | 'error';
 }
 
-function DiagnosisSection({ events }: { events: EventRow[] }) {
+function DiagnosisSection({
+  events,
+  runId,
+  chatTurns,
+}: {
+  events: EventRow[];
+  runId: string;
+  chatTurns: MedicChatTurn[];
+}) {
   const diagnoses = events.filter((e) => e.kind === 'diagnosis');
   if (diagnoses.length === 0) return null;
+  // Only the latest diagnosis hosts the chat — follow-up questions are
+  // scoped per-run, so showing chat on every historical diagnosis would
+  // duplicate turns.
+  const latestId = diagnoses[diagnoses.length - 1]?.id;
   return (
     <section className="space-y-3">
       <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">
@@ -139,14 +154,30 @@ function DiagnosisSection({ events }: { events: EventRow[] }) {
       </h2>
       <div className="space-y-4">
         {diagnoses.map((e) => (
-          <DiagnosisCard key={e.id} diagnosis={e.payload as MedicDiagnosis} createdAt={e.createdAt} />
+          <DiagnosisCard
+            key={e.id}
+            diagnosis={e.payload as MedicDiagnosis}
+            createdAt={e.createdAt}
+            runId={e.id === latestId ? runId : null}
+            chatTurns={e.id === latestId ? chatTurns : []}
+          />
         ))}
       </div>
     </section>
   );
 }
 
-function DiagnosisCard({ diagnosis, createdAt }: { diagnosis: MedicDiagnosis; createdAt: string }) {
+function DiagnosisCard({
+  diagnosis,
+  createdAt,
+  runId,
+  chatTurns,
+}: {
+  diagnosis: MedicDiagnosis;
+  createdAt: string;
+  runId: string | null;
+  chatTurns: MedicChatTurn[];
+}) {
   const classColors: Record<string, string> = {
     code: 'border-warn/50 bg-warn/5',
     config: 'border-accent/50 bg-accent/5',
@@ -159,75 +190,118 @@ function DiagnosisCard({ diagnosis, createdAt }: { diagnosis: MedicDiagnosis; cr
     infrastructure: 'bg-accent/10 text-accent',
     unknown: 'bg-rule text-muted',
   };
+  const confBadge: Record<string, string> = {
+    high: 'bg-success/10 text-success',
+    medium: 'bg-rule text-muted',
+    low: 'bg-warn/10 text-warn',
+  };
+  const location = diagnosis.location
+    ? `${diagnosis.location.file}${diagnosis.location.line ? `:${diagnosis.location.line}` : ''}`
+    : null;
+
   return (
-    <div className={`border rounded-lg p-5 space-y-4 ${classColors[diagnosis.classification] ?? classColors.unknown}`}>
-      <div className="flex items-start gap-3 flex-wrap">
-        <div className="flex items-center gap-2 shrink-0">
-          <span className="inline-block w-2 h-2 rounded-full bg-warn animate-pulse" />
-          <span className="text-xs font-semibold uppercase tracking-wider text-warn">Medic</span>
-        </div>
-        <span className={`text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded ${classBadge[diagnosis.classification] ?? classBadge.unknown}`}>
-          {diagnosis.classification}
-        </span>
-        <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-rule text-muted">
-          confidence: {diagnosis.confidence}
-        </span>
-        {diagnosis.source === 'ai' ? (
-          <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-accent/10 text-accent">
-            opus
+    <div className={`border rounded-lg ${classColors[diagnosis.classification] ?? classColors.unknown}`}>
+      {/* Headline — always open. One-line verdict the operator scans first. */}
+      <div className="p-5 space-y-2">
+        <div className="flex items-start gap-3 flex-wrap">
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="inline-block w-2 h-2 rounded-full bg-warn" />
+            <span className="text-xs font-semibold uppercase tracking-wider text-warn">Medic</span>
+          </div>
+          <span className={`text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded ${classBadge[diagnosis.classification] ?? classBadge.unknown}`}>
+            {diagnosis.classification}
           </span>
-        ) : null}
-        <span className="text-xs text-muted ml-auto">{new Date(createdAt).toLocaleTimeString()}</span>
-      </div>
-
-      <div className="space-y-2">
-        <h3 className="text-sm font-semibold uppercase tracking-wider text-muted">Root cause</h3>
-        <p className="leading-relaxed">{diagnosis.rootCause}</p>
-      </div>
-
-      {diagnosis.location ? (
-        <div className="font-mono text-sm bg-card border border-rule rounded-md px-3 py-2">
-          {diagnosis.location.file}
-          {diagnosis.location.line ? `:${diagnosis.location.line}` : ''}
-        </div>
-      ) : null}
-
-      <div className="space-y-2">
-        <h3 className="text-sm font-semibold uppercase tracking-wider text-muted">What I see</h3>
-        <p className="leading-relaxed text-sm">{diagnosis.narrative}</p>
-      </div>
-
-      {diagnosis.reproduction ? (
-        <div className="space-y-2">
-          <h3 className="text-sm font-semibold uppercase tracking-wider text-muted">Reproduction</h3>
-          <pre className="text-xs font-mono bg-ink text-paper rounded-md p-3 overflow-auto">{diagnosis.reproduction}</pre>
-        </div>
-      ) : null}
-
-      {diagnosis.suggestedFix ? (
-        <div className="space-y-2">
-          <h3 className="text-sm font-semibold uppercase tracking-wider text-muted">
-            Suggested fix{' '}
-            <span className={`ml-2 text-[10px] font-medium px-1.5 py-0.5 rounded ${diagnosis.suggestedFix.owned === 'developer' ? 'bg-warn/10 text-warn' : 'bg-accent/10 text-accent'}`}>
+          <span className={`text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded ${confBadge[diagnosis.confidence] ?? confBadge.medium}`}>
+            {diagnosis.confidence} confidence
+          </span>
+          {diagnosis.suggestedFix ? (
+            <span className={`text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded ${diagnosis.suggestedFix.owned === 'developer' ? 'bg-warn/10 text-warn' : 'bg-accent/10 text-accent'}`}>
               {diagnosis.suggestedFix.owned}-owned
             </span>
-          </h3>
-          <p className="leading-relaxed text-sm">{diagnosis.suggestedFix.description}</p>
-          <div className="text-xs font-mono text-muted">{diagnosis.suggestedFix.file}</div>
-          {diagnosis.suggestedFix.patch ? (
-            <pre className="text-xs font-mono bg-ink text-paper rounded-md p-3 overflow-auto max-h-80">
-              {diagnosis.suggestedFix.patch}
-            </pre>
           ) : null}
+          {diagnosis.source === 'ai' ? (
+            <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-accent/10 text-accent">
+              opus
+            </span>
+          ) : null}
+          <span className="text-xs text-muted ml-auto">{new Date(createdAt).toLocaleTimeString()}</span>
         </div>
-      ) : null}
 
-      {diagnosis.classification === 'code' ? (
-        <div className="text-xs text-muted bg-rule/50 rounded-md px-3 py-2 leading-relaxed">
-          Convoy will not modify your code. Push a fix and the pipeline resumes from the last clean stage.
+        <p className="text-base leading-relaxed">{diagnosis.rootCause}</p>
+
+        {location ? (
+          <div className="font-mono text-sm inline-block bg-card border border-rule rounded-md px-2.5 py-1">
+            {location}
+          </div>
+        ) : null}
+      </div>
+
+      {/* Progressive disclosure — each section expands on click. */}
+      <div className="border-t border-rule/60 divide-y divide-rule/60">
+        <DisclosureSection label="What I see" defaultOpen={false}>
+          <p className="leading-relaxed text-sm whitespace-pre-wrap">{diagnosis.narrative}</p>
+        </DisclosureSection>
+
+        {diagnosis.suggestedFix ? (
+          <DisclosureSection
+            label={`Suggested fix — ${diagnosis.suggestedFix.file}`}
+            defaultOpen={false}
+          >
+            <p className="leading-relaxed text-sm whitespace-pre-wrap">
+              {diagnosis.suggestedFix.description}
+            </p>
+            {diagnosis.suggestedFix.patch ? (
+              <pre className="mt-3 text-xs font-mono bg-ink text-paper rounded-md p-3 overflow-auto max-h-80 whitespace-pre-wrap break-words">
+                {diagnosis.suggestedFix.patch}
+              </pre>
+            ) : null}
+          </DisclosureSection>
+        ) : null}
+
+        {diagnosis.reproduction ? (
+          <DisclosureSection label="Reproduction" defaultOpen={false}>
+            <pre className="text-xs font-mono bg-ink text-paper rounded-md p-3 overflow-auto whitespace-pre-wrap break-words">
+              {diagnosis.reproduction}
+            </pre>
+          </DisclosureSection>
+        ) : null}
+
+        {diagnosis.classification === 'code' ? (
+          <div className="px-5 py-3 text-xs text-muted leading-relaxed bg-rule/30">
+            Convoy will not modify your code. Push a fix and the pipeline resumes from the last clean stage.
+          </div>
+        ) : null}
+      </div>
+
+      {runId ? (
+        <div className="px-5 pb-5 pt-2">
+          <MedicChat runId={runId} turns={chatTurns} />
         </div>
       ) : null}
     </div>
+  );
+}
+
+function DisclosureSection({
+  label,
+  children,
+  defaultOpen = false,
+}: {
+  label: string;
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+}) {
+  return (
+    <details className="group" open={defaultOpen}>
+      <summary className="cursor-pointer select-none list-none px-5 py-3 flex items-center gap-3 hover:bg-rule/30 transition">
+        <span className="text-xs font-semibold uppercase tracking-wider text-muted flex-1">
+          {label}
+        </span>
+        <span className="text-xs text-muted/70 group-open:hidden">show ▾</span>
+        <span className="text-xs text-muted/70 hidden group-open:inline">hide ▴</span>
+      </summary>
+      <div className="px-5 pb-4 pt-1">{children}</div>
+    </details>
   );
 }
 
