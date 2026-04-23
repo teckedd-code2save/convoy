@@ -10,6 +10,8 @@ import { appendChatTurn, listChatTurns } from '@/lib/medic-chat';
 import {
   appendAlreadySet,
   appendSecret,
+  computeExpectedKeys,
+  parseEnvText,
   unstageKey,
   writeRecurringPref,
 } from '@/lib/plan-env';
@@ -265,6 +267,126 @@ export async function unstageEnvVar(
   unstageKey(plan, key);
   revalidatePath(`/plans/${planId}`);
   return { ok: true };
+}
+
+/**
+ * Bulk-clear a set of keys from both the staged secrets file and the
+ * already-set file. Used by the panel's "clear selected" button and by
+ * "clear all staged" when the operator wants a reset.
+ *
+ * Keys that are invalid or not present are silently skipped — the caller
+ * might have a stale selection; we don't want a partial failure to be
+ * interpreted as "nothing happened."
+ */
+export async function bulkUnstage(
+  planId: string,
+  keys: string[],
+): Promise<{ ok: boolean; reason?: string; clearedCount?: number }> {
+  if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId' };
+  if (!Array.isArray(keys)) return { ok: false, reason: 'keys must be an array' };
+  const plan = getPlan(planId);
+  if (!plan) return { ok: false, reason: 'plan not found' };
+
+  let cleared = 0;
+  for (const key of keys) {
+    if (!key || !VALID_ENV_KEY.test(key)) continue;
+    unstageKey(plan, key);
+    cleared += 1;
+  }
+  revalidatePath(`/plans/${planId}`);
+  return { ok: true, clearedCount: cleared };
+}
+
+export async function bulkMarkAlreadySet(
+  planId: string,
+  keys: string[],
+): Promise<{ ok: boolean; reason?: string; markedCount?: number }> {
+  if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId' };
+  if (!Array.isArray(keys)) return { ok: false, reason: 'keys must be an array' };
+  const plan = getPlan(planId);
+  if (!plan) return { ok: false, reason: 'plan not found' };
+
+  let marked = 0;
+  for (const key of keys) {
+    if (!key || !VALID_ENV_KEY.test(key)) continue;
+    unstageKey(plan, key);
+    appendAlreadySet(plan, key);
+    marked += 1;
+  }
+  revalidatePath(`/plans/${planId}`);
+  return { ok: true, markedCount: marked };
+}
+
+/**
+ * Parse an operator-supplied .env document and stage its values. Two modes:
+ *
+ *   mode='matching' (default): only import keys that appear in the plan's
+ *     expected set (.env.schema + .env.example). Safer — doesn't quietly
+ *     stage vars the plan doesn't know about.
+ *
+ *   mode='all': import everything parseable. Useful when the operator
+ *     knows they have extra runtime vars the plan didn't declare.
+ *
+ * Returns per-category counts + the list of unknown (unparsed-as-matching)
+ * keys so the UI can show "staged N, skipped M (not in expected set): KEY1,
+ * KEY2…". Existing staged values for matched keys are replaced (unstageKey
+ * first) so re-importing is idempotent rather than appending duplicates.
+ *
+ * Value size limits: 8192 chars max per value, no newlines.
+ */
+export async function importEnvVars(
+  planId: string,
+  envText: string,
+  mode: 'matching' | 'all' = 'matching',
+): Promise<{
+  ok: boolean;
+  reason?: string;
+  stagedCount?: number;
+  skippedCount?: number;
+  unknownKeys?: string[];
+  invalidKeys?: string[];
+}> {
+  if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId' };
+  if (typeof envText !== 'string') return { ok: false, reason: 'invalid envText' };
+  if (envText.length > 500_000) return { ok: false, reason: 'envText too large (max 500KB)' };
+  if (mode !== 'matching' && mode !== 'all') return { ok: false, reason: 'mode must be "matching" or "all"' };
+
+  const plan = getPlan(planId);
+  if (!plan) return { ok: false, reason: 'plan not found' };
+
+  const parsed = parseEnvText(envText);
+  const expectedKeys = new Set(computeExpectedKeys(plan).map((e) => e.key));
+
+  let staged = 0;
+  const skipped: string[] = [];
+  const invalid: string[] = [];
+
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!VALID_ENV_KEY.test(key)) {
+      invalid.push(key);
+      continue;
+    }
+    if (value.length > 8192 || value.includes('\n')) {
+      invalid.push(key);
+      continue;
+    }
+    if (mode === 'matching' && !expectedKeys.has(key)) {
+      skipped.push(key);
+      continue;
+    }
+    unstageKey(plan, key);
+    appendSecret(plan, key, value);
+    staged += 1;
+  }
+
+  revalidatePath(`/plans/${planId}`);
+  return {
+    ok: true,
+    stagedCount: staged,
+    skippedCount: skipped.length,
+    unknownKeys: skipped,
+    invalidKeys: invalid,
+  };
 }
 
 export async function setRecurring(

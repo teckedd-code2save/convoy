@@ -29,6 +29,44 @@ export function extractEnvKeys(content: string): string[] {
   return keys;
 }
 
+/**
+ * Parse a .env-style document into key/value pairs. Tolerates the usual
+ * conventions:
+ *
+ *   KEY=bare value
+ *   KEY="quoted value"     → stripped
+ *   KEY='single quotes'    → stripped
+ *   KEY=value = with = eq  → "value = with = eq" (split on first =)
+ *   export KEY=...         → "export " stripped
+ *   # comments and blank lines are ignored
+ *
+ * Blank values are dropped — a key with an empty value tells us nothing
+ * and would overwrite an existing staged value with "". If the operator
+ * really wants to blank a key, they can clear it explicitly.
+ */
+export function parseEnvText(content: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const raw of content.split(/\r?\n/)) {
+    const line = raw.trim().replace(/^export\s+/, '');
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    let value = line.slice(eq + 1).trim();
+    // Strip a single layer of surrounding quotes — double or single.
+    if (
+      (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
+      (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (value.length === 0) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
 export function computeExpectedKeys(plan: PlanSummary): ExpectedKey[] {
   const seen = new Map<string, ExpectedKey['source']>();
 
