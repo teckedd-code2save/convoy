@@ -176,14 +176,22 @@ export function listApprovals(runId: string): ApprovalRow[] {
   }
 }
 
-export function decideApproval(id: string, status: 'approved' | 'rejected'): ApprovalRow | null {
+// Bind every decision to a claimed runId so a caller who only has the approval
+// UUID cannot mutate an approval on an unrelated run. Previously the runId
+// param on the server action was decorative — forged requests could claim to
+// act on one run while mutating another. Flagged by pre-demo adversarial review.
+export function decideApproval(
+  runId: string,
+  id: string,
+  status: 'approved' | 'rejected',
+): ApprovalRow | null {
   const db = openDb();
   if (!db) return null;
   try {
     const now = new Date().toISOString();
     const result = db
-      .prepare('UPDATE approvals SET status = ?, decided_at = ? WHERE id = ? AND status = ?')
-      .run(status, now, id, 'pending');
+      .prepare('UPDATE approvals SET status = ?, decided_at = ? WHERE id = ? AND run_id = ? AND status = ?')
+      .run(status, now, id, runId, 'pending');
     if (result.changes === 0) return null;
     const row = db
       .prepare<[string], {

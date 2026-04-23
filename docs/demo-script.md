@@ -1,117 +1,175 @@
 # Convoy — Demo Script
 
-Target length: **2–3 minutes**. Three acts.
+Target length: **2:30–3:00 minutes**. Three acts. All real — no scripted stages.
 
 ## Setup (off-camera)
 
-- Terminal 1: zoomed, in `convoy/`. `.env` has `ANTHROPIC_API_KEY` set.
-- Terminal 2: in `convoy/demo-app/`. Idle.
-- Browser: `http://localhost:3737` — running from `convoy/web`.
-- State clean: `rm -rf .convoy/plans .convoy/cache` (keep `state.db` for history).
-
-Pre-seed a plan so Act 1 doesn't have to wait on Opus:
-
-```bash
-npm run convoy -- plan ../shipd --save                  # or any real repo
-npm run convoy -- plan ./demo-app --save
-```
-
----
-
-## Act 1 — "Here's the plan."  (45s)
-
-> **Voiceover:** "This is Convoy. It turns a pull request into a safe deployment. Before it does anything, it shows you the plan."
-
-1. In browser, go to `/plans`. Scroll the list of seeded plans for a beat.
-2. Click the **shipd** plan. Let the summary paragraph render.
-
-> "Convoy scanned this repo and summarized what it is — a Next.js app with Prisma and Postgres, going to Vercel."
-
-3. Scroll to "What Convoy will author".
-4. Expand the `vercel.json` file. Brief pause.
-
-> "It only writes what I don't want to write — platform manifest, env schema, provenance record. It doesn't touch my `src/`."
-
-5. Scroll to "How I'll ship this" section.
-
-> "Seven numbered steps, first person. This is Convoy talking, not documentation. It's going to rehearse on a Vercel preview, then canary to 5%, then promote in stages, and roll back in ten seconds if anything breaches."
-
-6. Scroll to "Why this platform".
-
-> "It scored four platforms. Vercel wins for Next.js. If I wanted Railway, I'd pass `--platform=railway`."
+- **Terminal 1**: in `~/convoy`. `.env` has `ANTHROPIC_API_KEY`.
+- **Terminal 2**: reserved for the follow-up deploy or Fly CLI check.
+- **Browser tab**: `http://localhost:3737` — web viewer running from `web/`.
+- **Prereqs verified**: `gh auth status`, `fly auth whoami`, `vercel whoami` all green.
+- **Clean slate** so the demo reads cleanly:
+  ```bash
+  rm -rf .convoy/plans .convoy/cache
+  # keep .convoy/state.db for history; optional wipe if cluttered
+  ```
+- **Pre-seed one plan** for Act 1 so the video doesn't wait on Opus:
+  ```bash
+  npm run convoy -- plan https://github.com/teckedd-code2save/shipd --save
+  ```
 
 ---
 
-## Act 2 — "Here's the approval loop."  (45s)
+## Act 1 — "Here's the plan." (45s)
 
-> **Voiceover:** "Convoy doesn't merge PRs or promote traffic on its own. I hold the approvals."
+> **Voiceover:** "This is Convoy. You point it at a repo and it ships it. Before anything touches your systems, it shows you the plan."
 
-1. In Terminal 1, kick off the pipeline:
+1. In browser: `/plans`. The seeded **shipd** plan is at the top.
+2. Click it. Let the summary paragraph render.
 
-```bash
-npm run convoy -- apply <demo-app-plan-id> --no-auto-approve
-```
+> "Convoy cloned the repo, scanned it — Next.js, Prisma, Postgres — and wrote this plan with Opus 4.7. Target: Vercel. Only deployment-surface files get written. `src/` is off-limits."
 
-2. Let it run to the first approval gate (about 3 seconds). Timeline lights up through scan → pick → author.
+3. Scroll to **What Convoy will author**.
+4. Expand `vercel.json`. Brief pause showing the JSON.
 
-3. Switch to browser, go to `/runs` — the new run is at the top with **awaiting approval** pulsing.
+> "Vercel manifest, env schema, provenance record. Three files, all mine. None of yours."
 
-4. Click into the run. Show the pipeline stages lit up, then the **Waiting on you** approval card for `merge_pr`.
+5. Scroll to **How I'll ship this** — the numbered first-person narrative.
 
-5. Click **Approve merge_pr**. The card disappears. Page auto-refreshes.
+> "Seven steps in first person. Convoy explaining its own plan: open a PR, pause for me to merge it, rehearse locally with real metrics, pause again, deploy to a preview, verify, promote to prod, watch for a minute, and — if anything drifts — roll back in ten seconds."
 
-> "I just wrote to the same SQLite state DB the pipeline's polling. It's continuing."
+6. Scroll to **Why this platform**. The four-card ranking with Vercel lit up.
 
-6. Let rehearse run. When promote appears, approve it too.
-
-7. Wait for succeeded. The live URL appears in the header.
-
-> "Total time, two minutes. Two approvals from the browser, no terminal ever touched past the initial command."
+> "It scored every platform. Vercel won for Next.js. Pass `--platform=fly` and it replans."
 
 ---
 
-## Act 3 — "Here's what happens when it breaks."  (60s)
+## Act 2 — "Here's the real thing." (75s)
 
-> **Voiceover:** "But real systems break. This is what Convoy does when they do."
+> **Voiceover:** "Let's watch it ship a real service. Same repo, no tricks."
 
-1. In Terminal 1, start a new apply with injected failure:
+1. Terminal 1:
 
 ```bash
-npm run convoy -- apply <demo-app-plan-id> --inject-failure=rehearse
+npm run convoy -- ship ./demo-app --no-auto-approve
 ```
 
-2. Let it run. Pipeline proceeds through scan → pick → author → rehearse.
+2. Output streams:
 
-3. The rehearse stage fires `synthetic_load.breach` — on-screen you see `p99_ms=494 error_rate_pct=6.67 threshold=1.0`.
+```
+clone.done ...
+Plan <id> saved (narrative: ai)
+Target: demo-app (node, express)
+Platform: fly (scored)
 
-4. Then `medic.invoked`. Opus is reasoning on the real logs.
+Preflight
+  ✓ real author        gh authed as teckedd-code2save — will open PR on teckedd-code2save/convoy
+  ✓ real rehearsal     will spawn `node dist/server.js` on port 8080
+  ✓ real fly           flyctl authed as createdliving1000@gmail.com — will deploy to Fly
+```
 
-5. Switch to the browser. Refresh the run page.
+> "Preflight. Everything Convoy's about to do, verified before a single byte moves."
 
-6. The **Medic's diagnosis** card is up top.
+3. Pipeline advances to `author` and opens a **real** pull request on the convoy repo.
 
-> "Convoy's medic read the real log stream, noticed every tenth request timed out with `orders_query_timeout`, and identified it as a code-level failure in `src/routes/orders.ts` at line 44. Classification: code. Confidence: medium. Owned by: developer."
+> "Real PR. Branch pushed. Convoy paused — it won't merge without me."
 
-7. Scroll the card. Point at the narrative, the location, the suggested fix description, and the reminder at the bottom:
-   *"Convoy will not modify your code. Push a fix and the pipeline resumes from the last clean stage."*
+4. Switch to browser → `/runs/<run-id>`. Pending `merge_pr` approval card.
+5. Click **Approve merge_pr**.
 
-> "This is the point. Convoy doesn't silently patch your code. It tells you what it found, where to look, and waits. Your change, your call."
+> "Two clicks. Convoy auto-merged via gh pr merge and moved on."
+
+6. Terminal 1 — `▸ rehearse` starts:
+
+```
+install.running cmd=npm ci
+build.running  cmd=tsc
+boot.ready     port=8080
+load.running   requests=60 concurrency=4
+load.done      error_rate_pct=0 p99=...
+```
+
+> "That's a real subprocess — real `npm ci`, real `tsc`, real HTTP against port 8080. If it broke, medic would be reading the stdout right now."
+
+7. `▸ canary` requests `promote`. Approve in the browser.
+
+8. Terminal 1:
+
+```
+fly.creating  app=convoy-demo-app-<hash>
+fly.deploying strategy=canary
+fly.deployed  hostname=convoy-demo-app-<hash>.fly.dev
+```
+
+> "Fly canary strategy — one machine at a time with health gates, then the rest. This just happened for real."
+
+9. Terminal 1 → `◆ Convoy succeeded in 4m 12s` with a live URL.
+
+10. Click the URL. Real `200 OK` in the browser.
+
+> "Live. From `convoy ship` to serving traffic, four minutes, two clicks."
+
+---
+
+## Act 3 — "Here's what happens when it breaks." (60s)
+
+> **Voiceover:** "Real systems break. This is the part that matters."
+
+1. Point at `docs/rollback-proof.md` on-screen (or narrate).
+
+> "Earlier I staged a bug — a fly secret that delayed `/health` by two seconds. Deployed it through Convoy. Here's what happened."
+
+2. Either re-run or replay from the proof doc / recorded terminal:
+
+```
+observe.probe  probe_count=1 p99_ms=2817
+observe.breach reason=p99 2817ms exceeded 1000ms
+rollback.starting
+rollback.done  restored_version=3
+```
+
+> "Observe measured p99 of 2.8 seconds against the live URL. Threshold was one second. Convoy tripped the rollback itself — `fly deploy --image` with the prior release. No human clicked anything. Service recovered in seconds."
+
+3. Browser → the rolled-back run page. Show:
+   - Amber `↺ Rolled back to v3` banner
+   - Breach reason inline
+   - Clickable live URL
+
+> "Restored version — recorded. Reason — first-class on the run. Live URL — you can click it and it's still healthy. That's the reverse path being real."
+
+4. Scroll the timeline, open any event row.
+
+> "Every step has its full JSON payload. Replay the whole run for the post-mortem."
 
 ---
 
 ## Close — "This is Convoy." (15s)
 
-1. Back to the `/plans` page for a beat.
+1. Back to `/plans` home for a beat.
 
-> "Convoy. We ship your code — we don't rewrite it. Rehearse, ship, observe. Built with Opus 4.7 for the Claude Code hackathon."
+> "Convoy. We ship your code — we don't rewrite it. Real PRs, real rehearsals, real deploys, real rollbacks. Agents assisting, humans deciding. Built with Opus 4.7 for the Claude Code hackathon."
 
-2. Cut to the GitHub repo card or the architecture diagram.
+2. Cut to the plugin line in a Claude Code session:
+
+```
+/convoy:ship https://github.com/your-org/your-repo
+```
+
+> "Or run it from inside Claude Code. Plugin loaded, slash command, same pipeline."
 
 ---
 
 ## Fail-safes during recording
 
-- If Opus is slow (~8s for enrichment): start plan generation before rolling.
-- If dev server gets confused: `pkill -f "next dev" && rm -rf web/.next && npm run dev`.
-- If state DB has stale data: `rm .convoy/state.db` before recording.
-- Keep ANTHROPIC_API_KEY set — without it the narrative and medic fall back to deterministic output.
+- **Keep `ANTHROPIC_API_KEY` set.** Without it narrative + medic fall back to deterministic, less impressive copy.
+- **Pre-seed the Act 1 plan** (`plan --save`). Saves 10–15s of Opus wait.
+- **Pre-create the Fly app** for Act 2 or count on `--fly-create-app` (default). Cold-start of a fresh app adds ~30s.
+- **If the web dev server caches wrong**: `pkill -f "next dev" && rm -rf web/.next && (cd web && npm run dev)`.
+- **If a Fly app from a prior take is cluttering state**: `fly apps list | grep convoy-demo-` and `fly apps destroy <name>` them before the recording.
+- **Web approval lag**: the run page polls every 1.5s. Approve, count to two, then narrate "continuing."
+
+## Fallback variants
+
+- **Scripted-only demo** (no real credentials needed): `ship <path> --demo` runs the full 7 stages scripted. ~15s end to end. Useful if recording conditions don't allow real network calls.
+- **Medic-on-fixture-logs demo**: `apply <plan> --inject-failure=rehearse` uses the built-in buggy log fixture and runs the medic diagnosis path without spinning up anything real.
+- **Rollback-only demo**: narrate from `docs/rollback-proof.md` — the sequence, timings, and `fly releases` output are already captured there.

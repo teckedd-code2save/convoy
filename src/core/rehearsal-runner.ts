@@ -3,7 +3,18 @@ import { existsSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 export interface RehearsalTarget {
-  repoPath: string;
+  /**
+   * Where the app's lockfile / install manifest lives. For a pnpm/yarn/npm
+   * monorepo this is the repo ROOT (so `pnpm install` / `npm ci` resolves
+   * all workspaces). Defaults to serviceCwd when absent.
+   */
+  installCwd?: string;
+  /**
+   * Where build + start commands should run. For a monorepo workspace target
+   * this is the subdir (e.g. `apps/web`), so the locally-hoisted bin dir
+   * (node_modules/.bin) resolves binaries like `next`, `tsx`, `vite`, etc.
+   */
+  serviceCwd: string;
   installCommand?: string;
   buildCommand?: string;
   startCommand: string;
@@ -11,6 +22,43 @@ export interface RehearsalTarget {
   healthPath: string;
   metricsPath?: string;
   env?: Record<string, string>;
+  /**
+   * When false (the default) rehearsal subprocesses do NOT inherit the
+   * parent process env. Only a small safe allowlist (PATH, HOME, NODE_ENV,
+   * LANG, TERM, USER, SHELL, TMPDIR) plus `env` are passed. Set true only
+   * when the target repo is trusted — e.g. the operator's own checkout,
+   * opted in via `convoy apply --trust-repo`. Defaults to false so cloned
+   * third-party repos can't exfiltrate ANTHROPIC_API_KEY / GH_TOKEN / cloud
+   * credentials via their install or start scripts.
+   */
+  inheritAmbientEnv?: boolean;
+}
+
+const SAFE_ENV_ALLOWLIST = [
+  'PATH',
+  'HOME',
+  'NODE_ENV',
+  'LANG',
+  'LC_ALL',
+  'TERM',
+  'USER',
+  'SHELL',
+  'TMPDIR',
+] as const;
+
+function composeEnv(
+  target: Pick<RehearsalTarget, 'env' | 'inheritAmbientEnv'>,
+  extra: Record<string, string> = {},
+): NodeJS.ProcessEnv {
+  if (target.inheritAmbientEnv === true) {
+    return { ...process.env, ...(target.env ?? {}), ...extra };
+  }
+  const scrubbed: NodeJS.ProcessEnv = {};
+  for (const key of SAFE_ENV_ALLOWLIST) {
+    const value = process.env[key];
+    if (value !== undefined) scrubbed[key] = value;
+  }
+  return { ...scrubbed, ...(target.env ?? {}), ...extra };
 }
 
 export interface RehearsalResult {
@@ -67,23 +115,28 @@ export class RehearsalRunner {
 
   async run(probeOpts: ProbeOptions, signal?: AbortSignal): Promise<RehearsalResult> {
     const started = Date.now();
-    if (!existsSync(this.#target.repoPath)) {
-      return this.#bail(started, `path does not exist: ${this.#target.repoPath}`);
+    const installCwd = this.#target.installCwd ?? this.#target.serviceCwd;
+    const serviceCwd = this.#target.serviceCwd;
+    if (!existsSync(serviceCwd)) {
+      return this.#bail(started, `serviceCwd does not exist: ${serviceCwd}`);
+    }
+    if (!existsSync(installCwd)) {
+      return this.#bail(started, `installCwd does not exist: ${installCwd}`);
     }
 
     try {
       if (this.#target.installCommand) {
-        this.#onPhase('install.running', { cmd: this.#target.installCommand });
-        await this.#execWait(this.#target.installCommand, 180_000, signal);
+        this.#onPhase('install.running', { cmd: this.#target.installCommand, cwd: installCwd });
+        await this.#execWait(this.#target.installCommand, installCwd, 180_000, signal);
         this.#onPhase('install.done');
       }
       if (this.#target.buildCommand) {
-        this.#onPhase('build.running', { cmd: this.#target.buildCommand });
-        await this.#execWait(this.#target.buildCommand, 180_000, signal);
+        this.#onPhase('build.running', { cmd: this.#target.buildCommand, cwd: serviceCwd });
+        await this.#execWait(this.#target.buildCommand, serviceCwd, 180_000, signal);
         this.#onPhase('build.done');
       }
 
-      this.#onPhase('boot.starting', { cmd: this.#target.startCommand, port: this.#target.port });
+      this.#onPhase('boot.starting', { cmd: this.#target.startCommand, cwd: serviceCwd, port: this.#target.port });
       await this.#startService(signal);
       await this.#waitForHealth(30_000, signal);
       this.#onPhase('boot.ready', { port: this.#target.port });
@@ -144,11 +197,11 @@ export class RehearsalRunner {
     };
   }
 
-  async #execWait(shellCmd: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+  async #execWait(shellCmd: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       const proc = spawn('sh', ['-c', shellCmd], {
-        cwd: this.#target.repoPath,
-        env: { ...process.env, ...(this.#target.env ?? {}) },
+        cwd,
+        env: composeEnv(this.#target),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       proc.stdout?.on('data', (chunk: Buffer) => this.#appendLog(chunk.toString('utf8')));
@@ -177,12 +230,8 @@ export class RehearsalRunner {
   async #startService(signal?: AbortSignal): Promise<void> {
     const cmd = this.#target.startCommand;
     const proc = spawn('sh', ['-c', cmd], {
-      cwd: this.#target.repoPath,
-      env: {
-        ...process.env,
-        ...(this.#target.env ?? {}),
-        PORT: String(this.#target.port),
-      },
+      cwd: this.#target.serviceCwd,
+      env: composeEnv(this.#target, { PORT: String(this.#target.port) }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     proc.stdout?.on('data', (chunk: Buffer) => this.#appendLog(chunk.toString('utf8')));

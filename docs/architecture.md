@@ -26,10 +26,10 @@ flowchart TB
   end
 
   subgraph Targets[Deployment targets]
-    Fly["fly"]
-    Railway["railway"]
-    Vercel["vercel"]
-    CloudRun["cloudrun"]
+    Fly["fly (real)<br/>flyctl deploy · alias rollback"]
+    Vercel["vercel (real)<br/>preview → prod · alias rollback"]
+    Railway["railway<br/>(stubbed, v2)"]
+    CloudRun["cloudrun<br/>(stubbed, v2)"]
   end
 
   CLI --> Orch
@@ -86,7 +86,7 @@ flowchart LR
 | **promote** | Progressive rollout to full production. | No regression detected at each step |
 | **observe** | Post-deploy watch window. Continues to monitor; can trigger rollback. | SLO-healthy for the configured window |
 
-The **medic** subagent activates on any stage failure: reads logs, diagnoses root cause, and either patches Convoy-authored config and retries, or hands the developer a diagnosis card for code-level issues.
+The **medic** activates on any stage failure. It is a **Claude agent loop** (Opus 4.7) with four scoped tools: `read_log_tail`, `read_file`, `grep_repo`, and `finalize_diagnosis`. The agent picks which tools to call in what order, up to six turns. Path-traversal is refused at the tool boundary — the agent cannot read outside `repoPath`. When the root cause is in a Convoy-authored file (Dockerfile, platform manifest, `.env.schema`) the medic emits `owned=convoy` with a proposed patch. When the root cause is in developer code the medic emits `owned=developer` with a plain-language fix and the pipeline pauses for the human to push — it will not retry against code Convoy doesn't own.
 
 The **rollback** path is pre-staged at every stage. Forward progress is never permitted without a named, measured reverse.
 
@@ -98,7 +98,7 @@ The **rollback** path is pre-staged at every stage. Forward progress is never pe
 | **picker** | Scores platforms. Respects explicit user choice and existing platform config. |
 | **author** | Drafts deployment surface files in a pull request. Only owns files it creates. |
 | **deployer** | Delegates to the chosen platform adapter. |
-| **medic** | Diagnoses failures. Iterates on Convoy-authored config; hands code issues back to developer. |
+| **medic** | Claude agent loop. Four scoped tools; up to six turns. Emits structured diagnosis; pauses for developer fix on `owned=developer`. Implementation: `src/core/medic.ts`. |
 | **correlator** | Reads metrics during canary and observe stages. Decides go/no-go between promotion steps. |
 | **policy** | Evaluates rules — freeze windows, tier, required approvers, blast-radius budget. |
 
@@ -158,7 +158,7 @@ sequenceDiagram
   participant Web
 
   CLI->>SQLite: INSERT approval (status=pending)
-  CLI->>SQLite: poll every 400ms
+  CLI->>SQLite: poll every 400ms (no timeout — human drives)
   User->>Web: open /runs/[id]
   Web->>SQLite: SELECT run, events, approvals
   Web-->>User: render (with Approve button)
@@ -167,3 +167,51 @@ sequenceDiagram
   SQLite-->>CLI: next poll sees status=approved
   CLI->>CLI: continue pipeline
 ```
+
+## Rollback — the real reverse path
+
+Rollback is pre-staged at every production stage. On observe-stage breach the platform adapter fires the measured reverse without a human click.
+
+```mermaid
+sequenceDiagram
+  participant Orch as Orchestrator
+  participant Obs as Observe stage
+  participant FlyApi as Fly API (flyctl)
+  participant LiveApp as Live app
+
+  Obs->>LiveApp: GET /health every 2s
+  LiveApp-->>Obs: status + latency
+  Obs->>Obs: compute p99 + error rate vs threshold
+  Note over Obs: p99 2817ms > 1000ms → breach
+  Obs->>Orch: emit observe.breach { reason }
+  Obs->>FlyApi: list releases --image --json
+  FlyApi-->>Obs: { v3: ImageRef..., v2: ImageRef..., v1: ImageRef... }
+  Obs->>FlyApi: deploy --image <v3 ref> --strategy=immediate
+  FlyApi-->>Obs: release created (new version reusing v3's image)
+  Obs->>Orch: emit rollback.done { restored_version: 3 }
+  Orch->>SQLite: run.status = rolled_back · outcome_reason = "p99 2817ms > 1000ms"
+```
+
+Same shape for Vercel: `vercel ls --json` → pick a prior `READY` production deployment → `vercel alias set <prior-url> <prod-alias>`. Proven end-to-end in [`rollback-proof.md`](./rollback-proof.md).
+
+## Agent handoffs
+
+```mermaid
+flowchart LR
+  classDef agent fill:#0f6fff22,stroke:#0f6fff
+  classDef gate fill:#b4530922,stroke:#b45309
+  classDef alert fill:#b91c1c22,stroke:#b91c1c
+
+  Scanner[scanner]:::agent --> Picker[picker]:::agent
+  Picker --> Author[author]:::agent
+  Author --> MergeGate{{merge_pr<br/>approval}}:::gate
+  MergeGate --> Deployer[deployer]:::agent
+  Deployer --> PromoteGate{{promote<br/>approval}}:::gate
+  PromoteGate --> Correlator[correlator]:::agent
+  Deployer -. failure .-> Medic[medic]:::alert
+  Correlator -. breach .-> Rollback[rollback]:::alert
+  Medic -. code-level .-> Pause{{awaiting_fix<br/>human}}:::gate
+  Medic -. config-level .-> Deployer
+```
+
+Agents hand work to each other through the orchestrator and the SQLite event bus. Medic and rollback are only invoked when real signals fire — no scripted branching.

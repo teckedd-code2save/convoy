@@ -174,8 +174,10 @@ export async function createPrFromAuthoredFiles(
     writeFileSync(abs, file.contentPreview, 'utf8');
   }
 
-  // Stage, commit, push.
-  await sh('git', ['add', '--', ...files.map((f) => f.path)], { cwd: ctx.path });
+  // Stage, commit, push. Force-add: Convoy owns this list (Dockerfile, platform manifest,
+  // .env.schema, .convoy/*) and many Node templates gitignore .env* broadly, which would
+  // silently drop .env.schema without -f.
+  await sh('git', ['add', '-f', '--', ...files.map((f) => f.path)], { cwd: ctx.path });
   await sh('git', ['commit', '-m', title], { cwd: ctx.path });
   await sh('git', ['push', '-u', 'origin', branch], { cwd: ctx.path });
 

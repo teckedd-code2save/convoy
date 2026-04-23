@@ -25,6 +25,27 @@ import { resolveTarget } from './planner/target-resolver.js';
 const STATE_PATH = process.env['CONVOY_STATE_PATH'] ?? '.convoy/state.db';
 const PLANS_DIR = process.env['CONVOY_PLANS_DIR'] ?? '.convoy/plans';
 const SUPPORTED_PLATFORMS: readonly Platform[] = ['fly', 'railway', 'vercel', 'cloudrun'];
+const WEB_BASE = (process.env['CONVOY_WEB_URL'] ?? 'http://localhost:3737').replace(/\/$/, '');
+
+function webUrl(path: string): string {
+  return `${WEB_BASE}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
+async function openInBrowser(url: string): Promise<void> {
+  const { spawn } = await import('node:child_process');
+  const cmd = process.platform === 'darwin'
+    ? 'open'
+    : process.platform === 'win32'
+      ? 'start'
+      : 'xdg-open';
+  try {
+    const args = process.platform === 'win32' ? ['', url] : [url];
+    const proc = spawn(cmd, args, { detached: true, stdio: 'ignore', shell: process.platform === 'win32' });
+    proc.unref();
+  } catch {
+    // non-fatal — user can click the printed link
+  }
+}
 
 const SYMBOL = {
   run: '◆',
@@ -83,9 +104,29 @@ function renderRunEvent(event: RunEvent): void {
     case 'failed':
       process.stdout.write(`  ${pc.red(SYMBOL.fail)} ${compact(event.payload)}\n`);
       return;
-    case 'progress':
+    case 'progress': {
+      // Give medic agent tool calls a distinct line so the operator sees
+      // "medic is reading src/..., medic is grepping for..." as investigative
+      // steps, not indistinguishable progress dots.
+      const p = event.payload as Record<string, unknown> | null | undefined;
+      if (p && p['phase'] === 'medic.tool_use') {
+        const tool = String(p['tool'] ?? 'tool');
+        const input = p['input'];
+        let hint = '';
+        if (input && typeof input === 'object') {
+          const io = input as Record<string, unknown>;
+          if (typeof io['path'] === 'string') hint = io['path'];
+          else if (typeof io['pattern'] === 'string') hint = `/${io['pattern']}/`;
+          else if (typeof io['n'] === 'number') hint = `n=${io['n']}`;
+        }
+        process.stdout.write(
+          `  ${pc.magenta('◇')} ${pc.magenta('medic')} ${pc.dim(tool)} ${hint ? pc.dim(hint) : ''}\n`,
+        );
+        return;
+      }
       process.stdout.write(`  ${pc.dim(SYMBOL.bullet)} ${pc.dim(compact(event.payload))}\n`);
       return;
+    }
     case 'decision':
       process.stdout.write(`  ${pc.cyan(SYMBOL.decision)} ${compact(event.payload, 2)}\n`);
       return;
@@ -98,12 +139,15 @@ function renderRunEvent(event: RunEvent): void {
   }
 }
 
-function attachRenderer(bus: ConvoyBus, startedAt: Date): () => void {
+function attachRenderer(bus: ConvoyBus, startedAt: Date, openInUI = false): () => void {
   return bus.subscribe((e: ConvoyBusEvent) => {
     switch (e.type) {
       case 'run.created': {
         const head = `${pc.bold(pc.cyan(SYMBOL.run))} ${pc.bold(`Convoy run ${e.run.id.slice(0, 8)} started`)}`;
+        const url = webUrl(`/runs/${e.run.id}`);
         process.stdout.write(`${head}\n  ${pc.dim('Repository:')} ${e.run.repoUrl}\n`);
+        process.stdout.write(`  ${pc.cyan('▶')} ${pc.dim('Watch live:')} ${pc.cyan(url)}\n`);
+        if (openInUI) void openInBrowser(url);
         return;
       }
       case 'run.updated': {
@@ -204,9 +248,11 @@ async function runShip(
     const planStore = new PlanStore(PLANS_DIR);
     planStore.save(plan);
 
+    const planUrl = webUrl(`/plans/${plan.id}`);
     process.stdout.write(
       `${pc.dim('Plan')} ${pc.bold(plan.id.slice(0, 8))} ${pc.dim('saved')} ${pc.dim(`(narrative: ${enrichmentSource})`)}\n`,
     );
+    process.stdout.write(`${pc.cyan('▶')} ${pc.dim('Plan in web UI:')} ${pc.cyan(planUrl)}\n`);
     process.stdout.write(
       `${pc.dim('Target:')} ${plan.target.name} ${pc.dim(`(${plan.target.ecosystem}${plan.target.framework ? `, ${plan.target.framework}` : ''})`)}\n`,
     );
@@ -237,6 +283,7 @@ interface PlanOpts {
   save?: boolean;
   json?: boolean;
   noAi?: boolean;
+  open?: boolean;
 }
 
 async function runPlan(path: string, opts: PlanOpts): Promise<void> {
@@ -287,10 +334,13 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
     if (opts.save) {
       const store = new PlanStore(PLANS_DIR);
       const saved = store.save(plan);
+      const url = webUrl(`/plans/${plan.id}`);
       process.stdout.write(`\n${pc.dim('Saved plan to')} ${saved}\n`);
       process.stdout.write(
         `${pc.dim('Apply with')} ${pc.bold(`npm run convoy -- apply ${plan.id.slice(0, 8)}`)}\n`,
       );
+      process.stdout.write(`${pc.cyan('▶')} ${pc.dim('Inspect in the web UI:')} ${pc.cyan(url)}\n`);
+      if (opts.open === true) void openInBrowser(url);
     }
   } catch (err) {
     thinking?.stop();
@@ -317,7 +367,8 @@ function startThinking(): { stop: () => void } {
 }
 
 interface ApplyOpts {
-  autoApprove: boolean;
+  // Opt-in — absence of --auto-approve / --yes pauses at every approval gate.
+  autoApprove?: boolean;
   // These default to true (real). Use --no-real-X to stub, or --demo for all three.
   realAuthor: boolean;
   realRehearsal: boolean;
@@ -338,6 +389,8 @@ interface ApplyOpts {
   probeRequests?: number;
   probeConcurrency?: number;
   env?: Record<string, string>;
+  open?: boolean;
+  trustRepo?: boolean;
 }
 
 interface PreflightCheck {
@@ -444,10 +497,15 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
         remedy: workspaceHint,
       });
     } else {
+      const cwdHint = plan.target.workspace ? ` in \`${plan.target.workspace}/\`` : '';
+      const trusted = opts.trustRepo === true;
+      const envHint = trusted
+        ? '; parent env inherited (--trust-repo)'
+        : '; parent env scrubbed to PATH/HOME/NODE_ENV (+ --env and env-file). Use --trust-repo to inherit your shell env.';
       report.checks.push({
         name: 'real rehearsal',
         ok: true,
-        detail: `will spawn \`${plan.rehearsal.startCommand}\` on port ${plan.rehearsal.expectedPort ?? 8080}`,
+        detail: `will spawn \`${plan.rehearsal.startCommand}\`${cwdHint} on port ${plan.rehearsal.expectedPort ?? 8080}${envHint}`,
       });
     }
   } else {
@@ -595,7 +653,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
   const orchestrator = new Orchestrator(store, bus, stages);
 
   const startedAt = new Date();
-  const unsubscribe = attachRenderer(bus, startedAt);
+  const unsubscribe = attachRenderer(bus, startedAt, opts.open === true);
 
   // Preflight — confirm each real-* stage can actually run. If a hard
   // prereq is missing and the user didn't opt out, fail with a clear remedy.
@@ -610,9 +668,9 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
 
   const orchestratorOpts: OrchestratorOpts = {
     dryRun: !preflight.realRehearsal,
-    autoApprove: opts.autoApprove,
-    platformOverride: plan.platform.chosen,
+    autoApprove: opts.autoApprove === true,
     planId: plan.id,
+    plan,
   };
 
   if (opts.injectFailure === 'rehearse' || opts.injectFailure === 'canary') {
@@ -769,8 +827,19 @@ function buildRealRehearsalOpts(plan: ConvoyPlan, opts: ApplyOpts): RealRehearsa
   const userProbePaths = opts.probePath && opts.probePath.length > 0 ? opts.probePath : null;
   const probePaths = userProbePaths ?? [healthPath];
 
+  const serviceCwd = plan.target.workspace
+    ? `${plan.target.localPath}/${plan.target.workspace}`
+    : plan.target.localPath;
+
+  // Default to env-scrubbed rehearsal. --trust-repo opts into ambient env
+  // inheritance (e.g. operator's own checkout where their shell env is
+  // expected). For cloned third-party repos the default prevents credential
+  // exfiltration via hostile install/start scripts.
+  const inheritAmbientEnv = opts.trustRepo === true;
+
   const result: RealRehearsalOpt = {
     repoPath: plan.target.localPath,
+    serviceCwd,
     startCommand,
     port,
     healthPath,
@@ -781,6 +850,7 @@ function buildRealRehearsalOpts(plan: ConvoyPlan, opts: ApplyOpts): RealRehearsa
     probePaths,
     maxErrorRatePct: 1.0,
     maxP99Ms: 500,
+    inheritAmbientEnv,
   };
   if (installCommand) result.installCommand = installCommand;
   if (buildCommand) result.buildCommand = buildCommand;
@@ -933,7 +1003,9 @@ program
   .description('Plan + apply end-to-end. Real by default. Accepts a local path or a GitHub URL / owner/repo.')
   .option('--platform <platform>', 'explicit platform choice: fly | railway | vercel | cloudrun')
   .option('--workspace <subdir>', 'target a specific subdirectory (e.g. backend, apps/web)')
-  .option('--no-auto-approve', 'block on approvals; decide them from the web UI')
+  .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
+  .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
+  .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
   .option('--no-ai', 'skip the Opus narrative pass')
   .option('--demo', 'scripted pipeline — no PR, no subprocess, no Fly deploy')
   .option('--no-real-author', 'stub the author stage instead of opening a real PR')
@@ -972,6 +1044,7 @@ program
   .option('--repo-url <url>', 'annotate the plan with a remote repo URL (does not fetch)')
   .option('--workspace <subdir>', 'target a specific subdirectory (e.g. backend, apps/web) for monorepos')
   .option('--save', 'persist the plan to .convoy/plans/<id>.json', false)
+  .option('--open', 'open the saved plan in the web UI (requires --save)')
   .option('--json', 'output the raw plan as JSON instead of the human-readable render', false)
   .option('--no-ai', 'skip the Opus narrative pass and use the deterministic output')
   .action(async (path: string, options: PlanOpts) => {
@@ -988,7 +1061,9 @@ program
 program
   .command('apply <planId>')
   .description('Execute a saved plan. Real by default — opens a real PR, rehearses locally, deploys to Fly. Use --demo for a scripted pipeline.')
-  .option('--no-auto-approve', 'wait for external approval decisions instead of auto-approving')
+  .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
+  .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
+  .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
   .option('--demo', 'scripted pipeline (no PR, no subprocess, no Fly deploy)')
   .option('--no-real-author', 'stub the author stage instead of opening a real PR')
   .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')

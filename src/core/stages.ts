@@ -24,8 +24,11 @@ import {
   prStatus,
   type GitRepoContext,
 } from './github-runner.js';
-import { diagnose } from './medic.js';
+import { diagnose, type DiagnoseOptions } from './medic.js';
+import type { ConvoyPlan } from './plan.js';
 import { RehearsalRunner, type MetricsSnapshot } from './rehearsal-runner.js';
+import { pickPlatform } from '../planner/picker.js';
+import { scanRepository, type ScanResult } from '../planner/scanner.js';
 import type { RunStateStore } from './state.js';
 import type {
   Approval,
@@ -43,6 +46,13 @@ export interface OrchestratorOpts {
   autoApprove?: boolean;
   injectFailure?: InjectFailureOpt;
   planId?: string | null;
+  /**
+   * Full plan handed to the stage context so ScanStage can re-run the live
+   * scan on plan.target.localPath and PickStage can replay the authoritative
+   * pickPlatform decision. Without this, those two stages have no evidence to
+   * render — they used to emit hardcoded signals regardless of the repo.
+   */
+  plan?: ConvoyPlan;
   realRehearsal?: RealRehearsalOpt;
   realAuthor?: RealAuthorOpt;
   realFly?: RealFlyOpt;
@@ -82,7 +92,17 @@ export interface RealVercelOpt {
 }
 
 export interface RealRehearsalOpt {
+  /**
+   * Repo root — where the lockfile lives. `pnpm install` / `npm ci` runs here.
+   * Also used as repoPath for diagnosis context.
+   */
   repoPath: string;
+  /**
+   * Where build and start commands run. Defaults to repoPath when absent.
+   * For monorepo workspaces (e.g. `apps/web`) this is the subdir so
+   * node_modules/.bin resolves framework binaries (next, vite, tsx, etc.).
+   */
+  serviceCwd?: string;
   installCommand?: string;
   buildCommand?: string;
   startCommand: string;
@@ -96,6 +116,13 @@ export interface RealRehearsalOpt {
   maxErrorRatePct?: number;
   maxP99Ms?: number;
   convoyAuthoredFiles?: string[];
+  /**
+   * When true, the rehearsal subprocess inherits the parent env (ANTHROPIC_API_KEY,
+   * GH_TOKEN, AWS_*, etc.). Default false — scrubbed to a small allowlist so
+   * cloned third-party repos can't exfiltrate operator credentials via their
+   * install/start scripts. The CLI surfaces this as --trust-repo.
+   */
+  inheritAmbientEnv?: boolean;
 }
 
 export type InjectFailureOpt = {
@@ -175,6 +202,24 @@ abstract class BaseStage implements Stage {
     return sleep(ms, signal);
   }
 
+  /**
+   * Streams each tool call the medic agent makes as a `medic.tool_use`
+   * progress event so the CLI + web UI can replay "I read src/orders.ts
+   * lines 40-80, then grepped for 'orderTotal'" live, instead of only
+   * seeing the final diagnosis card.
+   */
+  protected medicTelemetry(ctx: StageContext): DiagnoseOptions {
+    return {
+      onToolCall: (call) => {
+        this.emit(ctx, 'progress', {
+          phase: 'medic.tool_use',
+          tool: call.name,
+          input: call.input,
+        });
+      },
+    };
+  }
+
   protected async awaitApproval(
     ctx: StageContext,
     kind: ApprovalKind,
@@ -184,7 +229,10 @@ abstract class BaseStage implements Stage {
     ctx.bus.emit({ type: 'approval.requested', approval });
     this.emit(ctx, 'progress', { awaiting_approval: kind, approval_id: approval.id });
 
-    const autoApprove = ctx.opts.autoApprove ?? true;
+    // Default: pause at every approval gate (opt-out via --auto-approve / -y).
+    // The previous default (auto-approve ON) contradicted the README's "humans
+    // decide" story and was flagged by pre-demo adversarial review.
+    const autoApprove = ctx.opts.autoApprove === true;
     if (autoApprove) {
       await this.sleep(400, ctx.signal);
       const decided = ctx.store.decideApproval(approval.id, 'approved');
@@ -215,17 +263,55 @@ export class ScanStage extends BaseStage {
 
   override async run(ctx: StageContext): Promise<unknown> {
     this.emit(ctx, 'started', { repo_url: ctx.run.repoUrl });
-    await this.sleep(800, ctx.signal);
-    const signals = {
-      language: 'typescript',
-      runtime: 'node-20',
-      framework: 'next.js',
-      topology: 'web+worker',
-      data: ['postgres'],
-      hints: { has_dockerfile: false, has_ci: true },
-    };
-    this.emit(ctx, 'finished', { signals });
-    return signals;
+
+    const plan = ctx.opts.plan;
+    if (plan) {
+      try {
+        const scanOpts = plan.target.workspace ? { workspace: plan.target.workspace } : {};
+        const scan = scanRepository(plan.target.localPath, scanOpts);
+        const signals = {
+          language: scan.language ?? scan.ecosystem,
+          runtime: scan.runtime,
+          framework: scan.framework,
+          topology: scan.topology,
+          data: scan.dataLayer,
+          hints: {
+            has_dockerfile: scan.hasDockerfile,
+            has_ci: scan.hasCi,
+            package_manager: scan.packageManager,
+            monorepo: scan.isMonorepo ? scan.monorepoTool : null,
+            existing_platform: scan.existingPlatform,
+          },
+          evidence: scan.evidence.slice(0, 6),
+        };
+        this.emit(ctx, 'finished', { signals });
+        return scan;
+      } catch (err) {
+        // Target directory may have moved since the plan was saved. Fall back
+        // to the plan's recorded target metadata rather than emitting fiction.
+        const message = err instanceof Error ? err.message : String(err);
+        this.emit(ctx, 'progress', {
+          note: `live scan unavailable: ${message}`,
+          fallback: 'plan.target',
+        });
+        const signals = {
+          language: plan.target.ecosystem,
+          runtime: null,
+          framework: plan.target.framework,
+          topology: plan.target.topology,
+          data: [] as string[],
+          hints: { source: 'plan-record' as const },
+        };
+        this.emit(ctx, 'finished', { signals });
+        return null;
+      }
+    }
+
+    // No plan attached — shouldn't happen on the apply path, but keep a
+    // minimal emission so downstream stages don't crash.
+    this.emit(ctx, 'progress', { note: 'no plan attached to run; scan skipped' });
+    this.emit(ctx, 'finished', { signals: null });
+    return null;
   }
 }
 
@@ -234,25 +320,36 @@ export class PickStage extends BaseStage {
 
   override async run(ctx: StageContext): Promise<unknown> {
     this.emit(ctx, 'started', {});
-    await this.sleep(300, ctx.signal);
 
-    const chosen: Platform = ctx.opts.platformOverride ?? 'fly';
-    const rankings = [
-      { platform: 'fly', score: 94, reason: 'container + worker + regions' },
-      { platform: 'railway', score: 91, reason: 'managed postgres + monorepo' },
-      { platform: 'cloudrun', score: 82, reason: 'serious infra, VPC, IAM' },
-      { platform: 'vercel', score: 54, reason: 'worker disqualifies frontend-first' },
-    ];
-    const decision = {
-      chosen,
-      reason:
-        ctx.opts.platformOverride !== undefined
-          ? `respecting explicit --platform=${chosen} override`
-          : `${chosen} scored highest for web+worker + postgres topology`,
-      rankings,
-    };
+    const scan = (ctx.prior['scan'] as ScanResult | null | undefined) ?? null;
+    const plan = ctx.opts.plan;
 
-    ctx.store.updateRun(ctx.run.id, { platform: chosen });
+    // Prefer re-running pickPlatform against the live scan (that's the
+    // honest "we just scored four platforms" demo). Fall back to the plan's
+    // recorded decision if live scan failed. Last resort: platformOverride.
+    let decision;
+    if (scan) {
+      decision = pickPlatform(scan, ctx.opts.platformOverride);
+      if (plan && decision.chosen !== plan.platform.chosen) {
+        this.emit(ctx, 'progress', {
+          note: 'live pick diverged from plan',
+          plan_chose: plan.platform.chosen,
+          live_chose: decision.chosen,
+        });
+      }
+    } else if (plan) {
+      decision = plan.platform;
+    } else {
+      const chosen: Platform = ctx.opts.platformOverride ?? 'fly';
+      decision = {
+        chosen,
+        reason: `fallback: ${chosen}`,
+        source: 'override' as const,
+        candidates: [],
+      };
+    }
+
+    ctx.store.updateRun(ctx.run.id, { platform: decision.chosen });
     const updated = ctx.store.getRun(ctx.run.id);
     if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
 
@@ -417,7 +514,7 @@ export class RehearseStage extends BaseStage {
         logs,
         metrics: { p99_ms: 494, p95_ms: 410, error_rate_pct: 6.67, count: 90 },
         errorMessage: 'synthetic load breached error-rate tolerance (6.67% > 1%)',
-      });
+      }, this.medicTelemetry(ctx));
 
       this.emit(ctx, 'diagnosis', diagnosis);
       this.emit(ctx, 'progress', { phase: 'ephemeral.destroying' });
@@ -448,10 +545,12 @@ export class RehearseStage extends BaseStage {
 
     const runner = new RehearsalRunner(
       {
-        repoPath: cfg.repoPath,
+        installCwd: cfg.repoPath,
+        serviceCwd: cfg.serviceCwd ?? cfg.repoPath,
         startCommand: cfg.startCommand,
         port: cfg.port,
         healthPath: cfg.healthPath,
+        inheritAmbientEnv: cfg.inheritAmbientEnv === true,
         ...(cfg.installCommand !== undefined && { installCommand: cfg.installCommand }),
         ...(cfg.buildCommand !== undefined && { buildCommand: cfg.buildCommand }),
         ...(cfg.metricsPath !== undefined && { metricsPath: cfg.metricsPath }),
@@ -488,7 +587,7 @@ export class RehearseStage extends BaseStage {
           ...(rehearsal.metricsAfter ?? rehearsal.metricsBefore ?? {}) as Record<string, unknown>,
         },
         errorMessage: rehearsal.reason ?? 'rehearsal failed',
-      });
+      }, this.medicTelemetry(ctx));
       this.emit(ctx, 'diagnosis', diagnosis);
       throw new RehearsalBreachError(diagnosis);
     }
@@ -640,7 +739,7 @@ export class CanaryStage extends BaseStage {
         convoyAuthoredFiles: cfg.convoyAuthoredFiles ?? [],
         logs: deployResult.logs,
         errorMessage: deployResult.error ?? 'fly deploy failed',
-      });
+      }, this.medicTelemetry(ctx));
       this.emit(ctx, 'diagnosis', diagnosis);
       throw new Error(`Fly deploy failed: ${deployResult.error}`);
     }
@@ -698,7 +797,7 @@ export class CanaryStage extends BaseStage {
         convoyAuthoredFiles: cfg.convoyAuthoredFiles ?? [],
         logs: preview.logs,
         errorMessage: preview.error ?? 'vercel preview deploy failed',
-      });
+      }, this.medicTelemetry(ctx));
       this.emit(ctx, 'diagnosis', diagnosis);
       throw new Error(`Vercel preview deploy failed: ${preview.error}`);
     }
