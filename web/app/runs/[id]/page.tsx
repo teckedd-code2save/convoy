@@ -66,6 +66,8 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
 
       {run.status === 'rolled_back' ? <RolledBackBanner run={run} /> : null}
 
+      <ProgressBar events={events} startedAt={run.startedAt} completedAt={run.completedAt} />
+
       {pendingApprovals.length > 0 ? (
         <section className="space-y-3">
           <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">
@@ -80,6 +82,8 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
       ) : null}
 
       <DiagnosisSection events={events} />
+
+      <MedicInvestigationSection events={events} />
 
       <StagesSection events={events} />
 
@@ -271,7 +275,7 @@ function TimelineSection({ events }: { events: EventRow[] }) {
         {events.map((e) => (
           <li key={e.id} className="pl-5 relative">
             <span
-              className={`absolute -left-[5px] top-1.5 w-2.5 h-2.5 rounded-full ${markerForKind(e.kind)}`}
+              className={`absolute -left-[5px] top-1.5 w-2.5 h-2.5 rounded-full ${markerForEvent(e)}`}
             />
             <TimelineEvent event={e} />
           </li>
@@ -286,19 +290,28 @@ function TimelineEvent({ event }: { event: EventRow }) {
     event.payload !== null && event.payload !== undefined && !(typeof event.payload === 'object' && Object.keys(event.payload as Record<string, unknown>).length === 0);
   const compact = renderPayload(event.payload);
   const full = hasPayload ? JSON.stringify(event.payload, null, 2) : '';
+  const isMedic = isMedicToolUse(event);
 
   return (
     <details className="group">
       <summary className="cursor-pointer select-none list-none">
         <div className="flex items-baseline gap-2 flex-wrap">
           <span className="font-mono text-xs font-semibold">{event.stage}</span>
-          <span className="text-xs text-muted">{event.kind}</span>
+          {isMedic ? (
+            <span className="text-xs font-semibold text-warn inline-flex items-center gap-1">
+              <span>◇</span> medic
+            </span>
+          ) : (
+            <span className="text-xs text-muted">{event.kind}</span>
+          )}
           <span className="text-xs text-muted ml-auto">
             {new Date(event.createdAt).toLocaleTimeString()}
           </span>
         </div>
         <div className="text-sm mt-1 font-mono text-muted break-words flex items-start gap-2">
-          <span className="flex-1">{compact || <em className="text-muted/70">(no payload)</em>}</span>
+          <span className="flex-1">
+            {isMedic ? renderMedicToolLine(event.payload) : compact || <em className="text-muted/70">(no payload)</em>}
+          </span>
           {hasPayload ? (
             <span className="text-xs text-muted/70 shrink-0 group-open:hidden select-none">expand ▾</span>
           ) : null}
@@ -314,6 +327,142 @@ function TimelineEvent({ event }: { event: EventRow }) {
       ) : null}
     </details>
   );
+}
+
+function isMedicToolUse(event: EventRow): boolean {
+  if (event.kind !== 'progress') return false;
+  const p = event.payload as Record<string, unknown> | null | undefined;
+  return p !== null && p !== undefined && p['phase'] === 'medic.tool_use';
+}
+
+function renderMedicToolLine(payload: unknown): string {
+  const p = (payload ?? {}) as Record<string, unknown>;
+  const tool = typeof p['tool'] === 'string' ? p['tool'] : 'tool';
+  const input = p['input'];
+  if (input && typeof input === 'object') {
+    const io = input as Record<string, unknown>;
+    if (typeof io['path'] === 'string') {
+      const line =
+        typeof io['start_line'] === 'number'
+          ? `:${io['start_line']}${typeof io['end_line'] === 'number' ? `-${io['end_line']}` : ''}`
+          : '';
+      return `${tool} ${io['path']}${line}`;
+    }
+    if (typeof io['pattern'] === 'string') {
+      const scope = typeof io['path'] === 'string' ? ` in ${io['path']}` : '';
+      return `${tool} /${io['pattern']}/${scope}`;
+    }
+    if (typeof io['n'] === 'number') return `${tool} n=${io['n']}`;
+  }
+  return tool;
+}
+
+function ProgressBar({
+  events,
+  startedAt,
+  completedAt,
+}: {
+  events: EventRow[];
+  startedAt: string;
+  completedAt: string | null;
+}) {
+  const status = computeStageStatus(events);
+  const done = STAGE_ORDER.filter((s) => status[s] === 'done').length;
+  const running = STAGE_ORDER.find((s) => status[s] === 'running');
+  const pct = Math.min(100, Math.round((done / STAGE_ORDER.length) * 100));
+  const elapsedMs =
+    (completedAt ? new Date(completedAt).getTime() : Date.now()) - new Date(startedAt).getTime();
+
+  return (
+    <section className="space-y-2">
+      <div className="flex items-baseline justify-between gap-3 flex-wrap">
+        <div className="flex items-baseline gap-2">
+          <span className="text-sm font-semibold">
+            {done} <span className="text-muted font-normal">/</span> {STAGE_ORDER.length}
+          </span>
+          <span className="text-sm text-muted">stages</span>
+          {running ? (
+            <span className="text-sm text-accent">
+              · <span className="font-mono">{running}</span> running
+            </span>
+          ) : null}
+        </div>
+        <div className="text-xs font-mono text-muted">
+          {formatElapsed(elapsedMs)}
+          {completedAt ? null : <span className="ml-1 text-accent animate-pulse">●</span>}
+        </div>
+      </div>
+      <div className="h-1.5 bg-rule rounded-full overflow-hidden">
+        <div
+          className="h-full bg-accent transition-all duration-500 ease-out"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+    </section>
+  );
+}
+
+function MedicInvestigationSection({ events }: { events: EventRow[] }) {
+  const toolCalls = events.filter(isMedicToolUse);
+  if (toolCalls.length === 0) return null;
+
+  const seenFinalize = toolCalls.some((e) => {
+    const p = e.payload as Record<string, unknown> | null;
+    const tool = p?.['tool'];
+    return tool === 'finalize_diagnosis';
+  });
+
+  return (
+    <section className="space-y-3">
+      <div className="flex items-center gap-3">
+        <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">
+          Medic investigation
+        </h2>
+        <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-warn/10 text-warn">
+          Claude agent · {toolCalls.length} tool call{toolCalls.length === 1 ? '' : 's'}
+        </span>
+        {!seenFinalize ? (
+          <span className="text-xs text-accent inline-flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+            investigating
+          </span>
+        ) : null}
+      </div>
+      <ol className="border border-rule rounded-lg p-3 space-y-1.5 bg-card">
+        {toolCalls.map((e, idx) => (
+          <li
+            key={e.id}
+            className="font-mono text-xs text-muted flex items-baseline gap-2 flex-wrap"
+          >
+            <span className="text-warn shrink-0">◇</span>
+            <span className="text-muted/70 tabular-nums shrink-0 w-4 text-right">
+              {idx + 1}
+            </span>
+            <span className="text-ink font-semibold">
+              {(e.payload as Record<string, unknown>)['tool'] as string}
+            </span>
+            <span className="text-muted break-all">{renderMedicToolLine(e.payload).replace(/^\S+\s*/, '')}</span>
+            <span className="text-muted/60 ml-auto shrink-0">
+              {new Date(e.createdAt).toLocaleTimeString()}
+            </span>
+          </li>
+        ))}
+      </ol>
+      <p className="text-xs text-muted leading-relaxed">
+        Each line is a tool call the medic agent made against this run. The agent picks
+        which tools to call and when to stop — path-traversal is refused at the tool boundary,
+        so the agent can only read files under the repo root.
+      </p>
+    </section>
+  );
+}
+
+function formatElapsed(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const mins = Math.floor(ms / 60_000);
+  const secs = Math.floor((ms % 60_000) / 1000);
+  return `${mins}m ${secs}s`;
 }
 
 function ApprovalCard({ runId, approval }: { runId: string; approval: ApprovalRow }) {
@@ -347,7 +496,9 @@ function computeStageStatus(events: EventRow[]): Record<string, 'idle' | 'runnin
   return status;
 }
 
-function markerForKind(kind: string): string {
+function markerForEvent(event: EventRow): string {
+  if (isMedicToolUse(event)) return 'bg-warn';
+  const kind = event.kind;
   if (kind === 'failed') return 'bg-danger';
   if (kind === 'finished') return 'bg-success';
   if (kind === 'started') return 'bg-accent';

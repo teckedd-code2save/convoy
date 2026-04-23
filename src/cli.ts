@@ -408,6 +408,29 @@ interface PreflightReport {
   hardFailures: string[];
 }
 
+const MEDIC_MODEL = 'claude-opus-4-7';
+
+/**
+ * Verify the Anthropic model id resolves before the pipeline does real work.
+ * Uses models.retrieve — no token cost, one HEAD-ish GET. If the string has
+ * drifted (e.g. a dated suffix now required), we warn the operator now
+ * instead of letting enricher + medic silently fall back on every call.
+ */
+async function preflightAnthropicModel(
+  apiKey: string,
+  model: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const Anthropic = (await import('@anthropic-ai/sdk')).default;
+    const client = new Anthropic({ apiKey });
+    await client.models.retrieve(model);
+    return { ok: true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason: message };
+  }
+}
+
 async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<PreflightReport> {
   const report: PreflightReport = {
     realAuthor: opts.realAuthor,
@@ -427,6 +450,35 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
       detail: 'all stages stubbed for the demo (no PR, no subprocess, no Fly deploy)',
     });
     return report;
+  }
+
+  // Verify the Anthropic model before the pipeline runs. Medic + enricher
+  // degrade gracefully on API errors, but silent degradation during the demo
+  // would turn the "Claude agent medic" centerpiece into a deterministic
+  // fallback card with no warning.
+  const apiKey = process.env['ANTHROPIC_API_KEY'];
+  if (apiKey) {
+    const modelCheck = await preflightAnthropicModel(apiKey, MEDIC_MODEL);
+    if (modelCheck.ok) {
+      report.checks.push({
+        name: 'anthropic model',
+        ok: true,
+        detail: `${MEDIC_MODEL} resolved`,
+      });
+    } else {
+      report.checks.push({
+        name: 'anthropic model',
+        ok: false,
+        detail: `${MEDIC_MODEL} did not resolve: ${modelCheck.reason?.slice(0, 140) ?? 'unknown'}`,
+        remedy: `Verify the model id (current: ${MEDIC_MODEL}). The pipeline will still run, but medic + enricher will fall back to deterministic output.`,
+      });
+    }
+  } else {
+    report.checks.push({
+      name: 'anthropic model',
+      ok: true,
+      detail: 'ANTHROPIC_API_KEY not set — medic + enricher will use deterministic fallback',
+    });
   }
 
   // --- real author ---
