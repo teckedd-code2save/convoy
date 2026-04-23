@@ -367,21 +367,44 @@ export class AuthorStage extends BaseStage {
       return this.#runReal(ctx, ctx.opts.realAuthor);
     }
 
-    this.emit(ctx, 'started', {});
+    this.emit(ctx, 'started', { mode: 'scripted' });
     await this.sleep(1200, ctx.signal);
 
-    const files = ['Dockerfile', 'fly.toml', '.env.schema', '.convoy/manifest.yaml'];
-    const prUrl = `https://github.com/placeholder/pr-for-${ctx.run.id.slice(0, 7)}`;
+    // Pull the real authored-file list from the plan so the approval card
+    // shows the same evidence the real-author path would: path, line count,
+    // summary, and content preview. Previously scripted mode emitted a fake
+    // pr_url and a bare string[] of filenames, leaving the operator to
+    // approve blind.
+    const plan = ctx.opts.plan;
+    const files = plan
+      ? plan.author.convoyAuthoredFiles.map((f) => ({
+          path: f.path,
+          lines: f.lines,
+          summary: f.summary,
+          contentPreview: f.contentPreview,
+        }))
+      : [
+          { path: 'Dockerfile', lines: 0, summary: '(no plan attached)', contentPreview: '' },
+        ];
 
-    this.emit(ctx, 'progress', { stage: 'pr_opened', files, pr_url: prUrl });
-
-    await this.awaitApproval(ctx, 'merge_pr', {
-      pr_url: prUrl,
-      files,
-      note: 'No developer code modified. Only Convoy-authored deployment surface.',
+    this.emit(ctx, 'progress', {
+      phase: 'files_drafted',
+      mode: 'scripted',
+      files: files.map((f) => f.path),
+      file_count: files.length,
     });
 
-    const result = { pr_url: prUrl, files, merged: true };
+    await this.awaitApproval(ctx, 'merge_pr', {
+      mode: 'scripted',
+      note: 'Scripted pipeline — no real PR was opened. These are the files Convoy would author.',
+      files,
+    });
+
+    const result = {
+      mode: 'scripted' as const,
+      files: files.map((f) => f.path),
+      merged: true,
+    };
     this.emit(ctx, 'finished', result);
     return result;
   }
@@ -435,11 +458,19 @@ export class AuthorStage extends BaseStage {
     });
 
     await this.awaitApproval(ctx, 'merge_pr', {
+      mode: 'real',
       pr_url: pr.prUrl,
       pr_number: pr.prNumber,
       branch: pr.branch,
-      files: cfg.authoredFiles.map((f) => f.path),
       note: 'Only Convoy-authored deployment files were committed. Source code is untouched.',
+      // Full file shape so the approval card can render the same content
+      // preview the plan page shows. Operator should never approve blind.
+      files: cfg.authoredFiles.map((f) => ({
+        path: f.path,
+        lines: f.contentPreview.split(/\r?\n/).length,
+        summary: f.summary ?? '',
+        contentPreview: f.contentPreview,
+      })),
     });
 
     if (cfg.mergeOnApproval) {
@@ -481,12 +512,14 @@ export class RehearseStage extends BaseStage {
       return this.#runReal(ctx, ctx.opts.realRehearsal);
     }
 
-    this.emit(ctx, 'started', {});
-    this.emit(ctx, 'progress', { phase: 'ephemeral.creating' });
+    this.emit(ctx, 'started', { mode: 'scripted' });
+    this.emit(ctx, 'progress', { phase: 'ephemeral.creating', mode: 'scripted' });
     await this.sleep(1200, ctx.signal);
 
-    const ephemeralUrl = `https://convoy-rehearsal-${ctx.run.id.slice(0, 6)}.fly.dev`;
-    this.emit(ctx, 'progress', { phase: 'ephemeral.ready', url: ephemeralUrl });
+    // Scripted rehearsal does not spin up a real ephemeral service, so there
+    // is no URL to advertise. Previously we emitted
+    // https://convoy-rehearsal-<hash>.fly.dev which never existed.
+    this.emit(ctx, 'progress', { phase: 'ephemeral.ready', mode: 'scripted' });
     await this.sleep(400, ctx.signal);
 
     this.emit(ctx, 'progress', { phase: 'smoke_tests.passed', count: 8 });
@@ -530,11 +563,11 @@ export class RehearseStage extends BaseStage {
     await this.sleep(300, ctx.signal);
 
     const result = {
+      mode: 'scripted' as const,
       healthy: true,
       p99_ms: 142,
       smoke_tests_passed: 8,
       new_error_fingerprints: 0,
-      ephemeral_url: ephemeralUrl,
     };
     this.emit(ctx, 'finished', result);
     return result;
@@ -826,19 +859,18 @@ export class PromoteStage extends BaseStage {
       return this.#runRealVercel(ctx, ctx.opts.realVercel, ctx.prior['canary'] as Record<string, unknown> | undefined);
     }
 
-    this.emit(ctx, 'started', {});
+    this.emit(ctx, 'started', { mode: 'scripted' });
 
     for (const pct of [10, 25, 50, 100]) {
       this.emit(ctx, 'progress', { traffic_split_percent: pct });
       await this.sleep(450, ctx.signal);
     }
 
-    const liveUrl = `https://convoy-demo-${ctx.run.id.slice(0, 6)}.fly.dev`;
-    ctx.store.updateRun(ctx.run.id, { liveUrl });
-    const updated = ctx.store.getRun(ctx.run.id);
-    if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
-
-    const result = { live_url: liveUrl, release: 'v1' };
+    // No fake live URL in scripted mode. Before this change the demo path
+    // emitted https://convoy-demo-<hash>.fly.dev which never resolved — the
+    // CLI printed it green, the web UI linked to it, both lied. Scripted
+    // runs end without a live URL; only real deploys populate run.liveUrl.
+    const result = { mode: 'scripted' as const, release: 'v1', note: 'scripted pipeline — no deployment' };
     this.emit(ctx, 'finished', result);
     return result;
   }

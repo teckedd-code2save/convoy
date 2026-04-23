@@ -21,6 +21,7 @@ import {
 import { RunStateStore } from './core/state.js';
 import type { Platform, Run, RunEvent, StageName } from './core/types.js';
 import { buildPlan } from './planner/index.js';
+import { scanRepository } from './planner/scanner.js';
 import { resolveTarget } from './planner/target-resolver.js';
 
 const STATE_PATH = process.env['CONVOY_STATE_PATH'] ?? '.convoy/state.db';
@@ -125,6 +126,56 @@ async function ensureWebViewerRunning(webDir: string): Promise<{
     spawned: true,
     note: `spawned web viewer but it did not respond within 8s (logs: ${logPath})`,
   };
+}
+
+/**
+ * Friendly one-time check for ANTHROPIC_API_KEY. If the operator is running
+ * from a Convoy checkout that already has `.env.example` but no `.env`,
+ * they almost certainly forgot step 3 of the README. Print the exact cp
+ * incantation rather than making them figure out why narratives are bland.
+ *
+ * Fires once per process via a module-level flag so plan+apply doesn't
+ * double-print for the ship flow.
+ */
+let convoyEnvChecked = false;
+function checkConvoyEnv(): void {
+  if (convoyEnvChecked) return;
+  convoyEnvChecked = true;
+  if (process.env['ANTHROPIC_API_KEY']) return;
+
+  const hasEnv = existsSync(resolve(process.cwd(), '.env'));
+  const hasEnvLocal = existsSync(resolve(process.cwd(), '.env.local'));
+  const hasEnvExample = existsSync(resolve(process.cwd(), '.env.example'));
+
+  if (hasEnv || hasEnvLocal) {
+    // File present but key missing — likely a typo or the wrong key name.
+    process.stdout.write(
+      `${pc.yellow('!')} ${pc.dim(`ANTHROPIC_API_KEY not set. Narrative + medic agent will fall back to deterministic output.`)}\n`,
+    );
+    process.stdout.write(
+      `  ${pc.dim(`Check ${hasEnv ? '.env' : '.env.local'} — the variable name must be exactly ANTHROPIC_API_KEY.`)}\n`,
+    );
+    return;
+  }
+
+  if (hasEnvExample) {
+    process.stdout.write(
+      `${pc.yellow('!')} ${pc.dim(`No .env file found. Medic agent + Opus narratives will be deterministic fallbacks.`)}\n`,
+    );
+    process.stdout.write(
+      `  ${pc.dim(`Fix: ${pc.bold('cp .env.example .env')} then add your key: ${pc.bold('echo ANTHROPIC_API_KEY=sk-ant-... >> .env')}`)}\n`,
+    );
+    return;
+  }
+
+  // No .env and no .env.example — running from outside a Convoy checkout,
+  // or a fresh clone missed the README. Minimal nudge.
+  process.stdout.write(
+    `${pc.yellow('!')} ${pc.dim(`ANTHROPIC_API_KEY not set — running with deterministic fallbacks.`)}\n`,
+  );
+  process.stdout.write(
+    `  ${pc.dim(`Set it to enable Opus narratives + the medic agent loop: ${pc.bold('export ANTHROPIC_API_KEY=sk-ant-...')}`)}\n`,
+  );
 }
 
 /**
@@ -303,6 +354,7 @@ async function runShip(
   target: string,
   opts: ShipOpts,
 ): Promise<void> {
+  checkConvoyEnv();
   let platformOverride: Platform | undefined;
   if (opts.platform !== undefined) {
     if (!isPlatform(opts.platform)) {
@@ -387,6 +439,7 @@ interface PlanOpts {
 }
 
 async function runPlan(path: string, opts: PlanOpts): Promise<void> {
+  checkConvoyEnv();
   let platformOverride: Platform | undefined;
   if (opts.platform !== undefined) {
     if (!isPlatform(opts.platform)) {
@@ -538,6 +591,107 @@ async function preflightAnthropicModel(
   }
 }
 
+interface DataLayerExpectation {
+  match: RegExp;
+  label: string;
+  envVars: string[];
+  flyRemedy?: string;
+}
+
+const DATA_LAYER_EXPECTATIONS: DataLayerExpectation[] = [
+  {
+    match: /postgres|postgis/i,
+    label: 'postgres',
+    envVars: ['DATABASE_URL', 'POSTGRES_URL', 'PG_URL'],
+    flyRemedy: 'fly postgres create --name <db-app> && fly postgres attach <db-app> --app <this-app>',
+  },
+  {
+    match: /redis/i,
+    label: 'redis',
+    envVars: ['REDIS_URL', 'UPSTASH_REDIS_URL'],
+    flyRemedy: 'fly redis create (Upstash addon) — attaches REDIS_URL automatically',
+  },
+  {
+    match: /mysql|mariadb/i,
+    label: 'mysql',
+    envVars: ['DATABASE_URL', 'MYSQL_URL'],
+  },
+  {
+    match: /mongo/i,
+    label: 'mongo',
+    envVars: ['MONGODB_URI', 'MONGO_URL'],
+  },
+];
+
+/**
+ * Scans the target repo for data-layer dependencies (postgres/redis/mysql/
+ * mongo) and checks that a connection string is staged somewhere Convoy
+ * will pass to the deploy. Without this the app boots into prod with no
+ * database, takes real traffic, and fails in the least-useful way.
+ *
+ * Warnings only — we don't hard-fail because the scan can false-positive
+ * (test fixtures, docs references) and some operators wire data layers
+ * outside `.env.convoy-secrets` via platform consoles.
+ */
+function appendDataLayerChecks(
+  plan: ConvoyPlan,
+  opts: ApplyOpts,
+  report: PreflightReport,
+): void {
+  let dataLayer: string[] = [];
+  try {
+    const scan = scanRepository(
+      plan.target.localPath,
+      plan.target.workspace ? { workspace: plan.target.workspace } : {},
+    );
+    dataLayer = scan.dataLayer;
+  } catch {
+    // Scan errored (repo moved, workspace missing, etc.). The existing
+    // preflight's other checks will surface the real problem. Skip data-
+    // layer check silently rather than emit a misleading warning.
+    return;
+  }
+
+  if (dataLayer.length === 0) return;
+
+  const secretsPath =
+    opts.flySecretsFile ?? `${plan.target.localPath}/.env.convoy-secrets`;
+  const fileSecrets = existsSync(secretsPath) ? parseEnvFile(secretsPath) : {};
+  const cliSecrets = opts.env ?? {};
+  const combined: Record<string, string> = { ...fileSecrets, ...cliSecrets };
+
+  // Dedupe expectations so `[postgres, postgis]` doesn't fire the same
+  // warning twice — PostGIS is just a Postgres extension.
+  const alreadyReported = new Set<string>();
+  for (const ds of dataLayer) {
+    const spec = DATA_LAYER_EXPECTATIONS.find((e) => e.match.test(ds));
+    if (!spec || alreadyReported.has(spec.label)) continue;
+    alreadyReported.add(spec.label);
+
+    const match = spec.envVars.find((v) => combined[v] && combined[v]!.length > 0);
+    if (match) {
+      report.checks.push({
+        name: `${spec.label} wiring`,
+        ok: true,
+        detail: `${match} staged from ${existsSync(secretsPath) && fileSecrets[match] ? secretsPath : '--env'}`,
+      });
+      continue;
+    }
+
+    const remedy =
+      plan.platform.chosen === 'fly' && spec.flyRemedy
+        ? spec.flyRemedy
+        : `stage a connection string: echo ${spec.envVars[0]}=... >> ${secretsPath}`;
+
+    report.checks.push({
+      name: `${spec.label} wiring`,
+      ok: false,
+      detail: `your app reads ${spec.label} (detected via scan: ${ds}) but no ${spec.envVars.join(' / ')} found`,
+      remedy,
+    });
+  }
+}
+
 async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<PreflightReport> {
   const report: PreflightReport = {
     realAuthor: opts.realAuthor,
@@ -586,6 +740,16 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
       ok: true,
       detail: 'ANTHROPIC_API_KEY not set — medic + enricher will use deterministic fallback',
     });
+  }
+
+  // --- data layer provisioning ---
+  // If the repo scan shows a Postgres/Redis/MySQL/Mongo dependency but the
+  // operator hasn't staged a connection string for the deploy, they'll ship
+  // an app that boots without its database. Warn loudly — this is the kind
+  // of footgun that eats production at 2am.
+  // realFly in this codebase gates any real platform deploy (fly or vercel).
+  if (report.realFly && !opts.demo) {
+    appendDataLayerChecks(plan, opts, report);
   }
 
   // --- real author ---
@@ -782,6 +946,7 @@ function autoFlyAppName(plan: ConvoyPlan): string {
 }
 
 async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
+  checkConvoyEnv();
   const plans = new PlanStore(PLANS_DIR);
   const plan = resolvePlan(plans, planId);
 

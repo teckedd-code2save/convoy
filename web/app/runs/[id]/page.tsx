@@ -465,8 +465,20 @@ function formatElapsed(ms: number): string {
   return `${mins}m ${secs}s`;
 }
 
+interface AuthoredFileSummary {
+  path: string;
+  lines: number;
+  summary: string;
+  contentPreview: string;
+}
+
 function ApprovalCard({ runId, approval }: { runId: string; approval: ApprovalRow }) {
-  const summary = approval.summary as Record<string, unknown> | null;
+  const summary = (approval.summary ?? null) as Record<string, unknown> | null;
+
+  if (approval.kind === 'merge_pr' && summary) {
+    return <MergePrApprovalCard runId={runId} approval={approval} summary={summary} />;
+  }
+
   return (
     <div className="border border-warn/40 bg-warn/5 rounded-lg p-5 space-y-3">
       <div className="flex items-center gap-3">
@@ -483,6 +495,131 @@ function ApprovalCard({ runId, approval }: { runId: string; approval: ApprovalRo
       ) : null}
       <ApprovalActions runId={runId} approvalId={approval.id} kind={approval.kind} />
     </div>
+  );
+}
+
+function MergePrApprovalCard({
+  runId,
+  approval,
+  summary,
+}: {
+  runId: string;
+  approval: ApprovalRow;
+  summary: Record<string, unknown>;
+}) {
+  const mode = (summary['mode'] as string | undefined) ?? 'real';
+  const prUrl = typeof summary['pr_url'] === 'string' ? summary['pr_url'] : null;
+  const prNumber = typeof summary['pr_number'] === 'number' ? summary['pr_number'] : null;
+  const branch = typeof summary['branch'] === 'string' ? summary['branch'] : null;
+  const note = typeof summary['note'] === 'string' ? summary['note'] : null;
+
+  // New shape: files is an array of {path, lines, summary, contentPreview}.
+  // Older shape (pre-rewrite): files is a string[] of paths only.
+  const rawFiles = summary['files'];
+  const files: AuthoredFileSummary[] = Array.isArray(rawFiles)
+    ? rawFiles.map((f) => {
+        if (typeof f === 'string') {
+          return { path: f, lines: 0, summary: '', contentPreview: '' };
+        }
+        if (f && typeof f === 'object') {
+          const obj = f as Record<string, unknown>;
+          return {
+            path: typeof obj['path'] === 'string' ? obj['path'] : '(unknown)',
+            lines: typeof obj['lines'] === 'number' ? obj['lines'] : 0,
+            summary: typeof obj['summary'] === 'string' ? obj['summary'] : '',
+            contentPreview:
+              typeof obj['contentPreview'] === 'string' ? obj['contentPreview'] : '',
+          };
+        }
+        return { path: '(unknown)', lines: 0, summary: '', contentPreview: '' };
+      })
+    : [];
+
+  return (
+    <div className="border border-warn/40 bg-warn/5 rounded-lg p-5 space-y-4">
+      <div className="flex items-center gap-3 flex-wrap">
+        <span className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-warn">
+          <span className="w-1.5 h-1.5 rounded-full bg-warn animate-pulse" />
+          approve merge
+        </span>
+        <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-rule text-muted">
+          {mode === 'scripted' ? 'scripted preview' : 'real PR'}
+        </span>
+        <span className="font-mono text-xs text-muted ml-auto">{approval.id.slice(0, 8)}</span>
+      </div>
+
+      {prUrl ? (
+        <a
+          href={prUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center gap-2 text-sm text-accent hover:underline font-mono break-all"
+        >
+          {prUrl.replace(/^https?:\/\//, '')}
+          {prNumber ? <span className="text-muted">#{prNumber}</span> : null}
+          <span aria-hidden>↗</span>
+        </a>
+      ) : null}
+
+      {branch ? (
+        <div className="text-xs font-mono text-muted">
+          branch: <span className="text-ink">{branch}</span>
+        </div>
+      ) : null}
+
+      {note ? (
+        <p className="text-sm text-muted leading-relaxed">{note}</p>
+      ) : null}
+
+      <div className="space-y-2">
+        <div className="text-xs font-semibold uppercase tracking-wider text-muted">
+          {files.length} file{files.length === 1 ? '' : 's'} Convoy authored
+        </div>
+        <div className="space-y-1.5">
+          {files.map((f) => (
+            <AuthoredFileRow key={f.path} file={f} />
+          ))}
+        </div>
+      </div>
+
+      <ApprovalActions runId={runId} approvalId={approval.id} kind={approval.kind} />
+    </div>
+  );
+}
+
+function AuthoredFileRow({ file }: { file: AuthoredFileSummary }) {
+  const hasPreview = file.contentPreview.length > 0;
+  return (
+    <details className="group border border-rule rounded-md bg-card">
+      <summary
+        className={`cursor-pointer select-none list-none px-3 py-2 flex items-baseline gap-3 flex-wrap ${hasPreview ? 'hover:bg-rule/30' : ''}`}
+      >
+        <span className="font-mono text-sm text-ink">{file.path}</span>
+        {file.lines > 0 ? (
+          <span className="text-xs text-muted tabular-nums">
+            {file.lines} line{file.lines === 1 ? '' : 's'}
+          </span>
+        ) : null}
+        {file.summary ? (
+          <span className="text-xs text-muted flex-1 truncate">{file.summary}</span>
+        ) : null}
+        {hasPreview ? (
+          <>
+            <span className="text-xs text-muted/70 shrink-0 group-open:hidden select-none">
+              show ▾
+            </span>
+            <span className="text-xs text-muted/70 shrink-0 hidden group-open:inline select-none">
+              hide ▴
+            </span>
+          </>
+        ) : null}
+      </summary>
+      {hasPreview ? (
+        <pre className="text-xs font-mono bg-ink text-paper p-3 overflow-auto max-h-96 whitespace-pre-wrap break-words rounded-b-md border-t border-rule">
+          {file.contentPreview}
+        </pre>
+      ) : null}
+    </details>
   );
 }
 

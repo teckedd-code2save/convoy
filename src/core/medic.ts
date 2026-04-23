@@ -38,7 +38,32 @@ Hard rules:
 - Never claim certainty you don't have. Ambiguous signal → confidence="low".
 - Speak in first person ("I see...", "I checked..."). You are the medic reporting what you found.
 
+Output format — critical:
+- The narrative, reproduction, and suggestedFix.description fields are rendered as plain text in a CLI + web UI.
+- Do NOT embed XML, HTML, or tool-use markup inside those strings. No </narrative>, <parameter name="...">, or similar. Just sentences.
+- Do NOT quote the raw JSON schema back in prose. You are writing for a human operator reading the card.
+- Keep narrative to 2-3 sentences. Keep description to one short paragraph. Reproduction is a single shell command or URL.
+
 You have at most ${MAX_TURNS} turns. Budget them: evidence first, finalize once you're confident.`;
+
+/**
+ * Strips tool-use-style XML leakage (</narrative>, <parameter name="...">,
+ * <json>...</json>) that the model sometimes embeds inside string-typed
+ * tool inputs. Safe for plain prose — real sentences don't contain angle
+ * brackets around lowercase identifiers.
+ */
+function sanitizeProse(value: string): string {
+  return value
+    // open + close tags like <narrative>, </narrative>, <parameter name="x">
+    .replace(/<\/?[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^>]*)?\/?>/g, '')
+    // stray fenced blocks
+    .replace(/^```(?:json|text)?\s*/i, '')
+    .replace(/```\s*$/, '')
+    // collapse whitespace the stripping left behind
+    .replace(/\s+\n/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
 
 export interface DiagnosisInput {
   stage: string;
@@ -467,8 +492,10 @@ function parseFinalize(input: unknown): Omit<Diagnosis, 'source' | 'toolCalls'> 
   if (!input || typeof input !== 'object') return null;
   const obj = input as Record<string, unknown>;
 
-  const rootCause = typeof obj['rootCause'] === 'string' ? obj['rootCause'].trim() : null;
-  const narrative = typeof obj['narrative'] === 'string' ? obj['narrative'].trim() : null;
+  const rootCause =
+    typeof obj['rootCause'] === 'string' ? sanitizeProse(obj['rootCause']) : null;
+  const narrative =
+    typeof obj['narrative'] === 'string' ? sanitizeProse(obj['narrative']) : null;
   const classification = obj['classification'];
   const confidence = obj['confidence'];
 
@@ -502,7 +529,7 @@ function parseFinalize(input: unknown): Omit<Diagnosis, 'source' | 'toolCalls'> 
   }
 
   if (typeof obj['reproduction'] === 'string') {
-    out.reproduction = obj['reproduction'].trim();
+    out.reproduction = sanitizeProse(obj['reproduction']);
   }
 
   const fix = obj['suggestedFix'];
@@ -519,7 +546,7 @@ function parseFinalize(input: unknown): Omit<Diagnosis, 'source' | 'toolCalls'> 
       out.suggestedFix = {
         file: file.trim(),
         owned,
-        description: description.trim(),
+        description: sanitizeProse(description),
         ...(typeof f['patch'] === 'string' && { patch: f['patch'] }),
       };
     }
