@@ -5,6 +5,7 @@ import { getRun, listEvents, listApprovals, type EventRow, type ApprovalRow, typ
 
 import { AutoRefresher } from './refresher';
 import { ApprovalActions } from './approval-form';
+import { FixActions } from './fix-actions';
 import { MedicChat } from './medic-chat';
 
 export const dynamic = 'force-dynamic';
@@ -84,7 +85,13 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
         </section>
       ) : null}
 
-      <DiagnosisSection events={events} runId={run.id} chatTurns={chatTurns} />
+      <DiagnosisSection
+        events={events}
+        runId={run.id}
+        planId={run.planId}
+        repoUrl={run.repoUrl}
+        chatTurns={chatTurns}
+      />
 
       <MedicInvestigationSection events={events} />
 
@@ -135,10 +142,14 @@ interface MedicDiagnosis {
 function DiagnosisSection({
   events,
   runId,
+  planId,
+  repoUrl,
   chatTurns,
 }: {
   events: EventRow[];
   runId: string;
+  planId: string | null;
+  repoUrl: string;
   chatTurns: MedicChatTurn[];
 }) {
   const diagnoses = events.filter((e) => e.kind === 'diagnosis');
@@ -147,6 +158,30 @@ function DiagnosisSection({
   // scoped per-run, so showing chat on every historical diagnosis would
   // duplicate turns.
   const latestId = diagnoses[diagnoses.length - 1]?.id;
+
+  // Extract the medic's tool call trace from progress events so the handoff
+  // prompt can tell Claude Code what evidence was gathered. Cheap per render.
+  const toolCalls = events
+    .filter((e) => {
+      if (e.kind !== 'progress') return false;
+      const p = e.payload as Record<string, unknown> | null;
+      return p !== null && p['phase'] === 'medic.tool_use';
+    })
+    .map((e) => {
+      const p = e.payload as Record<string, unknown>;
+      const tool = typeof p['tool'] === 'string' ? p['tool'] : 'tool';
+      const input = p['input'];
+      let inputSummary = '';
+      if (input && typeof input === 'object') {
+        const io = input as Record<string, unknown>;
+        if (typeof io['path'] === 'string') inputSummary = String(io['path']);
+        else if (typeof io['pattern'] === 'string') inputSummary = `/${io['pattern']}/`;
+        else if (typeof io['n'] === 'number') inputSummary = `n=${io['n']}`;
+        else inputSummary = JSON.stringify(input).slice(0, 100);
+      }
+      return { tool, inputSummary, timestamp: e.createdAt };
+    });
+
   return (
     <section className="space-y-3">
       <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">
@@ -159,6 +194,9 @@ function DiagnosisSection({
             diagnosis={e.payload as MedicDiagnosis}
             createdAt={e.createdAt}
             runId={e.id === latestId ? runId : null}
+            planId={e.id === latestId ? planId : null}
+            repoUrl={repoUrl}
+            toolCalls={e.id === latestId ? toolCalls : []}
             chatTurns={e.id === latestId ? chatTurns : []}
           />
         ))}
@@ -171,11 +209,17 @@ function DiagnosisCard({
   diagnosis,
   createdAt,
   runId,
+  planId,
+  repoUrl,
+  toolCalls,
   chatTurns,
 }: {
   diagnosis: MedicDiagnosis;
   createdAt: string;
   runId: string | null;
+  planId: string | null;
+  repoUrl: string;
+  toolCalls: { tool: string; inputSummary: string; timestamp: string }[];
   chatTurns: MedicChatTurn[];
 }) {
   const classColors: Record<string, string> = {
@@ -233,6 +277,16 @@ function DiagnosisCard({
           <div className="font-mono text-sm inline-block bg-card border border-rule rounded-md px-2.5 py-1">
             {location}
           </div>
+        ) : null}
+
+        {runId ? (
+          <FixActions
+            diagnosis={diagnosis}
+            planId={planId}
+            runId={runId}
+            toolCalls={toolCalls}
+            repoUrl={repoUrl}
+          />
         ) : null}
       </div>
 
