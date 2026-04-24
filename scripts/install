@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Convoy one-shot setup.
+#
+# Does two things so you never have to pass --plugin-dir again:
+#
+#   1. Exports CONVOY_HOME in your shell profile (zsh / bash / fish / sh).
+#      CONVOY_HOME points at the Convoy repo root — this script's own
+#      directory's parent. The plugin commands cd into CONVOY_HOME before
+#      invoking the CLI and Convoy's state (.convoy/*) accumulates there.
+#
+#   2. Registers this repo as a local-path Claude Code marketplace in
+#      ~/.claude/settings.json and enables the `convoy` plugin, so every
+#      Claude Code session picks up /convoy:where, /convoy:ship, etc.
+#
+# Idempotent. Running it twice is safe — it won't duplicate your shell
+# profile export or clobber other settings.json keys.
+#
+# After running, re-source your shell profile (or open a new terminal) and
+# restart any running Claude Code sessions so they pick up the new plugin.
+set -euo pipefail
+
+# Resolve CONVOY_HOME from this script's location.
+CONVOY_HOME="$(cd "$(dirname "$0")/.." && pwd)"
+
+echo "Convoy root: $CONVOY_HOME"
+
+if [ ! -f "$CONVOY_HOME/package.json" ] || ! grep -q '"name": "convoy"' "$CONVOY_HOME/package.json"; then
+  echo "  ✗ This doesn't look like a Convoy checkout (no package.json with name=convoy)."
+  echo "    Expected scripts/install to live inside the Convoy repo."
+  exit 1
+fi
+echo "  ✓ package.json present"
+
+# ---------------------------------------------------------------------------
+# Step 1 — export CONVOY_HOME in the user's shell profile.
+# ---------------------------------------------------------------------------
+
+shell_name="$(basename "${SHELL:-/bin/sh}")"
+case "$shell_name" in
+  zsh)
+    PROFILE="$HOME/.zshrc"
+    EXPORT_LINE="export CONVOY_HOME=\"$CONVOY_HOME\""
+    ;;
+  bash)
+    PROFILE="$HOME/.bashrc"
+    EXPORT_LINE="export CONVOY_HOME=\"$CONVOY_HOME\""
+    ;;
+  fish)
+    PROFILE="$HOME/.config/fish/config.fish"
+    EXPORT_LINE="set -x CONVOY_HOME \"$CONVOY_HOME\""
+    ;;
+  *)
+    PROFILE="$HOME/.profile"
+    EXPORT_LINE="export CONVOY_HOME=\"$CONVOY_HOME\""
+    ;;
+esac
+
+mkdir -p "$(dirname "$PROFILE")"
+touch "$PROFILE"
+
+if grep -qE '^\s*(export|set\s+-x)\s+CONVOY_HOME(=|\s)' "$PROFILE"; then
+  # Update an existing line in place only if the current value is different.
+  current=$(grep -E '^\s*(export|set\s+-x)\s+CONVOY_HOME(=|\s)' "$PROFILE" | tail -1)
+  if echo "$current" | grep -qF "$CONVOY_HOME"; then
+    echo "  ✓ CONVOY_HOME already points at $CONVOY_HOME in $PROFILE"
+  else
+    # Back up, rewrite the line.
+    cp "$PROFILE" "$PROFILE.convoy-bak.$(date +%s)"
+    sed -i.tmp -E "s|^\s*(export|set\s+-x)\s+CONVOY_HOME(=|\s).*|$EXPORT_LINE|" "$PROFILE"
+    rm -f "$PROFILE.tmp"
+    echo "  ✓ Updated CONVOY_HOME in $PROFILE (backup: $PROFILE.convoy-bak.*)"
+  fi
+else
+  {
+    printf '\n# Convoy deployment agent (added by scripts/install)\n'
+    printf '%s\n' "$EXPORT_LINE"
+  } >> "$PROFILE"
+  echo "  ✓ Added CONVOY_HOME export to $PROFILE"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 2 — register the plugin in Claude Code settings.
+# ---------------------------------------------------------------------------
+
+SETTINGS_DIR="$HOME/.claude"
+SETTINGS="$SETTINGS_DIR/settings.json"
+mkdir -p "$SETTINGS_DIR"
+
+# Use jq if available, else python3 as a safer-than-sed JSON editor. Both
+# preserve unrelated keys in settings.json so we don't clobber the user's
+# other Claude Code config.
+if command -v jq >/dev/null 2>&1; then
+  if [ ! -f "$SETTINGS" ]; then
+    echo '{}' > "$SETTINGS"
+  fi
+  jq --arg path "$CONVOY_HOME" '
+    .extraKnownMarketplaces = (.extraKnownMarketplaces // {}) |
+    .extraKnownMarketplaces["convoy"] = {"source": {"source": "directory", "path": $path}} |
+    .enabledPlugins = (.enabledPlugins // {}) |
+    .enabledPlugins["convoy@convoy"] = true
+  ' "$SETTINGS" > "$SETTINGS.new"
+  mv "$SETTINGS.new" "$SETTINGS"
+  echo "  ✓ Registered convoy marketplace + enabled plugin in $SETTINGS (via jq)"
+elif command -v python3 >/dev/null 2>&1; then
+  python3 - "$SETTINGS" "$CONVOY_HOME" <<'PY'
+import json, os, sys
+path, convoy_home = sys.argv[1], sys.argv[2]
+settings = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            settings = json.load(f)
+    except Exception:
+        settings = {}
+settings.setdefault("extraKnownMarketplaces", {})["convoy"] = {
+    "source": {"source": "directory", "path": convoy_home}
+}
+settings.setdefault("enabledPlugins", {})["convoy@convoy"] = True
+with open(path, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PY
+  echo "  ✓ Registered convoy marketplace + enabled plugin in $SETTINGS (via python3)"
+else
+  echo "  ✗ Need jq or python3 to safely edit $SETTINGS without clobbering other keys."
+  echo "    Install one (brew install jq) and re-run, or add this manually:"
+  cat <<EOF
+
+  In $SETTINGS:
+  {
+    "extraKnownMarketplaces": {
+      "convoy": {"source": {"source": "directory", "path": "$CONVOY_HOME"}}
+    },
+    "enabledPlugins": {
+      "convoy@convoy": true
+    }
+  }
+EOF
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Finish.
+# ---------------------------------------------------------------------------
+
+echo
+echo "Done."
+echo
+echo "Two steps to activate:"
+echo "  1. Reload your shell:         source \"$PROFILE\""
+echo "                                 (or open a new terminal)"
+echo "  2. Restart Claude Code if it's running (picks up the new plugin)"
+echo
+echo "Then from any directory:"
+echo "  /convoy:where             — orient"
+echo "  /convoy:ship <target>     — ship a repo end-to-end"
+echo
+echo "Uninstall: remove the CONVOY_HOME line from $PROFILE,"
+echo "           and the convoy entries from $SETTINGS."

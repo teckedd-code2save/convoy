@@ -3,6 +3,17 @@ description: Show the status of a Convoy run — most recent, or a specific run 
 argument-hint: [run-id-or-prefix]
 ---
 
+## State & paths — do NOT explore the filesystem
+
+Convoy's state lives at fixed paths. Do not `find`, `ls`, or `grep` to discover them — they are authoritative:
+
+- **CONVOY_HOME** — `${CONVOY_HOME:-$HOME/convoy}` (Convoy CLI source + all state)
+- **State DB** — `$CONVOY_HOME/.convoy/state.db` (SQLite: runs, events, approvals, medic chat)
+- **Saved plans** — `$CONVOY_HOME/.convoy/plans/<plan-id>.json`
+- **Web viewer** — `http://localhost:3737`
+
+If `CONVOY_HOME` is unset and `~/convoy` doesn't exist, ask the user for the path to their Convoy checkout.
+
 Run the Convoy status command:
 
 ```bash

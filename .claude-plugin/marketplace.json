@@ -1,0 +1,14 @@
+{
+  "name": "convoy",
+  "owner": {
+    "name": "Edward Twumasi"
+  },
+  "description": "Convoy — deployment agent that rehearses, ships, and observes without rewriting your code",
+  "plugins": [
+    {
+      "name": "convoy",
+      "source": "./plugin",
+      "description": "Deployment agent: plan → rehearse → ship → observe, with a Claude Opus 4.7 medic loop on breach"
+    }
+  ]
+}

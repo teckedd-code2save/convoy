@@ -4,30 +4,40 @@ Ship any repo end-to-end from inside Claude Code. Slash commands drive the real 
 
 ## Install in 60 seconds
 
-Copy-paste these four commands into a terminal. You'll have the plugin running in a Claude Code session at the end.
+Copy-paste these four commands into a terminal. At the end, every Claude Code session has `/convoy:*` available without `--plugin-dir` and `CONVOY_HOME` is set permanently.
 
 ```bash
-# 1. Clone Convoy
-git clone https://github.com/teckedd-code2save/convoy.git ~/convoy
-cd ~/convoy && npm install && (cd web && npm install)
+# 1. Clone Convoy (anywhere you like; path doesn't matter after step 3)
+git clone https://github.com/teckedd-code2save/convoy.git
+cd convoy
+npm install && (cd web && npm install)
 
-# 2. Add an Anthropic API key (optional, enables Opus narratives + medic)
+# 2. Add an Anthropic API key (optional, enables Opus narratives + the medic agent loop)
 echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
 
-# 3. Start the web viewer in its own terminal (needed for approvals)
-(cd ~/convoy/web && npm run dev) &
+# 3. One-shot setup — writes CONVOY_HOME to your shell profile and
+#    registers the plugin as a local-path marketplace in Claude Code.
+./scripts/install
 
-# 4. Launch Claude Code with the plugin loaded
-claude --plugin-dir ~/convoy/plugin
+# 4. Reload your shell + restart Claude Code
+source ~/.zshrc     # or ~/.bashrc, whichever the script used
 ```
 
-Inside Claude Code, verify the plugin loaded:
+Inside any Claude Code session, verify:
 
 ```
-/plugin
+/convoy:where
 ```
 
-`convoy` should appear under **Installed**. If not, check the **Errors** tab, or run `/reload-plugins` to re-scan.
+Should print where Convoy is installed, state DB size, recent plans, whether the web viewer is live. No `--plugin-dir` flag needed — the plugin is registered globally.
+
+If you'd rather run without the global install (one-off / testing), the old path still works:
+
+```bash
+CONVOY_HOME=/path/to/convoy claude --plugin-dir /path/to/convoy/plugin
+```
+
+`/plugin` inside Claude Code shows registered marketplaces + enabled plugins. `convoy@convoy` should be enabled after setup. `/reload-plugins` re-scans if you've just run `./scripts/install` in an existing session.
 
 ## First try
 
@@ -75,6 +85,7 @@ Skip any of them with the matching `--no-*` flag (e.g. `--no-real-author` to ski
 
 | Command | What it does |
 |---|---|
+| `/convoy:where` | **Run this first if you're lost.** Prints where Convoy is installed, what's in state, whether the web viewer is up. One-shot orientation. |
 | `/convoy:ship <target>` | Plan + apply end-to-end. Accepts a local path or a GitHub URL / `owner/repo`. Real by default. |
 | `/convoy:ship-status [run-id]` | Show the status of a run. Defaults to the most recent. |
 | `/convoy:ship-rollback <service>` | Explicit rollback instructions. Automatic rollback is already wired into the observe stage. |
@@ -113,6 +124,43 @@ CONVOY_HOME=/some/other/path claude --plugin-dir /some/other/path/plugin
 ```
 
 **Rehearsal or deploy fails**: medic produces a diagnosis card. The run status becomes `awaiting_fix` (for code-level issues) or `rolled_back` (for SLO breaches on production). Both are surfaced in the web UI at `http://localhost:3737/runs/<run-id>` with the reason inline.
+
+## Paste this into your project's CLAUDE.md
+
+For teams who use Convoy from a separate project (not inside the Convoy repo itself): paste this block into your project's `CLAUDE.md`. It tells every Claude Code session in that project where Convoy lives and stops the agent from `find`-ing around looking for state.
+
+```markdown
+## Convoy (deployment agent)
+
+This project uses [Convoy](https://github.com/teckedd-code2save/convoy) as its deployment agent. Slash commands: `/convoy:where` (orientation), `/convoy:ship <target>`, `/convoy:ship-status`, `/convoy:ship-rollback`.
+
+### Convoy state — authoritative paths (do not explore)
+
+- **CONVOY_HOME** — `${CONVOY_HOME:-$HOME/convoy}` (Convoy CLI source + all state live here, regardless of which project is the deploy target)
+- **State DB** — `$CONVOY_HOME/.convoy/state.db` (SQLite: runs, events, approvals, medic chat)
+- **Saved plans** — `$CONVOY_HOME/.convoy/plans/<plan-id>.json`
+- **Cloned targets** — `$CONVOY_HOME/.convoy/clones/github.com/<owner>/<repo>/`
+- **Web viewer** — `http://localhost:3737` (auto-spawned by the CLI on plan/apply)
+- **Web server log** — `$CONVOY_HOME/.convoy/web-server.log`
+
+Never `find`, `ls`, or `grep` to rediscover these — they are fixed. Run `/convoy:where` to print a live snapshot if context is needed.
+
+### Invoking Convoy
+
+Every Convoy command runs from `$CONVOY_HOME`, not from this project's directory:
+
+```bash
+cd "${CONVOY_HOME:-$HOME/convoy}" && npm run convoy -- <subcommand> <args>
+```
+
+If `CONVOY_HOME` is unset and `~/convoy` doesn't exist, ask the user for the path before running anything.
+
+### Principles Convoy enforces
+
+1. **Ships your code, does not rewrite it.** Convoy only authors Dockerfile, platform manifest, `.env.schema`, CI workflow, `infra/` Terraform, and `.convoy/*`. Medic diagnoses code-level failures and pauses for the developer to fix — it never edits `src/`.
+2. **Every forward action has a pre-staged reverse.** Rollback paths are real.
+3. **No autonomous probing.** Convoy doesn't call `fly secrets list`, `vercel env ls`, etc. — operator declarations are the source of truth for platform state.
+```
 
 ## More
 
