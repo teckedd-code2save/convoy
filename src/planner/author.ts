@@ -17,6 +17,15 @@ export function draftAuthorSection(scan: ScanResult, platform: Platform): PlanAu
   const containerBased = platform !== 'vercel';
   if (containerBased && !scan.hasDockerfile) {
     files.push(draftDockerfile(scan, platform));
+    // A Dockerfile without a .dockerignore means `COPY . .` pulls
+    // node_modules, .next, .git, .env*, build caches, IDE state — everything.
+    // The build context balloons, the upload to Depot/buildkit takes minutes
+    // to tens of minutes, and the auth token expires before the builder
+    // finishes. We learned this from a 45-minute Fly build that died on
+    // "Invalid token". Author them as a pair, always.
+    if (!scan.hasDockerignore) {
+      files.push(draftDockerignore(scan));
+    }
   }
 
   if (platform === 'fly' && scan.existingPlatform !== 'fly') files.push(draftFlyToml(scan));
@@ -108,6 +117,159 @@ COPY . .
 RUN npm ci
 EXPOSE 8080
 CMD ["npm", "start"]
+`;
+  }
+}
+
+function draftDockerignore(scan: ScanResult): PlanAuthoredFile {
+  const content = fallbackDockerignore(scan);
+  return {
+    path: '.dockerignore',
+    lines: content.split('\n').length,
+    summary: `keeps the build context lean (excludes node_modules, build artifacts, .git, env files) — paired with the Dockerfile so \`docker build\` doesn't ship your entire repo to the builder`,
+    contentPreview: content,
+  };
+}
+
+/**
+ * Per-ecosystem ignore lists. The base block (git, env, IDE, OS junk) is
+ * universal; the ecosystem block adds language-specific build artifacts.
+ * Keep the AI enricher hands-off here — these are well-known conventions
+ * that don't benefit from per-repo tailoring, and getting them wrong (e.g.
+ * accidentally ignoring src/) breaks the build silently.
+ */
+function fallbackDockerignore(scan: ScanResult): string {
+  const base = `# Convoy-authored .dockerignore — keeps the build context lean.
+# Anything matched here is NOT sent to the builder; without this file
+# \`COPY . .\` pulls everything (node_modules, build caches, .git, .env*)
+# and the build context upload takes orders of magnitude longer.
+
+# Version control + GitHub
+.git
+.gitignore
+.gitattributes
+.github
+
+# Editor + OS
+.vscode
+.idea
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Convoy itself
+.convoy
+
+# Env + secrets — never bake into images
+.env
+.env.*
+!.env.example
+!.env.schema
+.envrc
+
+# Logs + temp
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.cache
+tmp
+temp
+
+# Dockerfile + this file (don't include in image)
+Dockerfile
+.dockerignore
+
+# Test + coverage
+coverage
+.nyc_output
+test-results
+
+# Documentation that doesn't ship in the runtime
+README.md
+CHANGELOG.md
+docs
+*.md
+`;
+  switch (scan.ecosystem) {
+    case 'python':
+      return `${base}
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.tox
+.venv
+venv
+env
+build
+dist
+`;
+    case 'go':
+      return `${base}
+# Go
+vendor
+`;
+    case 'rust':
+      return `${base}
+# Rust
+target
+`;
+    case 'ruby':
+      return `${base}
+# Ruby
+.bundle
+vendor/bundle
+log
+tmp/cache
+`;
+    case 'java-jvm':
+      return `${base}
+# JVM
+target
+build
+.gradle
+*.class
+*.jar
+*.war
+`;
+    case 'static':
+      return `${base}
+# Static
+node_modules
+dist
+build
+`;
+    default:
+      // node + node-detected (Next.js, Vite, etc.) — also the default fallback.
+      return `${base}
+# Node / JS
+node_modules
+.npm
+.pnp
+.pnp.*
+.yarn
+
+# Build artifacts (Next.js, Vite, Remix, SvelteKit, generic)
+.next
+.nuxt
+.vercel
+.netlify
+.turbo
+.svelte-kit
+.cache
+out
+dist
+build
+
+# TypeScript
+*.tsbuildinfo
 `;
   }
 }

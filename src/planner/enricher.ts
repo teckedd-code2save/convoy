@@ -18,7 +18,7 @@ const CACHE_VERSION = 'v2';
 
 const SYSTEM_PROMPT = `You are a senior platform engineer drafting a Convoy deployment plan for a specific repository.
 
-Convoy ships user code to Fly.io, Railway, Vercel, or Cloud Run. Convoy never modifies developer source code. It authors only deployment-surface files (Dockerfile, platform manifests, CI config, .env.schema) and then rehearses on an ephemeral twin before any production traffic.
+Convoy ships user code to Fly.io, Railway, Vercel, or Cloud Run. Convoy never modifies developer source code. It authors only deployment-surface files (Dockerfile, .dockerignore, platform manifests, CI config, .env.schema) and then rehearses on an ephemeral twin before any production traffic.
 
 Your job: given the repo scan and a deterministic draft plan, return JSON that sounds like YOU are the deploying engineer explaining what you're going to do.
 
@@ -203,7 +203,7 @@ ${JSON.stringify(planSummary, null, 2)}
 ${fileInstructions || '(none)'}
 </files-to-author>
 
-Produce the JSON. For authoredFiles, prioritize the Dockerfile if one is requested — tailor it to the framework, package manager, Prisma (if present), and port. Platform manifests (fly.toml, vercel.json, railway.toml, cloudbuild.yaml) can be omitted from authoredFiles and the deterministic draft will be used. Always include shipNarrative. Return only the JSON inside <json> tags.`;
+Produce the JSON. For authoredFiles, prioritize the Dockerfile if one is requested — tailor it to the framework, package manager, Prisma (if present), and port. Platform manifests (fly.toml, vercel.json, railway.toml, cloudbuild.yaml) and .dockerignore can be omitted from authoredFiles — the deterministic drafts are well-known conventions and don't benefit from per-repo tailoring. Always include shipNarrative. Return only the JSON inside <json> tags.`;
 }
 
 function parseEnrichment(text: string): Enrichment | null {

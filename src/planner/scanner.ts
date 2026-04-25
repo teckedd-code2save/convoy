@@ -70,6 +70,7 @@ export interface ScanResult {
   dataLayer: string[];
   existingPlatform: Platform | null;
   hasDockerfile: boolean;
+  hasDockerignore: boolean;
   dockerfileBase: string | null;
   hasCi: boolean;
   packageManager: PackageManager;
@@ -193,6 +194,7 @@ export function scanRepository(localPath: string, opts: ScanOptions = {}): ScanR
 
   const existingPlatform = detectExistingPlatform(topLevelFiles, evidence);
   const hasDockerfile = topLevelFiles.includes('Dockerfile');
+  const hasDockerignore = topLevelFiles.includes('.dockerignore');
   const dockerfileBase = hasDockerfile ? readDockerfileBase(scanPath) : null;
   const hasCi = topLevelDirs.includes('.github') && allFiles.some((f) => f.startsWith('.github/workflows/'));
 
@@ -254,6 +256,7 @@ export function scanRepository(localPath: string, opts: ScanOptions = {}): ScanR
     dataLayer,
     existingPlatform,
     hasDockerfile,
+    hasDockerignore,
     dockerfileBase,
     hasCi,
     packageManager,
