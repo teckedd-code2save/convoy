@@ -77,6 +77,23 @@ export interface RealAuthorOpt {
   prBody: string;
   mergeOnApproval: boolean;
   mergeMethod?: 'merge' | 'squash' | 'rebase';
+  /**
+   * Operator-authored uncommitted changes captured at preflight. When set,
+   * AuthorStage carries these onto the plan-keyed branch as a separate
+   * `fix:`-prefixed commit BEFORE writing its plumbing files, so a fix
+   * that triggered the resume rides into production through the same PR
+   * Convoy is opening — not via a separate `git push origin main` that
+   * would trip git-deploy platforms (Vercel, Netlify, Cloud Run) into
+   * shipping unproven code.
+   *
+   * `messageDefault` is the auto-generated commit subject Convoy will use
+   * (e.g. "fix: <medic root cause>"). Operator can override later via
+   * git rebase if they care; for the demo flow the default is fine.
+   */
+  carryUncommittedChanges?: {
+    files: string[];
+    messageDefault: string;
+  };
 }
 
 export interface RealFlyOpt {
@@ -518,18 +535,40 @@ export class AuthorStage extends BaseStage {
       contentPreview: f.contentPreview,
     }));
 
+    // The carry block is the operator's uncommitted fix that Convoy will
+    // commit onto its branch BEFORE writing plumbing. We surface the file
+    // list + the planned commit subject in the approval card so the
+    // operator sees the combined picture (their fix + Convoy's plumbing)
+    // before clicking approve. They can reject if the dirty list looks
+    // wrong (stray editor file, accidentally-staged secret, etc.) and
+    // clean it up before the next resume.
+    const carryForApproval = cfg.carryUncommittedChanges
+      ? {
+          files: cfg.carryUncommittedChanges.files,
+          file_count: cfg.carryUncommittedChanges.files.length,
+          commit_subject: cfg.carryUncommittedChanges.messageDefault,
+          note:
+            'These uncommitted files will be committed to the convoy branch as a separate `fix:` commit before Convoy writes its plumbing. Main stays untouched until you approve the merge.',
+        }
+      : undefined;
+
+    const baseNote = existing?.state === 'open'
+      ? `Rehearsal passed. A PR for this plan is already open at ${existing.prUrl}; Convoy will force-push the latest authored files to its branch and reuse it.`
+      : 'Rehearsal passed. Convoy will open a PR with these deployment-surface files only — no application source is touched.';
+    const carryNote = carryForApproval
+      ? ` In addition, Convoy is carrying ${carryForApproval.file_count} operator-authored file${carryForApproval.file_count === 1 ? '' : 's'} from your working tree as a separate \`fix:\` commit on the same branch — no push to ${repo.defaultBranch} is needed for those changes to deploy.`
+      : '';
+
     await this.awaitApproval(ctx, 'open_pr', {
       mode: 'real',
       repo: `${repo.owner}/${repo.repo}`,
       default_branch: repo.defaultBranch,
       branch_to_create: branch,
       reuse_pr_url: existing?.state === 'open' ? existing.prUrl : undefined,
-      note:
-        existing?.state === 'open'
-          ? `Rehearsal passed. A PR for this plan is already open at ${existing.prUrl}; Convoy will force-push the latest authored files to its branch and reuse it.`
-          : 'Rehearsal passed. Convoy will open a PR with these deployment-surface files only — no application source is touched.',
+      note: `${baseNote}${carryNote}`,
       rehearsal: summarizeRehearsalForApproval(ctx.prior['rehearse']),
       files: authoredForApproval,
+      carry: carryForApproval,
     });
 
     let pr;
@@ -541,10 +580,25 @@ export class AuthorStage extends BaseStage {
         cfg.prTitle,
         cfg.prBody,
         existing?.state === 'open' ? existing.prUrl : undefined,
+        cfg.carryUncommittedChanges
+          ? {
+              files: cfg.carryUncommittedChanges.files,
+              message: cfg.carryUncommittedChanges.messageDefault,
+            }
+          : undefined,
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(`PR creation failed: ${message}`);
+    }
+
+    if (cfg.carryUncommittedChanges) {
+      this.emit(ctx, 'progress', {
+        phase: 'pr.carry_committed',
+        files: cfg.carryUncommittedChanges.files,
+        commit_subject: cfg.carryUncommittedChanges.messageDefault,
+        note: 'operator-authored fix committed to convoy branch alongside the deploy plumbing',
+      });
     }
 
     this.emit(ctx, 'progress', {

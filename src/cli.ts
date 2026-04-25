@@ -677,6 +677,14 @@ interface ApplyOpts {
    * the prior attempt that prior stage outputs are no longer trustworthy.
    */
   fresh?: boolean;
+  /**
+   * Default commit subject for the operator-fix commit Convoy carries onto
+   * its plan-keyed branch when the working tree is dirty at apply time. Set
+   * by `runResume` from the prior run's outcomeReason so a fix-and-resume
+   * after a medic-diagnosed breach surfaces the medic's verdict as the
+   * commit subject. Falls back to "fix: changes from operator" otherwise.
+   */
+  carryCommitMessage?: string;
 }
 
 interface PreflightCheck {
@@ -692,6 +700,16 @@ interface PreflightReport {
   realFly: boolean;
   checks: PreflightCheck[];
   hardFailures: string[];
+  /**
+   * Captured at preflight when --real-author is on and the target's working
+   * tree has uncommitted changes. The author stage carries these onto the
+   * convoy/<plan> branch as a separate commit BEFORE writing its plumbing,
+   * so the operator's fix and Convoy's deploy plumbing land in the same PR
+   * — and main stays clean until that PR is merged. The list also feeds
+   * the open_pr approval card so the operator sees what's about to be
+   * committed before they click approve.
+   */
+  carryUncommittedChanges?: { files: string[] };
 }
 
 const MEDIC_MODEL = 'claude-opus-4-7';
@@ -1031,34 +1049,35 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
             detail: `gh authed as ${auth.user ?? 'unknown'} — will open PR on ${repo.owner}/${repo.repo}`,
           });
 
-          // Heads-up before any orchestrator state mutates: if the target has
-          // uncommitted changes (a Claude-driven fix sitting on disk, WIP from
-          // the operator, etc.), Convoy will fail later inside
-          // createPrFromAuthoredFiles AFTER the operator has approved opening
-          // the PR. Surfacing it here prevents that wasted approval pause
-          // and gives the exact remedy.
+          // Dirty tree handling: previously we hard-failed here and told the
+          // operator to commit + push to main. That was wrong for git-deploy
+          // platforms (Vercel, Netlify, Cloud Run) — pushing the fix to main
+          // would trigger a prod deploy *outside Convoy's safety gates*,
+          // defeating the whole point of running through rehearsal first.
           //
-          // We deliberately don't auto-commit. Convoy's principle is "we ship
-          // your code, we don't rewrite it" — and committing on the
-          // developer's behalf is a thumbprint on their git history we
-          // shouldn't make without explicit consent.
+          // The right move is to carry the dirty changes onto Convoy's own
+          // branch as a separate commit, alongside the deploy plumbing. The
+          // operator sees the combined diff in the open_pr approval card and
+          // approves both at once. Main stays untouched until merge — and the
+          // merge IS the safe deploy, because rehearsal already proved the
+          // combined branch.
+          //
+          // This isn't "Convoy rewrites your code" — the developer (or Claude)
+          // wrote the changes, they're already on disk, and Convoy just
+          // transcribes them into its branch with the operator's explicit
+          // approval-gate consent.
           const dirty = await detectUncommittedChanges(plan.target.localPath);
           if (dirty.dirty) {
-            const fileList = dirty.files.slice(0, 6).map((f) => `    ${f}`).join('\n');
-            const moreSuffix = dirty.files.length > 6 ? `\n    … and ${dirty.files.length - 6} more` : '';
-            const branchHint = repo.defaultBranch;
-            report.hardFailures.push(
-              `real author: target has ${dirty.files.length} uncommitted change${dirty.files.length === 1 ? '' : 's'}.\n` +
-                `  Convoy won't commit them for you — that would put a thumbprint on your git history.\n` +
-                `  Files:\n${fileList}${moreSuffix}\n` +
-                `  Remedy: cd ${plan.target.localPath} && git add -A && git commit -m '<your message>' && git push origin ${branchHint}\n` +
-                `  Then re-run \`convoy resume\`.`,
-            );
+            report.carryUncommittedChanges = { files: dirty.files };
+            const previewFiles = dirty.files.slice(0, 4).join(', ');
+            const moreSuffix = dirty.files.length > 4 ? `, … (+${dirty.files.length - 4} more)` : '';
             report.checks.push({
               name: 'real author',
-              ok: false,
-              detail: `target has ${dirty.files.length} uncommitted file${dirty.files.length === 1 ? '' : 's'}`,
-              remedy: `commit + push your changes, then re-run \`convoy resume\``,
+              ok: true,
+              detail:
+                `${dirty.files.length} uncommitted file${dirty.files.length === 1 ? '' : 's'} ` +
+                `(${previewFiles}${moreSuffix}) — will be carried onto convoy/${plan.id.slice(0, 8)} ` +
+                `as a separate commit, surfaced in the open_pr approval card. Main stays untouched until merge.`,
             });
           }
         }
@@ -1337,6 +1356,19 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
       mergeOnApproval: opts.autoMerge !== false,
       mergeMethod: method,
     };
+    if (preflight.carryUncommittedChanges) {
+      const reasonForMessage = (opts.carryCommitMessage ?? '').trim();
+      // Trim long medic narratives to a usable commit subject. Conventional
+      // commit subject limit is ~72 chars; we leave headroom for the
+      // "fix: " prefix and let git/gh truncate displays as needed.
+      const subject = reasonForMessage.length > 0
+        ? `fix: ${reasonForMessage.replace(/\s+/g, ' ').slice(0, 64)}`
+        : 'fix: changes from operator';
+      realAuthor.carryUncommittedChanges = {
+        files: preflight.carryUncommittedChanges.files,
+        messageDefault: subject,
+      };
+    }
     orchestratorOpts.realAuthor = realAuthor;
   }
 
@@ -1897,23 +1929,31 @@ async function runResume(runId: string | undefined, opts: ApplyOpts): Promise<vo
     );
     if (failedStage) {
       process.stdout.write(
-        `  ${pc.red('✗')} ${pc.dim('failed at:')} ${failedStage} ${pc.dim('— replaying from here')}\n\n`,
+        `  ${pc.red('✗')} ${pc.dim('failed at:')} ${failedStage} ${pc.dim('— replaying from here')}\n`,
       );
     } else if (firstReplayStage) {
       process.stdout.write(
-        `  ${pc.cyan('▸')} ${pc.dim('replaying from:')} ${firstReplayStage}\n\n`,
+        `  ${pc.cyan('▸')} ${pc.dim('replaying from:')} ${firstReplayStage}\n`,
       );
-    } else {
-      process.stdout.write('\n');
     }
-  } else {
-    process.stdout.write('\n');
   }
 
-  // Default: continue the same run row. --fresh opts out.
+  // Heads-up about the carry path so the operator knows their dirty tree
+  // won't trip preflight. The authoritative detection runs inside runApply.
+  process.stdout.write(
+    `  ${pc.dim('Uncommitted changes in your target (if any) will be carried onto convoy/<plan> as a separate fix commit and shown in the open_pr approval card. Main stays clean until you approve the merge.')}\n\n`,
+  );
+
+  // Default: continue the same run row. --fresh opts out. Always thread the
+  // prior outcomeReason as the commit-subject default — when the working tree
+  // is dirty (the common case after a fix-and-resume), AuthorStage will
+  // commit those changes onto convoy's branch with this as the subject. Empty
+  // string when the prior run had no recorded reason; runApply falls back to
+  // a generic message in that case.
+  const carryMessage = priorReason ?? '';
   const resumeOpts: ApplyOpts = fresh
-    ? opts
-    : { ...opts, continueRunId: runIdFull };
+    ? { ...opts, carryCommitMessage: carryMessage }
+    : { ...opts, continueRunId: runIdFull, carryCommitMessage: carryMessage };
 
   await runApply(planId, resumeOpts);
 }

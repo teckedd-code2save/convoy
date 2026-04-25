@@ -72,12 +72,13 @@ Want to watch the medic agent work without a real breach? Inject a scripted fail
 npm run convoy -- apply <plan-id> --demo -y --inject-failure=rehearse
 ```
 
-When a real rehearsal breaches and medic classifies it `owned=developer`, the run pauses with status `awaiting_fix`. Push your fix and resume:
+When a real rehearsal breaches and medic classifies it `owned=developer`, the run pauses with status `awaiting_fix`. Edit the code (or let Claude Code do it) and run:
 
 ```bash
-git commit -am "fix: ..."
-npm run convoy -- resume          # re-applies the most recent paused run's plan
+npm run convoy -- resume          # continues the same run; carries dirty tree onto convoy/<plan>
 ```
+
+You **don't have to push your fix to main first**. Convoy detects the uncommitted changes, carries them onto the plan-keyed `convoy/<plan>` branch as a separate `fix:` commit (the medic's diagnosis becomes the commit subject), and surfaces the combined diff in the `open_pr` approval card. The fix and the deploy plumbing land in the same PR — main only sees them at merge time, after rehearsal proved they work. This is what makes Convoy safe on git-deploy platforms (Vercel, Netlify, Cloud Run) where pushing to main would otherwise trigger a prod build outside Convoy's gates.
 
 ---
 
@@ -253,7 +254,8 @@ All the mechanics are real by default. Pass `--demo` to short-circuit to a scrip
 | **Rehearsal env is scrubbed by default** — PATH/HOME/NODE_ENV + explicit `--env` only | **Real** | `--trust-repo` to inherit ambient env on your own checkouts |
 | **Readiness probe accepts any HTTP response** | **Real** | a 404 on `/health` no longer gates rehearsal; the synthetic load probe measures real health |
 | **Medic as a Claude agent loop** — 4 scoped tools, path-safety, live streamed | **Real** | `read_log_tail`, `read_file`, `grep_repo`, `finalize_diagnosis`; up to 6 turns |
-| **Fix-and-resume loop** — `convoy resume [runId]` re-applies a paused/failed run's plan after a code fix | **Real** | refuses succeeded/running runs; creates a new run row, preserves history |
+| **Fix-and-resume loop** — `convoy resume [runId]` continues a paused/failed run after a code fix | **Real** | refuses succeeded/running runs; default reuses the same run row and skips already-finished stages, `--fresh` opts out |
+| **Carries operator-authored fixes onto the convoy branch** — no push to main needed for the fix to deploy | **Real** | detected at preflight, surfaced in the `open_pr` approval card, stash/pop to safely move the dirty tree onto `convoy/<plan>`; medic root cause becomes the `fix:` commit subject |
 | **Fly.io** — canary deploy via `flyctl`, observe loop, auto-rollback | **Real** | proven end-to-end in [`docs/rollback-proof.md`](./docs/rollback-proof.md) |
 | **Vercel** — preview deploy + promote via `vercel` CLI | **Real** | |
 | Vercel alias-based rollback on production domain | Best-effort, v2 | current path aliases prior preview URL; reliable production-alias rollback is v2 |

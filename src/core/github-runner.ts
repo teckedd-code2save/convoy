@@ -202,7 +202,23 @@ export async function findExistingConvoyPr(
 }
 
 /**
- * Create a branch, write the authored files, commit, push, and open a PR.
+ * Operator-authored uncommitted changes that AuthorStage carries onto its
+ * branch as a `fix:`-prefixed commit before writing Convoy's plumbing. See
+ * the `RealAuthorOpt.carryUncommittedChanges` doc in stages.ts for the
+ * "why" (git-deploy platforms must not see the fix on main before Convoy's
+ * gates have run).
+ */
+export interface CarryUncommittedInput {
+  /** File paths from `git status --porcelain`, used for logging only. */
+  files: string[];
+  /** Commit subject. Caller pre-formats this (e.g. "fix: <medic root cause>"). */
+  message: string;
+}
+
+/**
+ * Create a branch, optionally carry the operator's uncommitted fix as a
+ * separate commit, write Convoy's plumbing as a second commit, push, and
+ * open a PR.
  *
  * Idempotent across resumes: callers pass a stable plan-keyed branch name
  * (see `planBranchName`). When the branch already exists locally or on
@@ -210,7 +226,18 @@ export async function findExistingConvoyPr(
  * content. The caller is expected to have already probed for an existing
  * open/merged PR via `findExistingConvoyPr` and passed `existingPrUrl` if
  * a same-branch PR is open — in that case we skip `gh pr create` and
- * return the existing URL with the new commit pushed to its head.
+ * return the existing URL with the new commits pushed to its head.
+ *
+ * Carry flow when `carry` is provided:
+ *   1. git stash push -u (preserve the dirty tree across the checkout)
+ *   2. git fetch + checkout -B <branch> from origin/<default>
+ *   3. git stash pop (restore dirty tree onto the new branch)
+ *   4. git add -A; git commit -m "<carry.message>" (the operator's fix)
+ *   5. write Convoy plumbing files
+ *   6. git add -f -- <plumbing>; git commit -m "<title>"
+ *   7. git push --force-with-lease
+ *
+ * Without carry it's the original two-step (checkout, write, commit, push).
  *
  * Throws on any step's failure with context the caller can surface.
  */
@@ -221,12 +248,10 @@ export async function createPrFromAuthoredFiles(
   title: string,
   body: string,
   existingPrUrl?: string,
+  carry?: CarryUncommittedInput,
 ): Promise<PrResult> {
   if (files.length === 0) {
     throw new Error('createPrFromAuthoredFiles called with no files');
-  }
-  if (await hasUncommittedChanges(ctx)) {
-    throw new Error('target repo has uncommitted changes; commit or stash before running real-author');
   }
 
   // Containment check — reject any authored path that would write outside the
@@ -239,24 +264,85 @@ export async function createPrFromAuthoredFiles(
     assertPathInsideRepo(repoRoot, file.path);
   }
 
-  // Make sure we're branching from the latest default branch. -B resets the
-  // branch to that commit, which is what we want for re-attempts: the prior
-  // run's commit on this branch (if any) is overwritten with fresh content
-  // built from the plan's authored files. Force-push later cements that.
+  // Step 1 — stash if dirty. We stash BEFORE the checkout so the operator's
+  // changes survive being switched onto a fresh branch. -u includes untracked
+  // files (.vscode/, .env*.local, etc.) that the operator might have on disk.
+  // Without --keep-index since there's no staged-vs-unstaged distinction we
+  // care to preserve: the dirty content goes into one stash entry and comes
+  // back as one diff.
+  const stashed = carry !== undefined && (await hasUncommittedChanges(ctx));
+  if (carry !== undefined && !stashed) {
+    // Operator told us to carry, but the working tree is clean by the time
+    // we got here — likely a race with an editor or a second `convoy resume`
+    // that already committed. Carrying nothing is the right answer; fall
+    // through to the no-carry branch.
+  }
+  if (stashed) {
+    await sh('git', ['stash', 'push', '-u', '-m', 'convoy: pre-author carry'], { cwd: ctx.path });
+  } else if (await hasUncommittedChanges(ctx)) {
+    // No carry instructed but tree is dirty — preserve the existing safety
+    // contract. The caller (preflight) should have caught this; reaching
+    // here means something slipped past, and we'd rather fail loud than
+    // silently lose the operator's WIP.
+    throw new Error(
+      'target repo has uncommitted changes and no carry was instructed; commit or stash before running real-author',
+    );
+  }
+
+  // Step 2 — make sure we're branching from the latest default branch. -B
+  // resets the branch to that commit, which is what we want for re-attempts:
+  // the prior run's commits on this branch (if any) are overwritten with
+  // fresh content built from the plan's authored files. Force-push later
+  // cements that.
   await sh('git', ['fetch', 'origin', ctx.defaultBranch], { cwd: ctx.path });
   await sh('git', ['checkout', '-B', branch, `origin/${ctx.defaultBranch}`], { cwd: ctx.path });
 
-  // Write each authored file to disk.
+  // Step 3 — pop the stash if we created one. This puts the operator's
+  // uncommitted changes back into the working tree, now on convoy's branch.
+  // If the dirty file paths overlap with files Convoy is about to write,
+  // we let the operator's content win in the carry commit; Convoy's commit
+  // (Step 6) re-overwrites those paths with the plan's authored content.
+  if (stashed) {
+    try {
+      await sh('git', ['stash', 'pop'], { cwd: ctx.path });
+    } catch (err) {
+      // Stash pop conflicts mean the operator's dirty content collides with
+      // origin/<default>. Surface clearly — Convoy can't auto-resolve, and
+      // proceeding would produce an inconsistent commit.
+      throw new Error(
+        `stash pop failed when carrying uncommitted changes onto ${branch}: ${err instanceof Error ? err.message : String(err)}. ` +
+          `The operator's changes may conflict with origin/${ctx.defaultBranch}. ` +
+          `Resolve manually: cd ${ctx.path} && git stash pop, then re-run \`convoy resume\`.`,
+      );
+    }
+  }
+
+  // Step 4 — carry the operator's fix as a separate commit. -A picks up
+  // tracked-modified, untracked-not-ignored, and deletions. Empty diff
+  // (e.g. all dirty files were gitignored) → silently skip the commit so
+  // the PR doesn't get an empty `fix:` entry.
+  if (carry !== undefined && stashed) {
+    await sh('git', ['add', '-A'], { cwd: ctx.path });
+    const staged = await sh('git', ['diff', '--cached', '--name-only'], { cwd: ctx.path, allowFailure: true });
+    if (staged.code === 0 && staged.stdout.trim().length > 0) {
+      await sh('git', ['commit', '-m', carry.message], { cwd: ctx.path });
+    }
+  }
+
+  // Step 5 — write each Convoy-authored file to disk. These overwrite
+  // anything the carry commit might have placed at the same path (e.g. if
+  // the operator edited a Convoy-owned file by hand).
   for (const file of files) {
     const abs = resolve(repoRoot, file.path);
     mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, file.contentPreview, 'utf8');
   }
 
-  // Stage, commit, push. Force-add: Convoy owns this list (Dockerfile, platform manifest,
-  // .env.schema, .convoy/*) and many Node templates gitignore .env* broadly, which would
-  // silently drop .env.schema without -f. --force-with-lease on push: rewrite the prior
-  // attempt's branch head safely (refuses if someone else pushed concurrently).
+  // Step 6 — stage, commit, push. Force-add: Convoy owns this list
+  // (Dockerfile, platform manifest, .env.schema, .convoy/*) and many Node
+  // templates gitignore .env* broadly, which would silently drop .env.schema
+  // without -f. --force-with-lease on push: rewrite the prior attempt's
+  // branch head safely (refuses if someone else pushed concurrently).
   await sh('git', ['add', '-f', '--', ...files.map((f) => f.path)], { cwd: ctx.path });
   await sh('git', ['commit', '-m', title], { cwd: ctx.path });
   await sh('git', ['push', '--force-with-lease', '-u', 'origin', branch], { cwd: ctx.path });
