@@ -16,6 +16,13 @@ Built for the *Built with Opus 4.7* Claude Code hackathon (April 21–26, 2026).
 
 This is the part we think is new.
 
+**At a glance:**
+
+- **What it is:** an Opus 4.7 tool-use loop with four scoped tools (`read_log_tail`, `read_file`, `grep_repo`, `finalize_diagnosis`). Up to six turns. Not a one-shot enrichment call — the agent decides what to read, forms hypotheses, verifies them, and stops on its own.
+- **When it runs:** any rehearse, canary, or observe breach activates it as a sidecar. The pipeline pauses while it investigates; you watch every tool call stream live in the CLI and the web viewer.
+- **What it produces:** a structured diagnosis card — `rootCause`, `classification` (code / config / infra), `confidence`, `owned` (developer / convoy), and a plain-language fix.
+- **What it never does:** patch your code. When `owned=developer` the run pauses with status `awaiting_fix`; you push a commit and run `convoy resume`. Convoy will not retry against code it doesn't own.
+
 When rehearsal breaches tolerance, Convoy hands the failure context to Opus 4.7 along with four tools scoped to the target repo. The agent picks which tools to call, in what order, and decides on its own when it has enough evidence to finalize. Path-traversal is refused at the tool boundary — the agent literally cannot read outside the repo root.
 
 ```
@@ -59,10 +66,17 @@ npm run convoy -- apply <plan-id> --open
 
 By default Convoy **pauses at every approval gate** and you approve from the web UI (the URL is printed when the run starts; it's also what `--open` launches). Pass `--auto-approve` or `-y` for unattended runs.
 
-Want to watch the medic agent work without a real breach? Inject a scripted failure — the tool loop runs against the demo fixture:
+Want to watch the medic agent work without a real breach? Inject a scripted failure — the tool loop runs against the demo fixture, and the web viewer renders the medic spotlight in real time:
 
 ```bash
 npm run convoy -- apply <plan-id> --demo -y --inject-failure=rehearse
+```
+
+When a real rehearsal breaches and medic classifies it `owned=developer`, the run pauses with status `awaiting_fix`. Push your fix and resume:
+
+```bash
+git commit -am "fix: ..."
+npm run convoy -- resume          # re-applies the most recent paused run's plan
 ```
 
 ---
@@ -82,21 +96,23 @@ npm run convoy -- apply <plan-id> --demo -y --inject-failure=rehearse
 ## The pipeline
 
 ```
-scan → pick → author → rehearse → canary → promote → observe
-                        │           │         │         │
-                        └─ medic ───┴─ rollback ────────┘
+scan → pick → rehearse → author → canary → promote → observe
+              │                     │         │         │
+              └─ medic ─────────────┴─ rollback ────────┘
 ```
+
+**Rehearse runs before author by design.** No PR opens and no repo state mutates until Convoy has proof the service boots and responds healthy. The operator approves opening the PR with rehearsal evidence on-screen, then approves merging it after reviewing the diff on GitHub. Previously author ran first; a downstream rehearsal failure could leave the repo merged-but-undeployed. We fixed that.
 
 | Stage | Responsibility |
 |---|---|
 | **scan** | Live `scanRepository()` on the target. Ecosystem, framework, data layer, topology, existing platform hints, package manager, build/start commands, health path. 12 ecosystems; monorepo-aware. |
 | **pick** | Live `pickPlatform()` scores all four supported platforms (Fly.io, Railway, Vercel, Cloud Run) against the scan evidence. Respects `--platform=X` and existing platform config (e.g. a committed `fly.toml`). |
-| **author** | Drafts only the files Convoy owns — Dockerfile (non-Vercel), platform manifest, `.env.schema`, CI workflow, provenance record. Opus-authored content when a key is set; ecosystem templates otherwise. |
-| **rehearse** | Spawns the target subprocess in an env-scrubbed shell. Real build, real boot, real health probe, real synthetic load, real log capture. Feeds the medic on breach. |
+| **rehearse** | Spawns the target subprocess in an env-scrubbed shell. Real install, real build, real boot. The readiness probe accepts any HTTP response — a 404 on `/health` means the process is up; the synthetic load probe that follows is what actually measures health. Real log capture; feeds the medic on breach. |
+| **author** | Pauses for `open_pr` approval with rehearsal evidence on-screen. Then drafts only the files Convoy owns — Dockerfile (non-Vercel), platform manifest, `.env.schema`, CI workflow, provenance record. Opus-authored content when a key is set; ecosystem templates otherwise. Containment-checked: any path outside the repo root is rejected at the filesystem boundary. |
 | **canary** | Fly's health-gated canary strategy (one machine → rest) via `flyctl`. Halt on error-rate / p99 threshold breach. |
 | **promote** | Bake window between deploy and promote. |
 | **observe** | Post-deploy watch window. SLO-healthy = release stays. Breach = auto-rollback (Fly). |
-| **medic** | *Sidecar to any breach.* Claude agent loop with four scoped tools. Emits a structured diagnosis card; for `owned=developer`, pauses the run for you to push a fix. |
+| **medic** | *Sidecar to any breach.* Claude agent loop with four scoped tools. Emits a structured diagnosis card; for `owned=developer`, pauses the run for you to push a fix. See below. |
 
 ---
 
@@ -106,8 +122,9 @@ The CLI and the web viewer share one SQLite state file. That means:
 
 - **Every plan save prints its web URL.** Click it — you see the plan in the viewer without copy-pasting an ID.
 - **Every `apply` prints the run URL as soon as the run is created.** The agent and you are looking at the same page; approvals you click in the UI unpause the orchestrator within ~400ms.
-- **Every medic tool call streams as a run event.** The web UI renders them inline so you can replay the agent's investigation.
-- **`--open`** on `plan --save` or `apply` auto-launches your default browser at the relevant URL.
+- **Every medic tool call streams as a run event.** The web UI renders them inline so you can replay the agent's investigation. The run page has a dedicated **Medic spotlight** — a magenta-glow card that animates while medic is investigating, so a single screenshot makes it obvious the Claude-driven medic is in the loop.
+- **The CLI is unmistakable in a Claude Code transcript.** Every Convoy run opens with a unicode-bordered banner and prefixes every line with a dim cyan rule, so when Convoy output mixes with other tools you can scan back and tell at a glance which block was Convoy.
+- **`--open`** on `plan --save` or `apply` auto-launches your default browser at the relevant URL. `convoy status` auto-spawns the web viewer if it's down so the timeline link the operator clicks is actually live.
 
 Override the base URL with `CONVOY_WEB_URL` if you're tunneling or remoting. The viewer runs on port 3737 by default.
 
@@ -169,14 +186,22 @@ convoy apply <plan-id> --demo                     # scripted, needs no creds
 convoy apply <plan-id> --no-real-rehearsal        # stub just the rehearsal
 convoy apply <plan-id> --no-real-author           # stub just the PR
 
+# Resuming after a code fix
+convoy resume                          # re-apply the most recent paused/failed run
+convoy resume <run-id>                 # re-apply a specific run's plan
+convoy resume --probe-path=/orders     # accepts the same flags as `apply`
+
 # End-to-end
 convoy ship <path-or-url>              # plan + save + apply in one shot
 convoy ship ./demo-app --auto-approve  # full real: PR, rehearse, deploy
-convoy status [run-id]                 # most recent or specific run
+convoy status [run-id]                 # most recent or specific run; auto-spawns the web viewer
+                                       # and prints the live timeline URL
 
 # Reserved
 convoy rollback <service>              # not yet implemented
 ```
+
+`convoy resume` is the answer to "I fixed the code, now what?" It looks up the run, refuses to resume `running` / `pending` / `succeeded` runs, prints the prior failure reason for context, and re-applies the saved plan. A new run row is created — the previous one is preserved as history. Stages aren't idempotent across partial state, so resume always replays from `scan`.
 
 Environment:
 - `ANTHROPIC_API_KEY` — enables Opus-authored file content, ship narrative, and the medic's agent loop. Without it, enricher and medic fall back to deterministic output.
@@ -226,7 +251,9 @@ All the mechanics are real by default. Pass `--demo` to short-circuit to a scrip
 | **Auto-merge via `gh pr merge --squash`** | **Real** | default on for `ship`; disable with `--no-auto-merge` |
 | **Local rehearsal** — env-scrubbed subprocess, real build, probe, metrics, log capture | **Real** | monorepo-aware: install at repo root, build/start in workspace subdir |
 | **Rehearsal env is scrubbed by default** — PATH/HOME/NODE_ENV + explicit `--env` only | **Real** | `--trust-repo` to inherit ambient env on your own checkouts |
+| **Readiness probe accepts any HTTP response** | **Real** | a 404 on `/health` no longer gates rehearsal; the synthetic load probe measures real health |
 | **Medic as a Claude agent loop** — 4 scoped tools, path-safety, live streamed | **Real** | `read_log_tail`, `read_file`, `grep_repo`, `finalize_diagnosis`; up to 6 turns |
+| **Fix-and-resume loop** — `convoy resume [runId]` re-applies a paused/failed run's plan after a code fix | **Real** | refuses succeeded/running runs; creates a new run row, preserves history |
 | **Fly.io** — canary deploy via `flyctl`, observe loop, auto-rollback | **Real** | proven end-to-end in [`docs/rollback-proof.md`](./docs/rollback-proof.md) |
 | **Vercel** — preview deploy + promote via `vercel` CLI | **Real** | |
 | Vercel alias-based rollback on production domain | Best-effort, v2 | current path aliases prior preview URL; reliable production-alias rollback is v2 |
