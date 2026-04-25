@@ -1957,6 +1957,10 @@ async function runResume(runId: string | undefined, opts: ApplyOpts): Promise<vo
 interface ReplayOpts {
   outDir?: string;
   noAnsi?: boolean;
+  animate?: boolean;
+  speed?: number;
+  screenshots?: boolean;
+  gif?: boolean;
 }
 
 /**
@@ -2046,6 +2050,13 @@ async function runReplay(runId: string | undefined, opts: ReplayOpts): Promise<v
     const storyPath = resolve(outDir, 'story.md');
     writeFileSync(storyPath, generateStoryMarkdown(run, events, elapsedMs), 'utf8');
 
+    // ---- story.html ----
+    // Self-contained dark-themed page. Open in a browser, screenshot for
+    // README hero / social / video B-roll. No external deps; survives
+    // offline review and PR description embedding.
+    const storyHtmlPath = resolve(outDir, 'story.html');
+    writeFileSync(storyHtmlPath, generateStoryHtml(run, events, elapsedMs), 'utf8');
+
     // ---- events.json ----
     // Raw events for archival; useful when iterating on story.md format
     // without re-running.
@@ -2076,11 +2087,277 @@ async function runReplay(runId: string | undefined, opts: ReplayOpts): Promise<v
     process.stdout.write(`${pc.green('✓')} Replay artifacts for run ${pc.bold(run.id.slice(0, 8))}:\n`);
     process.stdout.write(`  ${pc.dim('terminal:')} ${terminalPath}\n`);
     process.stdout.write(`  ${pc.dim('story:')}    ${storyPath}\n`);
+    process.stdout.write(`  ${pc.dim('html:')}     ${storyHtmlPath}\n`);
     process.stdout.write(`  ${pc.dim('events:')}   ${eventsPath}\n`);
     process.stdout.write(`\n  ${pc.dim('Preview the terminal replay:')} ${pc.bold(`cat ${terminalPath}`)}\n`);
+    process.stdout.write(`  ${pc.dim('Open the HTML page:')} ${pc.bold(`open ${storyHtmlPath}`)}\n`);
+
+    if (opts.screenshots) {
+      await captureScreenshots(run, outDir);
+    }
+
+    if (opts.gif) {
+      await assembleGif(outDir);
+    }
+
+    if (opts.animate) {
+      await replayAnimated(run, events, opts);
+    }
   } finally {
     store.close();
   }
+}
+
+/**
+ * Drive headless Chromium against the local web viewer to capture the
+ * run page as PNGs. Playwright is dynamically imported and treated as
+ * optional — operators without it installed get a friendly install hint
+ * instead of a crash, so `convoy replay` stays useful in its
+ * text-artifacts-only mode.
+ */
+async function captureScreenshots(run: Run, outDir: string): Promise<void> {
+  type ChromiumLauncher = {
+    launch: (options?: { headless?: boolean }) => Promise<{
+      newPage: (options?: { viewport?: { width: number; height: number } }) => Promise<{
+        goto: (url: string, options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle'; timeout?: number }) => Promise<unknown>;
+        setViewportSize: (size: { width: number; height: number }) => Promise<void>;
+        screenshot: (options: { path: string; fullPage?: boolean; type?: 'png' | 'jpeg' }) => Promise<unknown>;
+        waitForTimeout: (ms: number) => Promise<void>;
+        close: () => Promise<void>;
+      }>;
+      close: () => Promise<void>;
+    }>;
+  };
+
+  let chromium: ChromiumLauncher;
+  try {
+    const mod = (await import('playwright' as string)) as { chromium: ChromiumLauncher };
+    chromium = mod.chromium;
+  } catch {
+    process.stdout.write(
+      `\n${pc.yellow('!')} ${pc.dim('--screenshots: Playwright is not installed. Install with:')}\n`,
+    );
+    process.stdout.write(`  ${pc.bold('npm install -D playwright && npx playwright install chromium')}\n`);
+    process.stdout.write(`  ${pc.dim('Then re-run with --screenshots. The other replay artifacts already wrote.')}\n`);
+    return;
+  }
+
+  const viewer = await ensureWebViewerRunning(convoyWebDir());
+  if (!viewer.up) {
+    process.stdout.write(
+      `\n${pc.yellow('!')} ${pc.dim(`--screenshots: web viewer not reachable${viewer.note ? `: ${viewer.note}` : ''}`)}\n`,
+    );
+    process.stdout.write(`  ${pc.dim('Start it manually:')} ${pc.bold('cd web && npm run dev')}\n`);
+    return;
+  }
+
+  const screenshotDir = resolve(outDir, 'screenshots');
+  mkdirSync(screenshotDir, { recursive: true });
+
+  process.stdout.write(`\n${pc.dim('--screenshots: launching headless Chromium...')}\n`);
+  const browser = await chromium.launch({ headless: true });
+  try {
+    // Three framed 1280×800 captures at different scroll positions: top
+    // (banner + progress bar + pipeline), middle (medic spotlight if
+    // present, stage table), and bottom (outcome). All same dimensions
+    // so the --gif step can concat them without letterbox math. Plus
+    // one tall fullPage capture for the README hero / paste-into-PR use.
+    const page = (await browser.newPage({ viewport: { width: 1280, height: 800 } })) as unknown as {
+      goto: (url: string, options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle'; timeout?: number }) => Promise<unknown>;
+      setViewportSize: (size: { width: number; height: number }) => Promise<void>;
+      screenshot: (options: { path: string; fullPage?: boolean; type?: 'png' | 'jpeg' }) => Promise<unknown>;
+      waitForTimeout: (ms: number) => Promise<void>;
+      close: () => Promise<void>;
+      evaluate: (fn: string | ((...args: unknown[]) => unknown)) => Promise<unknown>;
+    };
+    const url = webUrl(`/runs/${run.id}`);
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 15000 });
+    // Settle the medic glow + progress bar animations before capturing.
+    await page.waitForTimeout(800);
+
+    const topPath = resolve(screenshotDir, 'run-page-top.png');
+    await page.screenshot({ path: topPath, type: 'png' });
+
+    // Mid-scroll: aim at the medic spotlight when present, else the stages
+    // table. We can't measure DOM positions cleanly without injecting
+    // scripts, so a fixed offset that lands in the right region for our
+    // current layout is good enough — the page is dense, and 600px down
+    // hits medic on runs that have it and stages otherwise.
+    await page.evaluate('window.scrollTo({top: 600, behavior: "instant"})');
+    await page.waitForTimeout(300);
+    const midPath = resolve(screenshotDir, 'run-page-mid.png');
+    await page.screenshot({ path: midPath, type: 'png' });
+
+    await page.evaluate('window.scrollTo({top: 1300, behavior: "instant"})');
+    await page.waitForTimeout(300);
+    const bottomPath = resolve(screenshotDir, 'run-page-bottom.png');
+    await page.screenshot({ path: bottomPath, type: 'png' });
+
+    // Tall full-page hero capture for static use (README, PR descriptions).
+    await page.evaluate('window.scrollTo({top: 0, behavior: "instant"})');
+    await page.waitForTimeout(200);
+    const heroPath = resolve(screenshotDir, 'run-page-hero.png');
+    await page.screenshot({ path: heroPath, type: 'png', fullPage: true });
+
+    await page.close();
+    process.stdout.write(`  ${pc.green('✓')} ${pc.dim('top frame (1280×800):')}    ${topPath}\n`);
+    process.stdout.write(`  ${pc.green('✓')} ${pc.dim('mid frame (1280×800):')}    ${midPath}\n`);
+    process.stdout.write(`  ${pc.green('✓')} ${pc.dim('bottom frame (1280×800):')} ${bottomPath}\n`);
+    process.stdout.write(`  ${pc.green('✓')} ${pc.dim('full page hero:')}          ${heroPath}\n`);
+  } finally {
+    await browser.close();
+  }
+}
+
+/**
+ * Stitch the captured screenshots into a short looping GIF using ffmpeg.
+ * Each PNG gets ~1.5s on screen; the loop lets a single GIF substitute
+ * for a hero image + alt crops in a social card.
+ *
+ * Treats ffmpeg as optional (dynamic check for the binary on PATH).
+ * Without --screenshots there's nothing to stitch — runs the screenshot
+ * step first if needed via re-invocation hint.
+ */
+async function assembleGif(outDir: string): Promise<void> {
+  const screenshotDir = resolve(outDir, 'screenshots');
+  if (!existsSync(screenshotDir)) {
+    process.stdout.write(
+      `\n${pc.yellow('!')} ${pc.dim('--gif: no screenshots/ directory. Run with --screenshots first (or pass both flags together).')}\n`,
+    );
+    return;
+  }
+
+  const ffmpegOk = await new Promise<boolean>((resolveCheck) => {
+    void (async () => {
+      try {
+        const { spawn } = await import('node:child_process');
+        const p = spawn('ffmpeg', ['-version'], { stdio: 'ignore' });
+        p.on('error', () => resolveCheck(false));
+        p.on('exit', (code) => resolveCheck(code === 0));
+      } catch {
+        resolveCheck(false);
+      }
+    })();
+  });
+  if (!ffmpegOk) {
+    process.stdout.write(
+      `\n${pc.yellow('!')} ${pc.dim('--gif: ffmpeg not found on PATH. Install with:')} ${pc.bold('brew install ffmpeg')} ${pc.dim('(or your platform equivalent), then re-run.')}\n`,
+    );
+    return;
+  }
+
+  const gifPath = resolve(outDir, 'replay.gif');
+  process.stdout.write(`\n${pc.dim('--gif: stitching screenshots with ffmpeg...')}\n`);
+
+  // Three framed scroll views (top / mid / bottom) all share dimensions by
+  // construction (1280×800 viewport screenshots), so concat works without
+  // the height-mismatch errors a fullPage capture would cause.
+  const inputPattern = resolve(screenshotDir, 'run-page-%s.png');
+  const requiredFrames = ['top', 'mid', 'bottom'].map((s) => inputPattern.replace('%s', s));
+  const missing = requiredFrames.filter((p) => !existsSync(p));
+  if (missing.length > 0) {
+    process.stdout.write(
+      `\n${pc.yellow('!')} ${pc.dim(`--gif: missing screenshot frames (${missing.length} of 3). Re-run \`convoy replay --screenshots\` first.`)}\n`,
+    );
+    return;
+  }
+
+  const result = await new Promise<{ code: number; stderr: string }>((resolveResult) => {
+    void (async () => {
+      const { spawn } = await import('node:child_process');
+      // Two-pass palette workflow inside one ffmpeg invocation: split the
+      // concatenated stream, generate a palette from one branch, paint
+      // gif frames using that palette on the other branch.
+      const args = [
+        '-y',
+        '-loop', '1', '-t', '1.5', '-i', requiredFrames[0]!,
+        '-loop', '1', '-t', '1.5', '-i', requiredFrames[1]!,
+        '-loop', '1', '-t', '1.5', '-i', requiredFrames[2]!,
+        '-filter_complex',
+        '[0:v][1:v][2:v]concat=n=3:v=1:a=0,fps=10[v];' +
+        '[v]split=2[v_pal][v_use];' +
+        '[v_pal]palettegen=stats_mode=full[pal];' +
+        '[v_use][pal]paletteuse=dither=sierra2_4a[out]',
+        '-map', '[out]',
+        gifPath,
+      ];
+      const p = spawn('ffmpeg', args);
+      let stderr = '';
+      p.stderr?.on('data', (c: Buffer) => { stderr += c.toString('utf8'); });
+      p.on('exit', (code) => resolveResult({ code: code ?? -1, stderr }));
+      p.on('error', () => resolveResult({ code: -1, stderr: 'spawn error' }));
+    })();
+  });
+
+  if (result.code === 0) {
+    process.stdout.write(`  ${pc.green('✓')} ${pc.dim('gif:')} ${gifPath}\n`);
+  } else {
+    process.stdout.write(`  ${pc.red('✗')} ${pc.dim('ffmpeg failed:')} ${result.stderr.split('\n').slice(-3).join(' ')}\n`);
+  }
+}
+
+/**
+ * Re-emit events to stdout with their original cadence (delta between
+ * event.createdAt timestamps), so a recorded demo can show "Convoy
+ * replaying its own pipeline." Inter-event pauses are capped at 5s so a
+ * paused-overnight `awaiting_fix → resume` doesn't translate into a
+ * literal overnight wait.
+ *
+ * --speed multiplies the original timing: 1.0 is real-time, 2.0 is 2x
+ * faster, 0.5 is half-speed. Default 1.0.
+ */
+async function replayAnimated(run: Run, events: RunEvent[], opts: ReplayOpts): Promise<void> {
+  const speed = opts.speed && opts.speed > 0 ? opts.speed : 1.0;
+  const MAX_GAP_MS = 5000;
+
+  process.stdout.write(`\n  ${pc.dim('--animate: replaying with original cadence')}${speed !== 1.0 ? pc.dim(` at ${speed}× speed`) : ''}${pc.dim(' (gaps capped at 5s)')}\n\n`);
+
+  const startedAt = new Date(run.startedAt);
+  const completedAt = run.completedAt ? new Date(run.completedAt) : new Date();
+  const elapsedMs = completedAt.getTime() - startedAt.getTime();
+
+  const planShort = run.planId ? run.planId.slice(0, 8) : 'unknown';
+  const platformLabel = run.platform ? ` ${pc.dim('·')} ${pc.bold(run.platform)}` : '';
+  const title = `${pc.bold(pc.cyan('▲ CONVOY'))}  ${pc.dim('·')}  run ${pc.bold(run.id.slice(0, 8))}  ${pc.dim('·')}  plan ${pc.bold(planShort)}${platformLabel}`;
+  const subtitle = `${pc.dim('target:')} ${run.repoUrl}`;
+  process.stdout.write(`\n${convoyBanner(title, subtitle)}\n`);
+  process.stdout.write(`${CONVOY_RULE}${pc.cyan('▶')} ${pc.dim('Watch live:')} ${pc.cyan(webUrl(`/runs/${run.id}`))}\n`);
+
+  let prevTs: number | null = null;
+  for (const event of events) {
+    const ts = new Date(event.createdAt).getTime();
+    if (prevTs !== null) {
+      const rawGap = ts - prevTs;
+      const cappedGap = Math.min(rawGap, MAX_GAP_MS);
+      const sleepMs = Math.max(0, Math.round(cappedGap / speed));
+      if (sleepMs > 0) await sleepMs2(sleepMs);
+    }
+    prevTs = ts;
+    process.stdout.write(formatRunEvent(event));
+  }
+
+  // Final outcome block — same shape attachRenderer prints on run.updated.
+  if (run.status === 'succeeded') {
+    process.stdout.write(`${CONVOY_RULE}\n`);
+    process.stdout.write(`${CONVOY_RULE}${pc.bold(pc.green(SYMBOL.run))} ${pc.bold(pc.green(`Convoy succeeded in ${formatDuration(elapsedMs)}`))}\n`);
+    if (run.liveUrl) process.stdout.write(`${CONVOY_RULE}${pc.dim('Live URL:')} ${pc.cyan(run.liveUrl)}\n`);
+  } else if (run.status === 'awaiting_fix') {
+    process.stdout.write(`${CONVOY_RULE}\n`);
+    process.stdout.write(`${CONVOY_RULE}${pc.bold(pc.yellow(SYMBOL.pause))} ${pc.bold(pc.yellow(`Paused after ${formatDuration(elapsedMs)} — awaiting developer fix`))}\n`);
+    if (run.outcomeReason) process.stdout.write(`${CONVOY_RULE}${pc.dim('Reason:')} ${run.outcomeReason}\n`);
+  } else if (run.status === 'failed' || run.status === 'rolled_back') {
+    process.stdout.write(`${CONVOY_RULE}\n`);
+    const color = run.status === 'rolled_back' ? pc.yellow : pc.red;
+    process.stdout.write(`${CONVOY_RULE}${pc.bold(color(SYMBOL.run))} ${pc.bold(color(`Convoy ${run.status} after ${formatDuration(elapsedMs)}`))}\n`);
+    if (run.outcomeReason) process.stdout.write(`${CONVOY_RULE}${pc.dim('Reason:')} ${run.outcomeReason}\n`);
+  }
+  process.stdout.write(`${convoyClosingRule()}\n`);
+}
+
+// Local alias so the import name doesn't shadow `setTimeout` in callers
+// that expect the standard one. Imported as `setTimeout as sleepMs` at top.
+async function sleepMs2(ms: number): Promise<void> {
+  await sleepMs(ms);
 }
 
 /**
@@ -2218,6 +2495,416 @@ function generateStoryMarkdown(run: Run, events: RunEvent[], elapsedMs: number):
 
 function compactNoAnsi(payload: unknown, limit = 4): string {
   return compact(payload, limit).replace(/\x1b\[[0-9;]*m/g, '');
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * Self-contained dark-themed HTML story page. Inline CSS, no external
+ * dependencies — opens offline, screenshottable for README hero / social
+ * cards, embeddable in PR descriptions.
+ *
+ * The look is intentionally close to the live web viewer (same color
+ * tokens, same medic spotlight magenta, same monospace) so a screenshot
+ * of the story page reads as "Convoy in action" rather than "a generic
+ * PDF report."
+ */
+function generateStoryHtml(run: Run, events: RunEvent[], elapsedMs: number): string {
+  const STAGE_ORDER: StageName[] = ['scan', 'pick', 'rehearse', 'author', 'canary', 'promote', 'observe'];
+  type StageState = 'idle' | 'started' | 'finished' | 'failed' | 'skipped';
+  const lastStateByStage = new Map<StageName, StageState>();
+  const stageStartByStage = new Map<StageName, Date>();
+  const stageEndByStage = new Map<StageName, Date>();
+  const finishPayloadByStage = new Map<StageName, unknown>();
+  const failPayloadByStage = new Map<StageName, unknown>();
+  for (const event of events) {
+    const ts = new Date(event.createdAt);
+    if (event.kind === 'started') {
+      lastStateByStage.set(event.stage, 'started');
+      stageStartByStage.set(event.stage, ts);
+    } else if (event.kind === 'finished') {
+      lastStateByStage.set(event.stage, 'finished');
+      stageEndByStage.set(event.stage, ts);
+      finishPayloadByStage.set(event.stage, event.payload);
+    } else if (event.kind === 'failed') {
+      lastStateByStage.set(event.stage, 'failed');
+      stageEndByStage.set(event.stage, ts);
+      failPayloadByStage.set(event.stage, event.payload);
+    } else if (event.kind === 'skipped') {
+      lastStateByStage.set(event.stage, 'skipped');
+    }
+  }
+
+  const medicEvents = events.filter((e) => {
+    if (e.kind !== 'progress') return false;
+    const p = e.payload as Record<string, unknown> | null | undefined;
+    return p?.['phase'] === 'medic.tool_use';
+  });
+  const diagnosis = events.find((e) => e.kind === 'diagnosis');
+
+  const doneCount = STAGE_ORDER.filter((s) => {
+    const st = lastStateByStage.get(s);
+    return st === 'finished' || st === 'skipped';
+  }).length;
+  const failedStage = STAGE_ORDER.find((s) => lastStateByStage.get(s) === 'failed');
+
+  const statusBadgeColor =
+    run.status === 'succeeded'
+      ? 'var(--success)'
+      : run.status === 'awaiting_fix' || run.status === 'rolled_back'
+        ? 'var(--warn)'
+        : 'var(--danger)';
+  const statusLabel = run.status === 'rolled_back' ? 'rolled back' : run.status.replace('_', ' ');
+
+  const stageRows = STAGE_ORDER.map((stage) => {
+    const state = lastStateByStage.get(stage) ?? 'idle';
+    const start = stageStartByStage.get(stage);
+    const end = stageEndByStage.get(stage);
+    const duration = start && end ? formatDuration(end.getTime() - start.getTime()) : '—';
+    const detail = state === 'finished'
+      ? compactNoAnsi(finishPayloadByStage.get(stage))
+      : state === 'failed'
+        ? compactNoAnsi(failPayloadByStage.get(stage))
+        : state === 'skipped'
+          ? 'replayed from prior attempt'
+          : state === 'idle'
+            ? 'not run'
+            : 'in flight';
+    const icon = state === 'finished' ? '●' : state === 'failed' ? '✗' : state === 'skipped' ? '⤳' : state === 'started' ? '◐' : '○';
+    const colorClass = `stage-${state}`;
+    return `
+      <tr class="${colorClass}">
+        <td class="stage-icon">${icon}</td>
+        <td class="stage-name"><code>${escapeHtml(stage)}</code></td>
+        <td class="stage-state">${escapeHtml(state)}</td>
+        <td class="stage-duration"><code>${escapeHtml(duration)}</code></td>
+        <td class="stage-detail"><code>${escapeHtml(detail)}</code></td>
+      </tr>`;
+  }).join('');
+
+  const medicSection = medicEvents.length > 0 || diagnosis
+    ? `
+      <section class="medic-spotlight">
+        <header class="medic-header">
+          <span class="medic-icon">◇</span>
+          <div>
+            <h2>Medic ${diagnosis ? 'finished investigating' : 'investigated'}</h2>
+            <p class="medic-meta">Claude agent · ${medicEvents.length} tool call${medicEvents.length === 1 ? '' : 's'} · loop in <code>src/core/medic.ts</code></p>
+          </div>
+        </header>
+        ${medicEvents.length > 0
+          ? `
+        <ol class="medic-tools">
+          ${medicEvents.map((e, idx) => {
+            const p = e.payload as Record<string, unknown>;
+            const tool = String(p['tool'] ?? 'tool');
+            const input = p['input'] as Record<string, unknown> | undefined;
+            let hint = '';
+            if (input) {
+              if (typeof input['path'] === 'string') hint = input['path'];
+              else if (typeof input['pattern'] === 'string') hint = `/${input['pattern']}/`;
+              else if (typeof input['n'] === 'number') hint = `n=${input['n']}`;
+            }
+            return `<li><span class="medic-mark">◇</span><span class="medic-idx">${idx + 1}</span><span class="medic-tool">${escapeHtml(tool)}</span><span class="medic-hint">${escapeHtml(hint)}</span></li>`;
+          }).join('')}
+        </ol>`
+          : ''}
+        ${diagnosis
+          ? (() => {
+              const dp = diagnosis.payload as Record<string, unknown>;
+              const rows: string[] = [];
+              if (dp['rootCause']) rows.push(`<dt>Root cause</dt><dd>${escapeHtml(String(dp['rootCause']))}</dd>`);
+              if (dp['classification']) rows.push(`<dt>Classification</dt><dd><code>${escapeHtml(String(dp['classification']))}</code></dd>`);
+              if (dp['confidence']) rows.push(`<dt>Confidence</dt><dd><code>${escapeHtml(String(dp['confidence']))}</code></dd>`);
+              if (dp['owned']) rows.push(`<dt>Owned</dt><dd><code>${escapeHtml(String(dp['owned']))}</code> ${dp['owned'] === 'developer' ? '<span class="muted">(developer fixes; Convoy pauses for resume)</span>' : '<span class="muted">(Convoy iterates on the authored file)</span>'}</dd>`);
+              if (dp['narrative']) rows.push(`<dt>Narrative</dt><dd>${escapeHtml(String(dp['narrative']))}</dd>`);
+              return `<dl class="diagnosis-card">${rows.join('')}</dl>`;
+            })()
+          : ''}
+      </section>`
+    : '';
+
+  const outcomeText = run.status === 'succeeded'
+    ? `Convoy succeeded in <strong>${formatDuration(elapsedMs)}</strong>.${run.liveUrl ? ` Live at <a href="${escapeHtml(run.liveUrl)}">${escapeHtml(run.liveUrl)}</a>.` : ''}`
+    : run.status === 'awaiting_fix'
+      ? `Run paused at <code>awaiting_fix</code> after <strong>${formatDuration(elapsedMs)}</strong>. Medic diagnosed a code-level failure; resume with <code>convoy resume</code> after fixing the code.`
+      : run.status === 'rolled_back'
+        ? `Run <strong>rolled back</strong> after ${formatDuration(elapsedMs)}.${run.outcomeReason ? ` Reason: ${escapeHtml(run.outcomeReason)}.` : ''}`
+        : run.status === 'failed'
+          ? `Run <strong>failed</strong> after ${formatDuration(elapsedMs)}.${run.outcomeReason ? ` Reason: ${escapeHtml(run.outcomeReason)}.` : ''}`
+          : `Run status: <code>${escapeHtml(run.status)}</code> after ${formatDuration(elapsedMs)}.`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Convoy run ${run.id.slice(0, 8)} — ${escapeHtml(statusLabel)}</title>
+<style>
+  :root {
+    --ink: #f4f4f5;
+    --paper: #0a0a0b;
+    --card: #14141a;
+    --card-elev: #1c1c25;
+    --muted: #8a8a99;
+    --rule: #26262f;
+    --accent: #6ea8ff;
+    --accent-glow: #6ea8ff33;
+    --success: #38d399;
+    --warn: #f5a524;
+    --danger: #ef4444;
+    --medic: #c084fc;
+    --medic-glow: #c084fc26;
+  }
+  * { box-sizing: border-box; }
+  html { color-scheme: dark; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(ellipse 80% 50% at 50% -20%, color-mix(in srgb, var(--accent) 8%, transparent), transparent),
+      var(--paper);
+    color: var(--ink);
+    font-family: -apple-system, 'Inter', 'Segoe UI', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.5;
+  }
+  code, pre, .mono {
+    font-family: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 0.92em;
+  }
+  .container { max-width: 920px; margin: 0 auto; padding: 48px 24px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .muted { color: var(--muted); }
+
+  /* Hero */
+  .banner {
+    border: 1px solid var(--rule);
+    border-radius: 14px;
+    padding: 28px 32px;
+    background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 4%, var(--card)) 0%, var(--card) 100%);
+    margin-bottom: 28px;
+  }
+  .banner-tag {
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+  }
+  .banner h1 {
+    font-size: 32px;
+    margin: 0 0 14px;
+    letter-spacing: -0.02em;
+    word-break: break-all;
+  }
+  .banner-meta { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; font-size: 14px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid ${run.status === 'succeeded' ? 'color-mix(in srgb, var(--success) 50%, transparent)' : run.status === 'awaiting_fix' || run.status === 'rolled_back' ? 'color-mix(in srgb, var(--warn) 50%, transparent)' : 'color-mix(in srgb, var(--danger) 50%, transparent)'};
+    background: ${run.status === 'succeeded' ? 'color-mix(in srgb, var(--success) 12%, transparent)' : run.status === 'awaiting_fix' || run.status === 'rolled_back' ? 'color-mix(in srgb, var(--warn) 12%, transparent)' : 'color-mix(in srgb, var(--danger) 12%, transparent)'};
+    color: ${statusBadgeColor};
+    font-weight: 600;
+  }
+  .badge .dot { width: 8px; height: 8px; border-radius: 999px; background: ${statusBadgeColor}; }
+  .meta-divider { color: var(--muted); }
+
+  /* Progress strip */
+  .progress { margin-bottom: 32px; }
+  .progress-meta { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+  .progress-count { font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }
+  .progress-count .slash { color: var(--muted); font-weight: 400; margin: 0 4px; }
+  .progress-label { color: var(--muted); text-transform: uppercase; font-size: 12px; letter-spacing: 0.12em; margin-left: 6px; }
+  .progress-bar {
+    height: 8px;
+    background: color-mix(in srgb, var(--rule) 70%, transparent);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 70%, white));
+    box-shadow: 0 0 16px var(--accent-glow);
+    border-radius: 999px;
+  }
+
+  /* Pipeline pills */
+  .pipeline { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 36px; }
+  .pill {
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 13px;
+    font-weight: 500;
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  .pill code { font-size: 13px; }
+  .pill.finished { border-color: color-mix(in srgb, var(--success) 50%, transparent); color: var(--success); background: color-mix(in srgb, var(--success) 5%, transparent); }
+  .pill.failed { border-color: var(--danger); color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+  .pill.skipped { border-color: color-mix(in srgb, var(--muted) 40%, transparent); color: var(--muted); background: color-mix(in srgb, var(--card) 60%, transparent); opacity: 0.75; }
+  .pill.idle, .pill.started { border-color: var(--rule); color: var(--muted); background: var(--card); }
+  .pipeline .arrow { color: color-mix(in srgb, var(--muted) 40%, transparent); user-select: none; }
+
+  /* Section heading */
+  h2 {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 28px 0 14px;
+  }
+
+  /* Medic spotlight */
+  .medic-spotlight {
+    border: 1px solid color-mix(in srgb, var(--medic) 40%, transparent);
+    border-radius: 14px;
+    padding: 22px 24px;
+    margin-bottom: 28px;
+    background: linear-gradient(135deg, color-mix(in srgb, var(--medic) 10%, transparent) 0%, color-mix(in srgb, var(--medic) 4%, transparent) 50%, transparent 100%);
+    box-shadow: 0 0 18px var(--medic-glow);
+  }
+  .medic-header { display: flex; gap: 14px; align-items: center; }
+  .medic-icon {
+    width: 36px; height: 36px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--medic) 20%, transparent);
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 18px; color: var(--medic);
+  }
+  .medic-header h2 {
+    color: var(--medic);
+    margin: 0;
+    text-transform: none;
+    letter-spacing: -0.01em;
+    font-size: 18px;
+    font-weight: 600;
+  }
+  .medic-meta { color: var(--muted); margin: 2px 0 0; font-size: 13px; }
+  .medic-tools { list-style: none; padding: 0; margin: 18px 0 0; display: flex; flex-direction: column; gap: 6px; }
+  .medic-tools li { display: flex; gap: 8px; align-items: baseline; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; color: var(--muted); }
+  .medic-mark { color: var(--medic); }
+  .medic-idx { color: var(--muted); width: 24px; text-align: right; }
+  .medic-tool { color: var(--ink); font-weight: 600; }
+  .medic-hint { color: var(--muted); }
+  .diagnosis-card {
+    margin: 20px 0 0;
+    border-top: 1px solid color-mix(in srgb, var(--medic) 25%, transparent);
+    padding-top: 18px;
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 8px 18px;
+  }
+  .diagnosis-card dt { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.12em; padding-top: 4px; }
+  .diagnosis-card dd { margin: 0; }
+
+  /* Stage table */
+  .pipeline-table {
+    width: 100%;
+    border-collapse: collapse;
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    overflow: hidden;
+    background: var(--card);
+  }
+  .pipeline-table th { text-align: left; padding: 10px 14px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); background: var(--card-elev); border-bottom: 1px solid var(--rule); }
+  .pipeline-table td { padding: 12px 14px; border-bottom: 1px solid color-mix(in srgb, var(--rule) 60%, transparent); vertical-align: middle; font-size: 14px; }
+  .pipeline-table tr:last-child td { border-bottom: none; }
+  .stage-icon { width: 28px; font-size: 16px; }
+  .stage-name { width: 120px; }
+  .stage-state { width: 110px; color: var(--muted); font-size: 13px; text-transform: capitalize; }
+  .stage-duration { width: 80px; color: var(--muted); }
+  .stage-detail { color: var(--muted); }
+  .stage-detail code { color: var(--ink); }
+  tr.stage-finished .stage-icon { color: var(--success); }
+  tr.stage-failed .stage-icon { color: var(--danger); }
+  tr.stage-skipped .stage-icon { color: var(--muted); }
+  tr.stage-skipped .stage-name code { opacity: 0.7; }
+
+  /* Outcome */
+  .outcome {
+    margin-top: 32px;
+    padding: 24px;
+    border-radius: 12px;
+    border: 1px solid ${run.status === 'succeeded' ? 'color-mix(in srgb, var(--success) 40%, transparent)' : 'color-mix(in srgb, var(--danger) 40%, transparent)'};
+    background: ${run.status === 'succeeded' ? 'color-mix(in srgb, var(--success) 6%, transparent)' : 'color-mix(in srgb, var(--danger) 6%, transparent)'};
+  }
+  .outcome p { margin: 0; font-size: 16px; }
+
+  /* Footer */
+  footer { margin-top: 40px; padding-top: 18px; border-top: 1px solid var(--rule); color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+  <main class="container">
+    <section class="banner">
+      <div class="banner-tag">▲ Convoy · run replay</div>
+      <h1>${escapeHtml(run.repoUrl)}</h1>
+      <div class="banner-meta">
+        <span class="badge"><span class="dot"></span>${escapeHtml(statusLabel)}</span>
+        ${run.platform ? `<span class="muted">platform <code>${escapeHtml(run.platform)}</code></span>` : ''}
+        <span class="meta-divider">·</span>
+        <span class="muted">run <code>${escapeHtml(run.id.slice(0, 8))}</code></span>
+        ${run.planId ? `<span class="meta-divider">·</span><span class="muted">plan <code>${escapeHtml(run.planId.slice(0, 8))}</code></span>` : ''}
+        <span class="meta-divider">·</span>
+        <span class="muted">${formatDuration(elapsedMs)} wall-clock</span>
+      </div>
+    </section>
+
+    <section class="progress">
+      <div class="progress-meta">
+        <div>
+          <span class="progress-count">${doneCount}<span class="slash">/</span>${STAGE_ORDER.length}</span>
+          <span class="progress-label">stages complete</span>
+        </div>
+        ${failedStage ? `<div style="color: var(--danger); font-size: 13px;">failed at <code>${escapeHtml(failedStage)}</code></div>` : ''}
+      </div>
+      <div class="progress-bar"><div class="progress-fill" style="width: ${Math.round((doneCount / STAGE_ORDER.length) * 100)}%"></div></div>
+    </section>
+
+    <section>
+      <h2>Pipeline</h2>
+      <div class="pipeline">
+        ${STAGE_ORDER.map((stage, idx) => {
+          const state = lastStateByStage.get(stage) ?? 'idle';
+          const icon = state === 'finished' ? '●' : state === 'failed' ? '✗' : state === 'skipped' ? '⤳' : state === 'started' ? '◐' : '○';
+          const arrow = idx < STAGE_ORDER.length - 1 ? '<span class="arrow">→</span>' : '';
+          return `<span class="pill ${state}"><span>${icon}</span><code>${escapeHtml(stage)}</code></span>${arrow}`;
+        }).join('')}
+      </div>
+    </section>
+
+    ${medicSection}
+
+    <section>
+      <h2>Stage detail</h2>
+      <table class="pipeline-table">
+        <thead><tr><th></th><th>Stage</th><th>Outcome</th><th>Duration</th><th>Detail</th></tr></thead>
+        <tbody>${stageRows}</tbody>
+      </table>
+    </section>
+
+    <section class="outcome">
+      <p>${outcomeText}</p>
+    </section>
+
+    <footer>
+      Generated by <code>convoy replay ${escapeHtml(run.id.slice(0, 8))}</code> · ${escapeHtml(new Date(run.startedAt).toISOString())}
+    </footer>
+  </main>
+</body>
+</html>
+`;
 }
 
 const program = new Command()
@@ -2384,9 +3071,13 @@ program
 
 program
   .command('replay [runId]')
-  .description('Generate demo media (terminal.txt + story.md + events.json) from a finished run. Defaults to the most recent run.')
+  .description('Generate demo media (terminal.txt + story.md + story.html + events.json) from a finished run. Defaults to the most recent run. Pass --animate to also replay live to stdout with the original cadence — demoable as a beat in itself.')
   .option('--out-dir <path>', 'output directory (default: ./demo-output)')
   .option('--no-ansi', 'strip ANSI color codes from terminal.txt (for plain-text social posts)')
+  .option('--animate', 're-emit events to stdout with their original cadence after writing artifacts. Inter-event pauses are capped at 5s.')
+  .option('--speed <multiplier>', 'animation speed multiplier (1.0 real-time, 2.0 = 2× faster, 0.5 = half-speed). Default 1.0.', (v) => Number(v))
+  .option('--screenshots', 'drive headless Chromium against the local web viewer to capture run-page PNGs. Requires `npm i -D playwright && npx playwright install chromium`.')
+  .option('--gif', 'stitch the captured screenshots into a looping replay.gif via ffmpeg. Requires --screenshots and ffmpeg on PATH.')
   .action(async (runId: string | undefined, options: ReplayOpts) => {
     await runReplay(runId, options);
   });
