@@ -23,6 +23,7 @@ import {
   gitHubAuthStatus,
   mergePr,
   planBranchName,
+  plumbingMatchesDefaultBranch,
   prStatus,
   type GitRepoContext,
 } from './github-runner.js';
@@ -524,6 +525,41 @@ export class AuthorStage extends BaseStage {
       return result;
     }
 
+    // Symmetric to pr.already_merged but for the case where the plumbing
+    // landed on origin/<default> via a different code path (a hand-merged
+    // PR, a run on a legacy run-id-keyed branch, or a developer who copied
+    // the files manually). findExistingConvoyPr can't see it because no
+    // *open* convoy/<branch> PR exists, but the files ARE already shipped.
+    // Without this check, AuthorStage would branch off origin/<default>,
+    // write identical content, and crash on `git commit` with "nothing to
+    // commit". With it, we recognize the no-op cleanly — but only when no
+    // operator carry is needed; if the working tree is dirty we still need
+    // to author so the carry commit rides into a PR.
+    const plumbingShipped = await plumbingMatchesDefaultBranch(
+      repo,
+      cfg.authoredFiles.map((f) => ({ path: f.path, contentPreview: f.contentPreview })),
+    );
+    const willCarry = cfg.carryUncommittedChanges !== undefined;
+    if (plumbingShipped && !willCarry && !existing) {
+      this.emit(ctx, 'progress', {
+        phase: 'pr.already_shipped',
+        branch,
+        files: cfg.authoredFiles.map((f) => f.path),
+        default_branch: repo.defaultBranch,
+        note: `Plumbing files already match origin/${repo.defaultBranch}. A prior PR (or a hand-merge) shipped them. Skipping author.`,
+      });
+      const result = {
+        pr_url: null,
+        pr_number: null,
+        branch,
+        files: cfg.authoredFiles.map((f) => f.path),
+        merged: true,
+        reused: 'already_on_default' as const,
+      };
+      this.emit(ctx, 'finished', result);
+      return result;
+    }
+
     // Pre-PR gate: before any git mutation, show the operator what rehearsal
     // produced + the authored file set, and wait for approval to open (or
     // reuse) the PR. This is the "rehearsal must pass AND operator must
@@ -590,6 +626,32 @@ export class AuthorStage extends BaseStage {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(`PR creation failed: ${message}`);
+    }
+
+    // No-op signal from createPrFromAuthoredFiles: plumbing already matched
+    // origin/<default> AND the carry's diff was empty (or no carry was
+    // instructed). Possible if the operator's "dirty tree" was entirely
+    // gitignored content (.vscode/, .env*.local, etc.), or if the
+    // plumbingMatchesDefaultBranch pre-check missed the case for any
+    // reason. Either way: nothing to push, nothing to PR, stage is a no-op.
+    if (pr.noOp) {
+      this.emit(ctx, 'progress', {
+        phase: 'pr.no_op',
+        branch: pr.branch,
+        files: cfg.authoredFiles.map((f) => f.path),
+        note:
+          'Plumbing already on origin/<default> and no operator changes had a non-empty diff. Skipping PR; advancing to deploy.',
+      });
+      const result = {
+        pr_url: null,
+        pr_number: null,
+        branch: pr.branch,
+        files: cfg.authoredFiles.map((f) => f.path),
+        merged: true,
+        reused: 'no_op' as const,
+      };
+      this.emit(ctx, 'finished', result);
+      return result;
     }
 
     if (cfg.carryUncommittedChanges) {

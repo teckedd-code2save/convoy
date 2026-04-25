@@ -19,6 +19,14 @@ export interface PrResult {
   branch: string;
   prUrl: string;
   prNumber: number;
+  /**
+   * Set when neither the carry commit nor the plumbing commit had content
+   * to commit (because both already match origin/<default>). The caller
+   * sees this and decides whether to skip the stage entirely; PrResult
+   * still includes branch/prUrl/prNumber as null-ish placeholders so the
+   * caller doesn't have to special-case the type.
+   */
+  noOp?: boolean;
 }
 
 export interface AuthResult {
@@ -151,6 +159,41 @@ export async function hasUncommittedChanges(ctx: GitRepoContext): Promise<boolea
  */
 export function planBranchName(planId: string): string {
   return `convoy/${planId.slice(0, 8)}`;
+}
+
+/**
+ * Compare each authored file's planned content against the current
+ * `origin/<default>` snapshot. Returns true when every file already exists
+ * on the default branch with matching content — i.e. a prior Convoy run
+ * (or a hand-merged PR) already shipped the plumbing.
+ *
+ * AuthorStage calls this AFTER findExistingConvoyPr and BEFORE the open_pr
+ * approval gate. Without this check, a resumed run whose author stage
+ * previously failed will branch off origin/<default>, write files
+ * identical to what's already there, and crash on `git commit` with
+ * "nothing to commit, working tree clean". With this check we recognize
+ * the no-op and skip the stage cleanly.
+ *
+ * We deliberately don't probe gh's API for this — `git show <ref>:<path>`
+ * is local, fast, and authoritative since `git fetch origin <default>`
+ * runs as part of the author flow anyway. We refresh origin first to make
+ * sure we're comparing against the latest default branch.
+ */
+export async function plumbingMatchesDefaultBranch(
+  ctx: GitRepoContext,
+  files: AuthoredFileInput[],
+): Promise<boolean> {
+  if (files.length === 0) return true;
+  // Refresh the operator's view of origin/<default> so we don't false-
+  // negative on a stale remote-tracking branch.
+  await sh('git', ['fetch', 'origin', ctx.defaultBranch], { cwd: ctx.path, allowFailure: true });
+  for (const file of files) {
+    const ref = `origin/${ctx.defaultBranch}:${file.path}`;
+    const result = await sh('git', ['show', ref], { cwd: ctx.path, allowFailure: true });
+    if (result.code !== 0) return false; // file missing on default
+    if (result.stdout !== file.contentPreview) return false; // content differs
+  }
+  return true;
 }
 
 /**
@@ -321,11 +364,13 @@ export async function createPrFromAuthoredFiles(
   // tracked-modified, untracked-not-ignored, and deletions. Empty diff
   // (e.g. all dirty files were gitignored) → silently skip the commit so
   // the PR doesn't get an empty `fix:` entry.
+  let carryCommitted = false;
   if (carry !== undefined && stashed) {
     await sh('git', ['add', '-A'], { cwd: ctx.path });
     const staged = await sh('git', ['diff', '--cached', '--name-only'], { cwd: ctx.path, allowFailure: true });
     if (staged.code === 0 && staged.stdout.trim().length > 0) {
       await sh('git', ['commit', '-m', carry.message], { cwd: ctx.path });
+      carryCommitted = true;
     }
   }
 
@@ -341,10 +386,37 @@ export async function createPrFromAuthoredFiles(
   // Step 6 — stage, commit, push. Force-add: Convoy owns this list
   // (Dockerfile, platform manifest, .env.schema, .convoy/*) and many Node
   // templates gitignore .env* broadly, which would silently drop .env.schema
-  // without -f. --force-with-lease on push: rewrite the prior attempt's
-  // branch head safely (refuses if someone else pushed concurrently).
+  // without -f. Empty-staged-diff guard: when the plumbing files already
+  // match origin/<default> (a prior PR already shipped them), git diff
+  // --cached is empty and `git commit` would fail "nothing to commit" — we
+  // skip the commit and let the caller decide what to do via the noOp
+  // signal in PrResult. --force-with-lease on push: rewrite the prior
+  // attempt's branch head safely (refuses if someone else pushed
+  // concurrently).
   await sh('git', ['add', '-f', '--', ...files.map((f) => f.path)], { cwd: ctx.path });
-  await sh('git', ['commit', '-m', title], { cwd: ctx.path });
+  const plumbingStaged = await sh('git', ['diff', '--cached', '--name-only'], { cwd: ctx.path, allowFailure: true });
+  const plumbingHasDiff = plumbingStaged.code === 0 && plumbingStaged.stdout.trim().length > 0;
+  let plumbingCommitted = false;
+  if (plumbingHasDiff) {
+    await sh('git', ['commit', '-m', title], { cwd: ctx.path });
+    plumbingCommitted = true;
+  }
+
+  // Did this whole flow result in any new commits? Possible no-op cases:
+  //   - plumbing already on origin/<default> AND no carry was instructed
+  //   - plumbing already on origin/<default> AND carry's diff was empty
+  // In both, the branch points at origin/<default> and there's nothing to
+  // push. Surface that clearly so AuthorStage skips with pr.already_shipped.
+  const anythingCommitted = plumbingCommitted || carryCommitted;
+  if (!anythingCommitted) {
+    return {
+      branch,
+      prUrl: existingPrUrl ?? '',
+      prNumber: existingPrUrl ? (parsePrNumber(existingPrUrl) ?? 0) : 0,
+      noOp: true,
+    };
+  }
+
   await sh('git', ['push', '--force-with-lease', '-u', 'origin', branch], { cwd: ctx.path });
 
   if (existingPrUrl) {
