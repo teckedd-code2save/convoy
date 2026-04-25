@@ -19,8 +19,10 @@ import type { ConvoyBus } from './bus.js';
 import {
   createPrFromAuthoredFiles,
   detectRepo,
+  findExistingConvoyPr,
   gitHubAuthStatus,
   mergePr,
+  planBranchName,
   prStatus,
   type GitRepoContext,
 } from './github-runner.js';
@@ -46,6 +48,15 @@ export interface OrchestratorOpts {
   autoApprove?: boolean;
   injectFailure?: InjectFailureOpt;
   planId?: string | null;
+  /**
+   * When set, the orchestrator continues an existing run row instead of
+   * creating a new one. Stages whose last event in this run is `finished`
+   * are skipped and their prior payload is replayed into the context. The
+   * first stage with a `failed`/incomplete history runs from scratch, and
+   * everything after it follows normally. This is what `convoy resume`
+   * threads through after the developer fixes a code-level failure.
+   */
+  continueRunId?: string;
   /**
    * Full plan handed to the stage context so ScanStage can re-run the live
    * scan on plan.target.localPath and PickStage can replay the authoritative
@@ -463,12 +474,43 @@ export class AuthorStage extends BaseStage {
     }
     this.emit(ctx, 'progress', { phase: 'gh.authenticated', user: auth.user, scopes: auth.scopes });
 
+    // Plan-keyed branch name — stable across resumes. With this, a fix-and-
+    // resume after a failed merge force-pushes the same branch and reuses
+    // the same PR instead of opening a duplicate. Falls back to run id only
+    // when no plan is in context (legacy callers / programmer error).
+    const planId = ctx.opts.plan?.id ?? ctx.run.id;
+    const branch = planBranchName(planId);
+
+    // Probe BEFORE the open_pr approval. If a PR for this branch was already
+    // merged in a prior attempt, AuthorStage has nothing to do and we should
+    // tell the operator that — not pause for an approval gate they don't
+    // need. If a PR is already open, the approval card surfaces "reuse" so
+    // the operator isn't surprised when no new PR appears on GitHub.
+    const existing = await findExistingConvoyPr(repo, branch);
+    if (existing && existing.state === 'merged') {
+      this.emit(ctx, 'progress', {
+        phase: 'pr.already_merged',
+        pr_url: existing.prUrl,
+        pr_number: existing.prNumber,
+        branch,
+        note: 'A prior attempt of this plan already opened and merged a PR. Skipping author.',
+      });
+      const result = {
+        pr_url: existing.prUrl,
+        pr_number: existing.prNumber,
+        branch,
+        files: cfg.authoredFiles.map((f) => f.path),
+        merged: true,
+        reused: 'merged' as const,
+      };
+      this.emit(ctx, 'finished', result);
+      return result;
+    }
+
     // Pre-PR gate: before any git mutation, show the operator what rehearsal
-    // produced + the authored file set, and wait for approval to open the
-    // PR. This is the "rehearsal must pass AND operator must confirm before
-    // PR opens" gate — without it, the sequence was PR-first, prove-later,
-    // which meant rehearsal failures could leave the repo merged but
-    // undeployed.
+    // produced + the authored file set, and wait for approval to open (or
+    // reuse) the PR. This is the "rehearsal must pass AND operator must
+    // confirm before PR opens" gate.
     const authoredForApproval = cfg.authoredFiles.map((f) => ({
       path: f.path,
       lines: f.contentPreview.split(/\r?\n/).length,
@@ -480,8 +522,12 @@ export class AuthorStage extends BaseStage {
       mode: 'real',
       repo: `${repo.owner}/${repo.repo}`,
       default_branch: repo.defaultBranch,
-      branch_to_create: `convoy/${ctx.run.id.slice(0, 8)}`,
-      note: 'Rehearsal passed. Convoy will open a PR with these deployment-surface files only — no application source is touched.',
+      branch_to_create: branch,
+      reuse_pr_url: existing?.state === 'open' ? existing.prUrl : undefined,
+      note:
+        existing?.state === 'open'
+          ? `Rehearsal passed. A PR for this plan is already open at ${existing.prUrl}; Convoy will force-push the latest authored files to its branch and reuse it.`
+          : 'Rehearsal passed. Convoy will open a PR with these deployment-surface files only — no application source is touched.',
       rehearsal: summarizeRehearsalForApproval(ctx.prior['rehearse']),
       files: authoredForApproval,
     });
@@ -490,10 +536,11 @@ export class AuthorStage extends BaseStage {
     try {
       pr = await createPrFromAuthoredFiles(
         repo,
-        ctx.run.id,
+        branch,
         cfg.authoredFiles.map((f) => ({ path: f.path, contentPreview: f.contentPreview })),
         cfg.prTitle,
         cfg.prBody,
+        existing?.state === 'open' ? existing.prUrl : undefined,
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

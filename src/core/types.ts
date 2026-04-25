@@ -33,7 +33,8 @@ export type EventKind =
   | 'failed'
   | 'log'
   | 'diagnosis'
-  | 'decision';
+  | 'decision'
+  | 'skipped';
 
 export type ApprovalKind =
   | 'open_pr'

@@ -144,15 +144,83 @@ export async function hasUncommittedChanges(ctx: GitRepoContext): Promise<boolea
 }
 
 /**
+ * Convoy's stable branch name for a given plan. Plan id is stable across
+ * resumes; run id is not. Keying the branch off plan id is what makes
+ * AuthorStage idempotent — a resume after a merge failure pushes to the
+ * same branch and reuses the same PR instead of opening a duplicate.
+ */
+export function planBranchName(planId: string): string {
+  return `convoy/${planId.slice(0, 8)}`;
+}
+
+/**
+ * Probe GitHub for an existing convoy/* PR. Returns the open PR if one
+ * exists for `branch`, the most-recently-merged PR if one was already
+ * shipped, or null otherwise. AuthorStage uses this before authoring so
+ * resume after a merge failure can:
+ *   - reuse the open PR (force-push new content to its branch)
+ *   - skip the stage entirely if a prior PR already merged
+ *   - fall back to creating a new PR if none exists
+ */
+export async function findExistingConvoyPr(
+  ctx: GitRepoContext,
+  branch: string,
+): Promise<{ state: 'open'; prUrl: string; prNumber: number } | { state: 'merged'; prUrl: string; prNumber: number } | null> {
+  // List open PRs first; that's the most actionable case (resume continues here).
+  const open = await sh(
+    'gh',
+    ['pr', 'list', '--head', branch, '--state', 'open', '--json', 'number,url', '--limit', '1'],
+    { cwd: ctx.path, allowFailure: true },
+  );
+  if (open.code === 0 && open.stdout.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(open.stdout) as { number: number; url: string }[];
+      const first = parsed[0];
+      if (first) return { state: 'open', prUrl: first.url, prNumber: first.number };
+    } catch {
+      // fall through
+    }
+  }
+
+  // No open PR — check whether an earlier attempt already merged this branch.
+  const merged = await sh(
+    'gh',
+    ['pr', 'list', '--head', branch, '--state', 'merged', '--json', 'number,url', '--limit', '1'],
+    { cwd: ctx.path, allowFailure: true },
+  );
+  if (merged.code === 0 && merged.stdout.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(merged.stdout) as { number: number; url: string }[];
+      const first = parsed[0];
+      if (first) return { state: 'merged', prUrl: first.url, prNumber: first.number };
+    } catch {
+      // fall through
+    }
+  }
+
+  return null;
+}
+
+/**
  * Create a branch, write the authored files, commit, push, and open a PR.
+ *
+ * Idempotent across resumes: callers pass a stable plan-keyed branch name
+ * (see `planBranchName`). When the branch already exists locally or on
+ * origin we reset it to the default branch HEAD and force-push the new
+ * content. The caller is expected to have already probed for an existing
+ * open/merged PR via `findExistingConvoyPr` and passed `existingPrUrl` if
+ * a same-branch PR is open — in that case we skip `gh pr create` and
+ * return the existing URL with the new commit pushed to its head.
+ *
  * Throws on any step's failure with context the caller can surface.
  */
 export async function createPrFromAuthoredFiles(
   ctx: GitRepoContext,
-  runId: string,
+  branch: string,
   files: AuthoredFileInput[],
   title: string,
   body: string,
+  existingPrUrl?: string,
 ): Promise<PrResult> {
   if (files.length === 0) {
     throw new Error('createPrFromAuthoredFiles called with no files');
@@ -171,9 +239,10 @@ export async function createPrFromAuthoredFiles(
     assertPathInsideRepo(repoRoot, file.path);
   }
 
-  const branch = `convoy/${runId.slice(0, 8)}`;
-
-  // Make sure we're branching from the latest default branch.
+  // Make sure we're branching from the latest default branch. -B resets the
+  // branch to that commit, which is what we want for re-attempts: the prior
+  // run's commit on this branch (if any) is overwritten with fresh content
+  // built from the plan's authored files. Force-push later cements that.
   await sh('git', ['fetch', 'origin', ctx.defaultBranch], { cwd: ctx.path });
   await sh('git', ['checkout', '-B', branch, `origin/${ctx.defaultBranch}`], { cwd: ctx.path });
 
@@ -186,10 +255,19 @@ export async function createPrFromAuthoredFiles(
 
   // Stage, commit, push. Force-add: Convoy owns this list (Dockerfile, platform manifest,
   // .env.schema, .convoy/*) and many Node templates gitignore .env* broadly, which would
-  // silently drop .env.schema without -f.
+  // silently drop .env.schema without -f. --force-with-lease on push: rewrite the prior
+  // attempt's branch head safely (refuses if someone else pushed concurrently).
   await sh('git', ['add', '-f', '--', ...files.map((f) => f.path)], { cwd: ctx.path });
   await sh('git', ['commit', '-m', title], { cwd: ctx.path });
-  await sh('git', ['push', '-u', 'origin', branch], { cwd: ctx.path });
+  await sh('git', ['push', '--force-with-lease', '-u', 'origin', branch], { cwd: ctx.path });
+
+  if (existingPrUrl) {
+    const prNumber = parsePrNumber(existingPrUrl);
+    if (prNumber === null) {
+      throw new Error(`could not parse PR number from existing PR url ${existingPrUrl}`);
+    }
+    return { branch, prUrl: existingPrUrl, prNumber };
+  }
 
   // Open the PR via gh.
   const prCreate = await sh(

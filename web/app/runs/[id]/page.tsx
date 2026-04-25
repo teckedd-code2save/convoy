@@ -374,12 +374,14 @@ function StagesSection({ events }: { events: EventRow[] }) {
             running: 'border-accent text-accent bg-accent/10 convoy-pulse',
             done: 'border-success/50 text-success bg-success/5',
             failed: 'border-danger text-danger bg-danger/10',
+            skipped: 'border-muted/40 text-muted bg-card/60 opacity-70',
           };
           const icon: Record<string, string> = {
             idle: '○',
             running: '◐',
             done: '●',
             failed: '✗',
+            skipped: '⤳',
           };
           return (
             <div key={stage} className="flex items-center">
@@ -510,7 +512,10 @@ function ProgressBar({
   completedAt: string | null;
 }) {
   const status = computeStageStatus(events);
-  const done = STAGE_ORDER.filter((s) => status[s] === 'done').length;
+  // Count `skipped` toward `done` for the progress bar — a skipped stage is
+  // a complete one (it finished in the prior attempt and we replayed its
+  // payload). Without this the bar would understate progress on resumed runs.
+  const done = STAGE_ORDER.filter((s) => status[s] === 'done' || status[s] === 'skipped').length;
   const running = STAGE_ORDER.find((s) => status[s] === 'running');
   const pct = Math.min(100, Math.round((done / STAGE_ORDER.length) * 100));
   const elapsedMs =
@@ -996,12 +1001,13 @@ function AuthoredFileRow({ file }: { file: AuthoredFileSummary }) {
   );
 }
 
-function computeStageStatus(events: EventRow[]): Record<string, 'idle' | 'running' | 'done' | 'failed'> {
-  const status: Record<string, 'idle' | 'running' | 'done' | 'failed'> = {};
+function computeStageStatus(events: EventRow[]): Record<string, 'idle' | 'running' | 'done' | 'failed' | 'skipped'> {
+  const status: Record<string, 'idle' | 'running' | 'done' | 'failed' | 'skipped'> = {};
   for (const e of events) {
     if (e.kind === 'started') status[e.stage] = 'running';
     else if (e.kind === 'finished') status[e.stage] = 'done';
     else if (e.kind === 'failed') status[e.stage] = 'failed';
+    else if (e.kind === 'skipped') status[e.stage] = 'skipped';
   }
   return status;
 }
@@ -1011,6 +1017,7 @@ function markerForEvent(event: EventRow): string {
   const kind = event.kind;
   if (kind === 'failed') return 'bg-danger';
   if (kind === 'finished') return 'bg-success';
+  if (kind === 'skipped') return 'bg-muted';
   if (kind === 'started') return 'bg-accent';
   if (kind === 'decision') return 'bg-accent';
   if (kind === 'diagnosis') return 'bg-warn';

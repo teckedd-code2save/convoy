@@ -181,6 +181,52 @@ function checkConvoyEnv(): void {
 }
 
 /**
+ * Surface uncommitted changes in the target repo as preflight evidence.
+ * Returns the dirty file list (porcelain `XY <path>` lines parsed down to the
+ * path) so the failure message can list what needs committing without
+ * re-running git.
+ *
+ * Errors swallow to `dirty: false` deliberately — preflight should never hard
+ * fail because git itself isn't available; a missing `.git` directory is
+ * already caught by the detectRepo check upstream.
+ */
+async function detectUncommittedChanges(repoPath: string): Promise<{ dirty: boolean; files: string[] }> {
+  try {
+    const { spawn } = await import('node:child_process');
+    return await new Promise((resolveResult) => {
+      const proc = spawn('git', ['status', '--porcelain'], { cwd: repoPath });
+      let stdout = '';
+      proc.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString('utf8');
+      });
+      proc.on('close', (code: number) => {
+        if (code !== 0) {
+          resolveResult({ dirty: false, files: [] });
+          return;
+        }
+        const files = stdout
+          .split('\n')
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0)
+          // Porcelain v1: first 2 chars are status, then space, then path.
+          // Renames look like `R  old -> new`; we keep the new path.
+          .map((line) => {
+            const path = line.slice(3).trim();
+            const arrow = path.indexOf(' -> ');
+            return arrow >= 0 ? path.slice(arrow + 4) : path;
+          });
+        resolveResult({ dirty: files.length > 0, files });
+      });
+      proc.on('error', () => {
+        resolveResult({ dirty: false, files: [] });
+      });
+    });
+  } catch {
+    return { dirty: false, files: [] };
+  }
+}
+
+/**
  * Resolve the `web/` directory relative to the CLI binary itself (works
  * whether the user ran the CLI from the repo root or from a subdirectory).
  */
@@ -324,6 +370,14 @@ function renderRunEvent(event: RunEvent): void {
       return;
     case 'log':
       process.stdout.write(`${CONVOY_RULE}${pc.dim('|')} ${pc.dim(compact(event.payload))}\n`);
+      return;
+    case 'skipped':
+      // Render skipped on its own line block matching `started → finished`,
+      // since the user is replacing both. Reads as: "I remembered this was
+      // already done; I'm not redoing it."
+      process.stdout.write(
+        `${CONVOY_RULE}\n${CONVOY_RULE}${pc.dim('⤳')} ${pc.dim(`${event.stage} ${pc.italic('skipped — already finished in prior attempt')}`)}\n`,
+      );
       return;
   }
 }
@@ -609,6 +663,20 @@ interface ApplyOpts {
   alreadySet?: string[];
   recurring?: boolean;
   platform?: string;
+  /**
+   * When set, runApply tells the orchestrator to continue this run row
+   * instead of creating a new one. Set programmatically by `convoy resume`,
+   * not exposed as a public flag — operators driving fresh applies should
+   * never pass this.
+   */
+  continueRunId?: string;
+  /**
+   * Resume-only opt-out. When true, `convoy resume` falls back to the
+   * pre-continuation behavior (create a brand-new run row, replay every
+   * stage). Useful when the target's git state has diverged enough from
+   * the prior attempt that prior stage outputs are no longer trustworthy.
+   */
+  fresh?: boolean;
 }
 
 interface PreflightCheck {
@@ -962,6 +1030,37 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
             ok: true,
             detail: `gh authed as ${auth.user ?? 'unknown'} — will open PR on ${repo.owner}/${repo.repo}`,
           });
+
+          // Heads-up before any orchestrator state mutates: if the target has
+          // uncommitted changes (a Claude-driven fix sitting on disk, WIP from
+          // the operator, etc.), Convoy will fail later inside
+          // createPrFromAuthoredFiles AFTER the operator has approved opening
+          // the PR. Surfacing it here prevents that wasted approval pause
+          // and gives the exact remedy.
+          //
+          // We deliberately don't auto-commit. Convoy's principle is "we ship
+          // your code, we don't rewrite it" — and committing on the
+          // developer's behalf is a thumbprint on their git history we
+          // shouldn't make without explicit consent.
+          const dirty = await detectUncommittedChanges(plan.target.localPath);
+          if (dirty.dirty) {
+            const fileList = dirty.files.slice(0, 6).map((f) => `    ${f}`).join('\n');
+            const moreSuffix = dirty.files.length > 6 ? `\n    … and ${dirty.files.length - 6} more` : '';
+            const branchHint = repo.defaultBranch;
+            report.hardFailures.push(
+              `real author: target has ${dirty.files.length} uncommitted change${dirty.files.length === 1 ? '' : 's'}.\n` +
+                `  Convoy won't commit them for you — that would put a thumbprint on your git history.\n` +
+                `  Files:\n${fileList}${moreSuffix}\n` +
+                `  Remedy: cd ${plan.target.localPath} && git add -A && git commit -m '<your message>' && git push origin ${branchHint}\n` +
+                `  Then re-run \`convoy resume\`.`,
+            );
+            report.checks.push({
+              name: 'real author',
+              ok: false,
+              detail: `target has ${dirty.files.length} uncommitted file${dirty.files.length === 1 ? '' : 's'}`,
+              remedy: `commit + push your changes, then re-run \`convoy resume\``,
+            });
+          }
         }
       }
     }
@@ -1202,6 +1301,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     planId: plan.id,
     plan,
     ...(platformOverride !== undefined && { platformOverride }),
+    ...(opts.continueRunId !== undefined && { continueRunId: opts.continueRunId }),
   };
 
   if (opts.injectFailure === 'rehearse' || opts.injectFailure === 'canary') {
@@ -1658,28 +1758,35 @@ async function runStatus(runId?: string): Promise<void> {
       process.stdout.write(`  ${pc.dim('Timeline:')}   ${pc.cyan(timelineUrl)} ${pc.yellow('(viewer not reachable')}${viewer.note ? pc.yellow(`: ${viewer.note}`) : ''}${pc.yellow(')')}\n`);
     }
 
+    // Last-write-wins per stage so a resumed-and-now-finished stage doesn't
+    // keep its prior `failed` marker. Stages either ran (started) or didn't,
+    // and ended in finished / failed / skipped — we render the latest verdict.
     const events = store.listEvents(run.id);
-    const perStage = new Map<StageName, { started: boolean; finished: boolean; failed: boolean }>();
+    type StageState = 'idle' | 'started' | 'finished' | 'failed' | 'skipped';
+    const perStage = new Map<StageName, StageState>();
     for (const event of events) {
-      const entry = perStage.get(event.stage) ?? { started: false, finished: false, failed: false };
-      if (event.kind === 'started') entry.started = true;
-      if (event.kind === 'finished') entry.finished = true;
-      if (event.kind === 'failed') entry.failed = true;
-      perStage.set(event.stage, entry);
+      if (event.kind === 'started') perStage.set(event.stage, 'started');
+      else if (event.kind === 'finished') perStage.set(event.stage, 'finished');
+      else if (event.kind === 'failed') perStage.set(event.stage, 'failed');
+      else if (event.kind === 'skipped') perStage.set(event.stage, 'skipped');
     }
 
-    const order: StageName[] = ['scan', 'pick', 'author', 'rehearse', 'canary', 'promote', 'observe'];
+    const order: StageName[] = ['scan', 'pick', 'rehearse', 'author', 'canary', 'promote', 'observe'];
     process.stdout.write(`\n  ${pc.dim('Stages')}\n`);
     for (const name of order) {
-      const entry = perStage.get(name);
-      const marker = entry?.failed
-        ? pc.red(SYMBOL.fail)
-        : entry?.finished
-          ? pc.green(SYMBOL.ok)
-          : entry?.started
-            ? pc.yellow(SYMBOL.bullet)
-            : pc.dim(SYMBOL.bullet);
-      process.stdout.write(`  ${marker} ${name}\n`);
+      const state = perStage.get(name) ?? 'idle';
+      const marker =
+        state === 'failed'
+          ? pc.red(SYMBOL.fail)
+          : state === 'finished'
+            ? pc.green(SYMBOL.ok)
+            : state === 'skipped'
+              ? pc.dim('⤳')
+              : state === 'started'
+                ? pc.yellow(SYMBOL.bullet)
+                : pc.dim(SYMBOL.bullet);
+      const suffix = state === 'skipped' ? pc.dim(' (skipped — already finished)') : '';
+      process.stdout.write(`  ${marker} ${name}${suffix}\n`);
     }
 
     const pending = store.listPendingApprovals(run.id);
@@ -1695,10 +1802,13 @@ async function runStatus(runId?: string): Promise<void> {
 }
 
 /**
- * `convoy resume [runId]` — re-applies the plan associated with a paused or
- * failed run after the developer has fixed the underlying code. The orchestrator
- * always creates a fresh run row on apply (stages are not idempotent across
- * partial state), so this is "rerun the same plan", not "continue the same row".
+ * `convoy resume [runId]` — continues a paused or failed run after the
+ * developer has fixed the underlying code. By default the run row is
+ * preserved: stages whose last event is `finished` are skipped, and the
+ * pipeline replays from the first stage that didn't complete. Pass
+ * `--fresh` to fall back to the pre-continuation behavior (new run row,
+ * every stage replayed from scratch) — useful when the target's state has
+ * diverged enough that prior stage outputs are no longer trustworthy.
  *
  * Defaults to the most recent run when no id is given, matching `convoy status`.
  * Refuses to resume runs that succeeded or are still in flight.
@@ -1706,8 +1816,12 @@ async function runStatus(runId?: string): Promise<void> {
 async function runResume(runId: string | undefined, opts: ApplyOpts): Promise<void> {
   const store = new RunStateStore(STATE_PATH);
   let planId: string | null = null;
+  let runIdFull = '';
   let resumedFromShort = '';
   let priorReason: string | null = null;
+  let finishedStages: StageName[] = [];
+  let failedStage: StageName | null = null;
+  let firstReplayStage: StageName | null = null;
   try {
     const run: Run | null = runId
       ? store.getRun(runId)
@@ -1745,23 +1859,63 @@ async function runResume(runId: string | undefined, opts: ApplyOpts): Promise<vo
     }
 
     planId = run.planId;
+    runIdFull = run.id;
     resumedFromShort = run.id.slice(0, 8);
     priorReason = run.outcomeReason;
+
+    // Walk the run's events to compute "what's already done" for the banner.
+    // The orchestrator does the same thing internally for skip decisions; we
+    // just preview it here so the operator sees what's about to be skipped.
+    const STAGE_ORDER: StageName[] = ['scan', 'pick', 'rehearse', 'author', 'canary', 'promote', 'observe'];
+    const lastTerminalByStage = new Map<StageName, 'finished' | 'failed'>();
+    for (const event of store.listEvents(run.id)) {
+      if (event.kind === 'finished' || event.kind === 'failed') {
+        lastTerminalByStage.set(event.stage, event.kind);
+      }
+    }
+    finishedStages = STAGE_ORDER.filter((s) => lastTerminalByStage.get(s) === 'finished');
+    failedStage = STAGE_ORDER.find((s) => lastTerminalByStage.get(s) === 'failed') ?? null;
+    firstReplayStage = STAGE_ORDER.find((s) => lastTerminalByStage.get(s) !== 'finished') ?? null;
   } finally {
     store.close();
   }
 
+  const fresh = opts.fresh === true;
   process.stdout.write(
-    `${pc.bold(pc.cyan(SYMBOL.run))} ${pc.dim('Resuming from run')} ${pc.bold(resumedFromShort)} ${pc.dim('— re-applying plan')} ${pc.bold(planId.slice(0, 8))}\n`,
+    `${pc.bold(pc.cyan(SYMBOL.run))} ${pc.dim(fresh ? 'Resuming (fresh run) from' : 'Continuing run')} ${pc.bold(resumedFromShort)} ${pc.dim('· plan')} ${pc.bold(planId.slice(0, 8))}\n`,
   );
   if (priorReason) {
     process.stdout.write(`  ${pc.dim('Prior failure:')} ${priorReason}\n`);
   }
-  process.stdout.write(
-    `  ${pc.dim('Note: a new run id will be assigned. The previous run row is preserved for history.')}\n\n`,
-  );
+  if (fresh) {
+    process.stdout.write(
+      `  ${pc.dim('--fresh: a new run row will be created, every stage replays from scratch.')}\n\n`,
+    );
+  } else if (finishedStages.length > 0) {
+    process.stdout.write(
+      `  ${pc.green('✓')} ${pc.dim('already finished:')} ${finishedStages.join(', ')}\n`,
+    );
+    if (failedStage) {
+      process.stdout.write(
+        `  ${pc.red('✗')} ${pc.dim('failed at:')} ${failedStage} ${pc.dim('— replaying from here')}\n\n`,
+      );
+    } else if (firstReplayStage) {
+      process.stdout.write(
+        `  ${pc.cyan('▸')} ${pc.dim('replaying from:')} ${firstReplayStage}\n\n`,
+      );
+    } else {
+      process.stdout.write('\n');
+    }
+  } else {
+    process.stdout.write('\n');
+  }
 
-  await runApply(planId, opts);
+  // Default: continue the same run row. --fresh opts out.
+  const resumeOpts: ApplyOpts = fresh
+    ? opts
+    : { ...opts, continueRunId: runIdFull };
+
+  await runApply(planId, resumeOpts);
 }
 
 const program = new Command()
@@ -1882,7 +2036,8 @@ program
 
 program
   .command('resume [runId]')
-  .description('Re-apply the plan from a paused or failed run after fixing the code. Defaults to the most recent run. Creates a new run row.')
+  .description('Continue a paused or failed run after fixing the code. Defaults to the most recent run. Skips stages already finished; replays from the first incomplete stage.')
+  .option('--fresh', 'create a new run row and replay every stage from scratch (default: continue the same run row, skip already-finished stages)')
   .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
   .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
   .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
