@@ -777,16 +777,36 @@ function detectTestDirs(topLevelDirs: string[], allFiles: string[]): string[] {
 }
 
 function detectHealthPath(localPath: string, allFiles: string[]): string | null {
-  const candidates = [
+  // Next.js API-route pattern — the URL is structural, derived from the file
+  // location under app/api or pages/api, not from the file body.
+  const nextCandidates = [
     'app/api/health/route.ts',
     'app/api/health/route.js',
     'pages/api/health.ts',
     'pages/api/health.js',
-    'src/routes/health.ts',
-    'src/health.ts',
   ];
-  for (const c of candidates) {
+  for (const c of nextCandidates) {
     if (allFiles.includes(c)) return '/api/health';
+  }
+  // Express/Fastify-style: the URL is registered inside the file body. Prefer
+  // what the source declares (`router.get('/health', ...)`); fall back to
+  // `/health` when the body is unreadable. Previously the scanner lumped
+  // `src/routes/health.ts` into the Next.js bucket and returned `/api/health`
+  // for plain Express apps — wrong for the bundled demo app and any repo
+  // where the health router is mounted at `/` rather than `/api`.
+  const expressCandidates = [
+    'src/routes/health.ts',
+    'src/routes/health.js',
+    'src/health.ts',
+    'src/health.js',
+    'routes/health.ts',
+    'routes/health.js',
+  ];
+  for (const c of expressCandidates) {
+    if (!allFiles.includes(c)) continue;
+    const raw = tryReadFile(localPath, c);
+    if (raw && /['"`]\/api\/health['"`]/.test(raw)) return '/api/health';
+    return '/health';
   }
   if (allFiles.some((f) => f.endsWith('health.ts') || f.endsWith('health.js'))) {
     return '/health';
@@ -795,6 +815,7 @@ function detectHealthPath(localPath: string, allFiles: string[]): string | null 
   const routeFiles = allFiles.filter((f) => /routes?\.(t|j)sx?$|server\.(t|j)sx?$|main\.(t|j)sx?$/.test(f)).slice(0, 5);
   for (const rf of routeFiles) {
     const raw = tryReadFile(localPath, rf);
+    if (raw && /['"`]\/api\/health['"`]/.test(raw)) return '/api/health';
     if (raw && /['"`]\/health['"`]/.test(raw)) return '/health';
   }
   return null;

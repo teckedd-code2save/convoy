@@ -230,6 +230,11 @@ function defaultRehearsal(scan: ScanResult, platform: Platform): PlanRehearsalSe
     buildCommand: scan.buildCommand,
     startCommand: scan.startCommand,
     expectedPort: scan.port,
+    healthPath: scan.healthPath,
+    // Scanner doesn't detect metrics routes today — most Node services only
+    // expose /metrics when prom_client is explicitly mounted. Leave null so
+    // the runner falls back to its default probe and synthesized snapshot.
+    metricsPath: null,
     validations,
     estimatedDurationSeconds: 300,
     estimatedCost: 'under $0.05 per rehearsal',
@@ -271,13 +276,19 @@ function defaultRollback(platform: Platform): PlanRollbackSection {
 function defaultApprovals(): PlanApproval[] {
   return [
     {
+      kind: 'open_pr',
+      description:
+        'After rehearsal, Convoy shows the evidence and the drafted files. Your approval is what opens the PR — no repo state is changed before this.',
+      required: true,
+    },
+    {
       kind: 'merge_pr',
-      description: 'Convoy opens a PR with the Convoy-authored files — requires merge approval.',
+      description: 'Once the PR is open, you review the diff on GitHub. Your approval is what merges it.',
       required: true,
     },
     {
       kind: 'promote',
-      description: 'After clean rehearsal, promotion to canary requires human approval.',
+      description: 'After the PR merges, promotion to canary requires human approval.',
       required: true,
     },
     {
@@ -305,14 +316,6 @@ function defaultShipNarrative(
   const hasMigrations =
     hasPrisma || scan.topLevelDirs.includes('migrations') || scan.dataLayer.some((d) => d.includes('postgres') || d.includes('mysql'));
 
-  steps.push({
-    step: 1,
-    kind: 'approval',
-    text: authoredCount > 0
-      ? `I'll open a pull request with ${authoredCount} file${authoredCount === 1 ? '' : 's'} I drafted. You review the diff and merge — I don't merge on my own.`
-      : `I'll open a pull request (or skip — your repo already has everything I need). You merge.`,
-  });
-
   const rehearseDetails: string[] = [`install with ${pm} on a scratch volume`];
   if (rehearsal.buildCommand) rehearseDetails.push(`run ${buildCmd}`);
   if (hasPrisma) rehearseDetails.push('`prisma generate` during image build');
@@ -327,22 +330,36 @@ function defaultShipNarrative(
   rehearseDetails.push('then tear the twin down');
 
   steps.push({
-    step: 2,
+    step: 1,
     kind: 'action',
-    text: `I'll rehearse on ${rehearsal.targetDescriptor} before anything real happens.`,
+    text: `I'll rehearse on ${rehearsal.targetDescriptor} before touching your repo.`,
     details: rehearseDetails,
+  });
+
+  steps.push({
+    step: 2,
+    kind: 'approval',
+    text: authoredCount > 0
+      ? `If rehearsal is clean, I'll show you the evidence and the ${authoredCount} file${authoredCount === 1 ? '' : 's'} I drafted. Your approval is what opens the PR — nothing in your repo changes before that.`
+      : `If rehearsal is clean, I'll check in — your repo already has everything I need, so there's no PR to open.`,
   });
 
   steps.push({
     step: 3,
     kind: 'approval',
-    text: `If rehearsal is clean, I'll ask you to promote. No canary traffic without your yes.`,
+    text: `Once the PR is open, review the diff on GitHub. Your approval is what merges it — I never merge on my own.`,
+  });
+
+  steps.push({
+    step: 4,
+    kind: 'approval',
+    text: `After merge, I'll ask you to promote. No canary traffic without your yes.`,
   });
 
   const promoteSteps = promotion.steps.map((s) => `${s.trafficPercent}%`).join(' → ');
   const firstBake = promotion.steps[0]?.bakeWindowSeconds ?? 30;
   steps.push({
-    step: 4,
+    step: 5,
     kind: 'action',
     text: `On approval, I'll start a canary at ${promotion.canary.trafficPercent}% of traffic for a ${promotion.canary.bakeWindowSeconds}s bake.`,
     details: [
@@ -351,13 +368,13 @@ function defaultShipNarrative(
   });
 
   steps.push({
-    step: 5,
+    step: 6,
     kind: 'action',
     text: `If the canary holds, I'll step it up: ${promoteSteps} with a ${firstBake}s bake between each step — watching the same signals every time.`,
   });
 
   steps.push({
-    step: 6,
+    step: 7,
     kind: 'action',
     text: `Once I'm at 100%, I'll keep watching for the observe window. If anything breaches, I roll back via \`${rollback.strategy}\` in about ${rollback.estimatedSeconds}s — no one has to page anyone.`,
   });

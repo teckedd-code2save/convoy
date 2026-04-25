@@ -35,7 +35,12 @@ export type EventKind =
   | 'diagnosis'
   | 'decision';
 
-export type ApprovalKind = 'merge_pr' | 'promote' | 'rollback' | 'apply_migration';
+export type ApprovalKind =
+  | 'open_pr'
+  | 'merge_pr'
+  | 'promote'
+  | 'rollback'
+  | 'apply_migration';
 
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 

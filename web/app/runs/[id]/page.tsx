@@ -43,7 +43,7 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
           ) : null}
         </div>
         <div className="flex items-center gap-3 flex-wrap">
-          <h1 className="text-3xl font-semibold tracking-tight truncate">{run.repoUrl}</h1>
+          <h1 className="text-3xl md:text-4xl font-semibold tracking-tight truncate">{run.repoUrl}</h1>
           <StatusBadge status={run.status} live={isLive} />
         </div>
         <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
@@ -71,6 +71,8 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
       {run.status === 'rolled_back' ? <RolledBackBanner run={run} /> : null}
 
       <ProgressBar events={events} startedAt={run.startedAt} completedAt={run.completedAt} />
+
+      <MedicSpotlight events={events} runStatus={run.status} />
 
       {pendingApprovals.length > 0 ? (
         <section className="space-y-3">
@@ -364,21 +366,34 @@ function StagesSection({ events }: { events: EventRow[] }) {
   return (
     <section className="space-y-4">
       <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">Pipeline</h2>
-      <div className="flex flex-wrap gap-2">
-        {STAGE_ORDER.map((stage) => {
+      <div className="flex flex-wrap items-stretch gap-2">
+        {STAGE_ORDER.map((stage, idx) => {
           const s = status[stage] ?? 'idle';
           const styles: Record<string, string> = {
-            idle: 'border-rule text-muted bg-card',
-            running: 'border-accent text-accent bg-accent/5 animate-pulse',
-            done: 'border-success text-success bg-success/5',
-            failed: 'border-danger text-danger bg-danger/5',
+            idle: 'border-rule/60 text-muted bg-card',
+            running: 'border-accent text-accent bg-accent/10 convoy-pulse',
+            done: 'border-success/50 text-success bg-success/5',
+            failed: 'border-danger text-danger bg-danger/10',
+          };
+          const icon: Record<string, string> = {
+            idle: '○',
+            running: '◐',
+            done: '●',
+            failed: '✗',
           };
           return (
-            <div
-              key={stage}
-              className={`px-3 py-1.5 rounded-md border font-mono text-xs font-medium ${styles[s]}`}
-            >
-              {stage}
+            <div key={stage} className="flex items-center">
+              <div
+                className={`px-3.5 py-2 rounded-md border font-mono text-sm font-medium inline-flex items-center gap-2 ${styles[s]}`}
+              >
+                <span aria-hidden className="text-xs">{icon[s]}</span>
+                <span>{stage}</span>
+              </div>
+              {idx < STAGE_ORDER.length - 1 ? (
+                <span className="text-muted/30 mx-1 text-xs select-none" aria-hidden>
+                  →
+                </span>
+              ) : null}
             </div>
           );
         })}
@@ -502,30 +517,122 @@ function ProgressBar({
     (completedAt ? new Date(completedAt).getTime() : Date.now()) - new Date(startedAt).getTime();
 
   return (
-    <section className="space-y-2">
+    <section className="space-y-3">
       <div className="flex items-baseline justify-between gap-3 flex-wrap">
         <div className="flex items-baseline gap-2">
-          <span className="text-sm font-semibold">
-            {done} <span className="text-muted font-normal">/</span> {STAGE_ORDER.length}
+          <span className="text-2xl font-semibold tabular-nums tracking-tight">
+            {done}<span className="text-muted font-normal mx-1">/</span>{STAGE_ORDER.length}
           </span>
-          <span className="text-sm text-muted">stages</span>
+          <span className="text-sm text-muted uppercase tracking-wider">stages</span>
           {running ? (
-            <span className="text-sm text-accent">
-              · <span className="font-mono">{running}</span> running
+            <span className="text-sm text-accent inline-flex items-center gap-1.5 ml-2">
+              <span className="font-mono font-medium">{running}</span>
+              <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+              <span className="text-muted">running</span>
             </span>
           ) : null}
         </div>
-        <div className="text-xs font-mono text-muted">
+        <div className="text-xs font-mono text-muted tabular-nums">
           {formatElapsed(elapsedMs)}
-          {completedAt ? null : <span className="ml-1 text-accent animate-pulse">●</span>}
+          {completedAt ? null : <span className="ml-1.5 text-accent animate-pulse">●</span>}
         </div>
       </div>
-      <div className="h-1.5 bg-rule rounded-full overflow-hidden">
+      <div className="h-2 bg-rule/60 rounded-full overflow-hidden">
         <div
-          className="h-full bg-accent transition-all duration-500 ease-out"
+          className="h-full convoy-progress-fill rounded-full transition-all duration-700 ease-out"
           style={{ width: `${pct}%` }}
         />
       </div>
+    </section>
+  );
+}
+
+/**
+ * Renders only when medic events exist. Sits high in the page (right under
+ * the progress bar) with a magenta glow so a screenshot or video frame makes
+ * it obvious that the Claude-driven medic agent is in the loop.
+ *
+ * The body re-uses the existing tool-call list rendering — this component is
+ * the visual frame, not a duplicated source of truth.
+ */
+function MedicSpotlight({
+  events,
+  runStatus,
+}: {
+  events: EventRow[];
+  runStatus: string;
+}) {
+  const toolCalls = events.filter(isMedicToolUse);
+  if (toolCalls.length === 0) return null;
+
+  const seenFinalize = toolCalls.some((e) => {
+    const p = e.payload as Record<string, unknown> | null;
+    return p?.['tool'] === 'finalize_diagnosis';
+  });
+  const isInvestigating = !seenFinalize && (runStatus === 'running' || runStatus === 'awaiting_fix' || runStatus === 'awaiting_approval');
+  const recent = toolCalls.slice(-4);
+
+  return (
+    <section
+      className={`relative rounded-xl border border-medic/40 bg-gradient-to-br from-medic/10 via-medic/5 to-transparent p-5 ${
+        isInvestigating ? 'convoy-medic-glow' : ''
+      }`}
+    >
+      <div className="flex items-center gap-3 flex-wrap">
+        <span
+          className={`inline-flex items-center justify-center w-8 h-8 rounded-full bg-medic/20 text-medic text-base ${
+            isInvestigating ? 'animate-pulse' : ''
+          }`}
+          aria-hidden
+        >
+          ◇
+        </span>
+        <div className="flex flex-col">
+          <h2 className="text-base font-semibold tracking-tight text-medic">
+            {isInvestigating ? 'Medic is investigating' : 'Medic finished investigating'}
+          </h2>
+          <p className="text-xs text-muted">
+            Claude agent · {toolCalls.length} tool call{toolCalls.length === 1 ? '' : 's'} {isInvestigating ? '· live' : '· complete'}
+          </p>
+        </div>
+        {isInvestigating ? (
+          <span className="ml-auto text-xs text-medic inline-flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-medic animate-pulse" />
+            live
+          </span>
+        ) : null}
+      </div>
+
+      <ol className="mt-4 space-y-1.5">
+        {recent.map((e, idx) => {
+          const realIdx = toolCalls.length - recent.length + idx + 1;
+          const tool = (e.payload as Record<string, unknown>)['tool'] as string;
+          return (
+            <li
+              key={e.id}
+              className="font-mono text-xs flex items-baseline gap-2 flex-wrap text-muted"
+            >
+              <span className="text-medic shrink-0">◇</span>
+              <span className="text-muted/60 tabular-nums shrink-0 w-6 text-right">
+                {realIdx}
+              </span>
+              <span className="text-ink font-semibold">{tool}</span>
+              <span className="text-muted break-all">
+                {renderMedicToolLine(e.payload).replace(/^\S+\s*/, '')}
+              </span>
+              <span className="text-muted/50 ml-auto shrink-0 tabular-nums">
+                {new Date(e.createdAt).toLocaleTimeString()}
+              </span>
+            </li>
+          );
+        })}
+      </ol>
+
+      {toolCalls.length > recent.length ? (
+        <p className="mt-3 text-[11px] text-muted/70">
+          Showing most recent {recent.length} of {toolCalls.length}. Full investigation log below.
+        </p>
+      ) : null}
     </section>
   );
 }
@@ -603,6 +710,9 @@ interface AuthoredFileSummary {
 function ApprovalCard({ runId, approval }: { runId: string; approval: ApprovalRow }) {
   const summary = (approval.summary ?? null) as Record<string, unknown> | null;
 
+  if (approval.kind === 'open_pr' && summary) {
+    return <OpenPrApprovalCard runId={runId} approval={approval} summary={summary} />;
+  }
   if (approval.kind === 'merge_pr' && summary) {
     return <MergePrApprovalCard runId={runId} approval={approval} summary={summary} />;
   }
@@ -622,6 +732,141 @@ function ApprovalCard({ runId, approval }: { runId: string; approval: ApprovalRo
         </pre>
       ) : null}
       <ApprovalActions runId={runId} approvalId={approval.id} kind={approval.kind} />
+    </div>
+  );
+}
+
+function OpenPrApprovalCard({
+  runId,
+  approval,
+  summary,
+}: {
+  runId: string;
+  approval: ApprovalRow;
+  summary: Record<string, unknown>;
+}) {
+  const mode = (summary['mode'] as string | undefined) ?? 'real';
+  const repo = typeof summary['repo'] === 'string' ? summary['repo'] : null;
+  const defaultBranch = typeof summary['default_branch'] === 'string' ? summary['default_branch'] : null;
+  const branchToCreate = typeof summary['branch_to_create'] === 'string' ? summary['branch_to_create'] : null;
+  const note = typeof summary['note'] === 'string' ? summary['note'] : null;
+  const rehearsal = summary['rehearsal'] && typeof summary['rehearsal'] === 'object'
+    ? (summary['rehearsal'] as Record<string, unknown>)
+    : null;
+
+  const rawFiles = summary['files'];
+  const files: AuthoredFileSummary[] = Array.isArray(rawFiles)
+    ? rawFiles.map((f) => {
+        if (typeof f === 'string') {
+          return { path: f, lines: 0, summary: '', contentPreview: '' };
+        }
+        if (f && typeof f === 'object') {
+          const obj = f as Record<string, unknown>;
+          return {
+            path: typeof obj['path'] === 'string' ? obj['path'] : '(unknown)',
+            lines: typeof obj['lines'] === 'number' ? obj['lines'] : 0,
+            summary: typeof obj['summary'] === 'string' ? obj['summary'] : '',
+            contentPreview:
+              typeof obj['contentPreview'] === 'string' ? obj['contentPreview'] : '',
+          };
+        }
+        return { path: '(unknown)', lines: 0, summary: '', contentPreview: '' };
+      })
+    : [];
+
+  return (
+    <div className="border border-warn/40 bg-warn/5 rounded-lg p-5 space-y-4">
+      <div className="flex items-center gap-3 flex-wrap">
+        <span className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-warn">
+          <span className="w-1.5 h-1.5 rounded-full bg-warn animate-pulse" />
+          approve opening PR
+        </span>
+        <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-rule text-muted">
+          {mode === 'scripted' ? 'scripted preview' : 'real PR'}
+        </span>
+        <span className="font-mono text-xs text-muted ml-auto">{approval.id.slice(0, 8)}</span>
+      </div>
+
+      {note ? <p className="text-sm text-muted leading-relaxed">{note}</p> : null}
+
+      {rehearsal ? <RehearsalEvidence rehearsal={rehearsal} /> : (
+        <div className="text-xs text-muted italic">
+          No rehearsal evidence attached. This should not happen in the reordered pipeline —
+          check the rehearse stage output above.
+        </div>
+      )}
+
+      {repo || branchToCreate ? (
+        <div className="text-xs font-mono text-muted space-y-1">
+          {repo ? <div>repo: <span className="text-ink">{repo}</span></div> : null}
+          {defaultBranch ? <div>base: <span className="text-ink">{defaultBranch}</span></div> : null}
+          {branchToCreate ? <div>branch to create: <span className="text-ink">{branchToCreate}</span></div> : null}
+        </div>
+      ) : null}
+
+      <div className="space-y-2">
+        <div className="text-xs font-semibold uppercase tracking-wider text-muted">
+          {files.length} file{files.length === 1 ? '' : 's'} Convoy will commit
+        </div>
+        <div className="space-y-1.5">
+          {files.map((f) => (
+            <AuthoredFileRow key={f.path} file={f} />
+          ))}
+        </div>
+      </div>
+
+      <ApprovalActions runId={runId} approvalId={approval.id} kind={approval.kind} />
+    </div>
+  );
+}
+
+function RehearsalEvidence({ rehearsal }: { rehearsal: Record<string, unknown> }) {
+  const mode = typeof rehearsal['mode'] === 'string' ? rehearsal['mode'] : 'unknown';
+  const healthy = typeof rehearsal['healthy'] === 'boolean' ? rehearsal['healthy'] : null;
+  const durationMs = typeof rehearsal['duration_ms'] === 'number' ? rehearsal['duration_ms'] : null;
+  const logLines = typeof rehearsal['log_lines'] === 'number' ? rehearsal['log_lines'] : null;
+  const p99 = typeof rehearsal['p99_ms'] === 'number' ? rehearsal['p99_ms'] : null;
+  const smokeCount = typeof rehearsal['smoke_tests_passed'] === 'number' ? rehearsal['smoke_tests_passed'] : null;
+  const metrics = rehearsal['metrics'] && typeof rehearsal['metrics'] === 'object'
+    ? (rehearsal['metrics'] as Record<string, unknown>)
+    : null;
+
+  return (
+    <div className="border border-rule rounded-md bg-card p-3 space-y-1.5">
+      <div className="text-xs font-semibold uppercase tracking-wider text-muted">Rehearsal evidence</div>
+      <div className="flex items-center gap-3 flex-wrap text-xs">
+        {healthy === true ? (
+          <span className="inline-flex items-center gap-1.5 text-success">
+            <span className="w-1.5 h-1.5 rounded-full bg-success" /> healthy
+          </span>
+        ) : healthy === false ? (
+          <span className="inline-flex items-center gap-1.5 text-danger">
+            <span className="w-1.5 h-1.5 rounded-full bg-danger" /> breached
+          </span>
+        ) : null}
+        <span className="text-muted">mode: <span className="text-ink font-mono">{mode}</span></span>
+        {durationMs !== null ? (
+          <span className="text-muted">duration: <span className="text-ink tabular-nums">{(durationMs / 1000).toFixed(1)}s</span></span>
+        ) : null}
+        {smokeCount !== null ? (
+          <span className="text-muted">smoke: <span className="text-ink tabular-nums">{smokeCount} passed</span></span>
+        ) : null}
+        {p99 !== null ? (
+          <span className="text-muted">p99: <span className="text-ink tabular-nums">{p99}ms</span></span>
+        ) : null}
+        {logLines !== null ? (
+          <span className="text-muted">logs: <span className="text-ink tabular-nums">{logLines} lines</span></span>
+        ) : null}
+      </div>
+      {metrics ? (
+        <div className="text-xs font-mono text-muted">
+          {Object.entries(metrics).map(([k, v]) => (
+            <span key={k} className="mr-3">
+              {k}=<span className="text-ink">{String(v)}</span>
+            </span>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }

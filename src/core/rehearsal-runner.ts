@@ -46,19 +46,56 @@ const SAFE_ENV_ALLOWLIST = [
   'TMPDIR',
 ] as const;
 
+// Subdirectories where package managers drop locally-installed executables.
+// Prepending these to PATH is what `npm run` / `pnpm` / `yarn` / `uv run`
+// do implicitly, and it's why `"build": "next build"` works from package.json
+// but fails when Convoy shells the same string directly.
+const LOCAL_BIN_SUBDIRS = [
+  'node_modules/.bin', // node: npm / pnpm / yarn / bun hoist bins here
+  '.venv/bin',         // python: uv / modern venv default
+  'venv/bin',          // python: classic `python -m venv venv`
+  '.venv/Scripts',     // python on windows (harmless on posix; existsSync is false)
+  'venv/Scripts',
+] as const;
+
+function resolveLocalBinDirs(cwds: ReadonlyArray<string>): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const cwd of cwds) {
+    if (!cwd) continue;
+    for (const sub of LOCAL_BIN_SUBDIRS) {
+      const path = `${cwd}/${sub}`;
+      if (seen.has(path)) continue;
+      seen.add(path);
+      if (existsSync(path)) out.push(path);
+    }
+  }
+  return out;
+}
+
 function composeEnv(
   target: Pick<RehearsalTarget, 'env' | 'inheritAmbientEnv'>,
+  cwds: ReadonlyArray<string>,
   extra: Record<string, string> = {},
 ): NodeJS.ProcessEnv {
-  if (target.inheritAmbientEnv === true) {
-    return { ...process.env, ...(target.env ?? {}), ...extra };
+  const base: NodeJS.ProcessEnv = target.inheritAmbientEnv === true
+    ? { ...process.env }
+    : (() => {
+        const scrubbed: NodeJS.ProcessEnv = {};
+        for (const key of SAFE_ENV_ALLOWLIST) {
+          const value = process.env[key];
+          if (value !== undefined) scrubbed[key] = value;
+        }
+        return scrubbed;
+      })();
+  const merged: NodeJS.ProcessEnv = { ...base, ...(target.env ?? {}), ...extra };
+  const binDirs = resolveLocalBinDirs(cwds);
+  if (binDirs.length > 0) {
+    const prefix = binDirs.join(':');
+    const existing = merged['PATH'] ?? '';
+    merged['PATH'] = existing ? `${prefix}:${existing}` : prefix;
   }
-  const scrubbed: NodeJS.ProcessEnv = {};
-  for (const key of SAFE_ENV_ALLOWLIST) {
-    const value = process.env[key];
-    if (value !== undefined) scrubbed[key] = value;
-  }
-  return { ...scrubbed, ...(target.env ?? {}), ...extra };
+  return merged;
 }
 
 export interface RehearsalResult {
@@ -199,9 +236,10 @@ export class RehearsalRunner {
 
   async #execWait(shellCmd: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
     await new Promise<void>((resolve, reject) => {
+      const installCwd = this.#target.installCwd ?? this.#target.serviceCwd;
       const proc = spawn('sh', ['-c', shellCmd], {
         cwd,
-        env: composeEnv(this.#target),
+        env: composeEnv(this.#target, [cwd, installCwd, this.#target.serviceCwd]),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       proc.stdout?.on('data', (chunk: Buffer) => this.#appendLog(chunk.toString('utf8')));
@@ -229,9 +267,14 @@ export class RehearsalRunner {
 
   async #startService(signal?: AbortSignal): Promise<void> {
     const cmd = this.#target.startCommand;
+    const installCwd = this.#target.installCwd ?? this.#target.serviceCwd;
     const proc = spawn('sh', ['-c', cmd], {
       cwd: this.#target.serviceCwd,
-      env: composeEnv(this.#target, { PORT: String(this.#target.port) }),
+      env: composeEnv(
+        this.#target,
+        [this.#target.serviceCwd, installCwd],
+        { PORT: String(this.#target.port) },
+      ),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     proc.stdout?.on('data', (chunk: Buffer) => this.#appendLog(chunk.toString('utf8')));
@@ -248,15 +291,30 @@ export class RehearsalRunner {
       if (this.#proc && this.#proc.exitCode !== null) {
         throw new Error(`service exited prematurely with code ${this.#proc.exitCode}`);
       }
+      // A child killed by signal (SIGSEGV, SIGKILL from OOM, SIGTERM) has
+      // exitCode === null and signalCode !== null. Without this check, a
+      // service that crashes during boot causes Convoy to wait the full
+      // health-timeout for nothing, and the downstream medic sees "never
+      // responded" instead of "service crashed".
+      if (this.#proc && this.#proc.signalCode !== null) {
+        throw new Error(`service killed prematurely by signal ${this.#proc.signalCode}`);
+      }
       try {
-        const res = await fetch(url, { signal: AbortSignal.timeout(1000) });
-        if (res.ok) return;
+        // Any HTTP response — even 404 — means the process is up and serving.
+        // The absence of a /health route is not a health failure: the operator
+        // hasn't necessarily wired one, and Convoy shouldn't gate rehearsal on
+        // a Convoy-shaped contract the developer never agreed to. The synthetic
+        // probe stage that follows hits real paths (--probe-path) and measures
+        // real error rates, which is the actual signal we care about.
+        await fetch(url, { signal: AbortSignal.timeout(1000) });
+        return;
       } catch {
-        // keep retrying
+        // Connection refused / aborted / timeout — process not ready yet.
+        // Keep retrying until deadline.
       }
       await sleep(500);
     }
-    throw new Error(`health never responded 200 at ${url} within ${timeoutMs}ms`);
+    throw new Error(`service did not start listening at ${url} within ${timeoutMs}ms`);
   }
 
   async #readMetrics(): Promise<MetricsSnapshot | undefined> {
@@ -281,14 +339,23 @@ export class RehearsalRunner {
 
   async #probe(opts: ProbeOptions, signal?: AbortSignal): Promise<MetricsSnapshot> {
     const base = `http://127.0.0.1:${this.#target.port}`;
+    // Reserve the slot BEFORE awaiting the fetch. The previous version gated
+    // on `ok + err < requests` and incremented only after `await fetch`, so
+    // N concurrent workers would all observe spare capacity, each start a
+    // request, and the final count could overshoot `requests` by up to
+    // concurrency-1. Since JS is single-threaded, `issued++` is atomic with
+    // respect to the read on the preceding line — no lock needed.
+    let issued = 0;
     let ok = 0;
     let err = 0;
     const latencies: number[] = [];
 
     const worker = async (): Promise<void> => {
-      while (ok + err < opts.requests) {
+      while (true) {
         if (signal?.aborted) return;
-        const path = opts.paths[(ok + err) % opts.paths.length] ?? '/';
+        if (issued >= opts.requests) return;
+        const slot = issued++;
+        const path = opts.paths[slot % opts.paths.length] ?? '/';
         const start = Date.now();
         try {
           const res = await fetch(`${base}${path}`, { signal: AbortSignal.timeout(opts.timeoutMs) });

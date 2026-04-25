@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 export interface GitRepoContext {
   path: string;
@@ -161,6 +161,16 @@ export async function createPrFromAuthoredFiles(
     throw new Error('target repo has uncommitted changes; commit or stash before running real-author');
   }
 
+  // Containment check — reject any authored path that would write outside the
+  // repo root BEFORE we mutate git state or disk. The plan is treated as an
+  // executable artifact elsewhere in the pipeline, so "Convoy only authors
+  // deployment-surface files" has to be enforced at the filesystem boundary,
+  // not just assumed from the plan.
+  const repoRoot = resolve(ctx.path);
+  for (const file of files) {
+    assertPathInsideRepo(repoRoot, file.path);
+  }
+
   const branch = `convoy/${runId.slice(0, 8)}`;
 
   // Make sure we're branching from the latest default branch.
@@ -169,7 +179,7 @@ export async function createPrFromAuthoredFiles(
 
   // Write each authored file to disk.
   for (const file of files) {
-    const abs = join(ctx.path, file.path);
+    const abs = resolve(repoRoot, file.path);
     mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, file.contentPreview, 'utf8');
   }
@@ -208,6 +218,25 @@ export async function createPrFromAuthoredFiles(
     throw new Error(`could not parse PR number from ${prUrl}`);
   }
   return { branch, prUrl, prNumber };
+}
+
+/**
+ * Refuse absolute paths and any relative path that resolves outside the repo
+ * root (traversal via `..`, symlink-style escapes). Throws with the offending
+ * path so the caller surfaces it in the run log.
+ */
+function assertPathInsideRepo(repoRoot: string, relPath: string): void {
+  if (isAbsolute(relPath)) {
+    throw new Error(`authored file path must be relative to repo root: ${relPath}`);
+  }
+  const abs = resolve(repoRoot, relPath);
+  if (abs === repoRoot) {
+    throw new Error(`authored file path resolves to repo root itself: ${relPath}`);
+  }
+  const rel = relative(repoRoot, abs);
+  if (rel.startsWith('..') || isAbsolute(rel) || rel.split(sep).includes('..')) {
+    throw new Error(`authored file path escapes repo root: ${relPath}`);
+  }
 }
 
 function extractPrUrl(output: string): string | null {

@@ -170,6 +170,29 @@ export class RollbackTriggeredError extends Error {
   }
 }
 
+/**
+ * Reduce the rehearsal stage's finished-payload to the fields the operator
+ * needs to decide whether to open a PR. Tolerates both scripted and real
+ * modes, and handles the case where rehearsal didn't run or produced no
+ * snapshot. Returns null when there's nothing to show — the approval card
+ * then renders "no rehearsal evidence" instead of a half-populated object.
+ */
+function summarizeRehearsalForApproval(prior: unknown): Record<string, unknown> | null {
+  if (!prior || typeof prior !== 'object') return null;
+  const p = prior as Record<string, unknown>;
+  const summary: Record<string, unknown> = {};
+  if (typeof p['mode'] === 'string') summary['mode'] = p['mode'];
+  else summary['mode'] = 'real-local';
+  if (typeof p['healthy'] === 'boolean') summary['healthy'] = p['healthy'];
+  if (typeof p['duration_ms'] === 'number') summary['duration_ms'] = p['duration_ms'];
+  if (typeof p['p99_ms'] === 'number') summary['p99_ms'] = p['p99_ms'];
+  if (typeof p['smoke_tests_passed'] === 'number') summary['smoke_tests_passed'] = p['smoke_tests_passed'];
+  if (typeof p['log_lines'] === 'number') summary['log_lines'] = p['log_lines'];
+  if (p['metricsAfter'] && typeof p['metricsAfter'] === 'object') summary['metrics'] = p['metricsAfter'];
+  else if (p['metricsBefore'] && typeof p['metricsBefore'] === 'object') summary['metrics'] = p['metricsBefore'];
+  return Object.keys(summary).length > 0 ? summary : null;
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -394,9 +417,14 @@ export class AuthorStage extends BaseStage {
       file_count: files.length,
     });
 
-    await this.awaitApproval(ctx, 'merge_pr', {
+    // Scripted mode never opens a real PR, but the approval card still
+    // shows what rehearsal produced + the file set — so the demo narrative
+    // matches the real flow: operator sees rehearsal evidence, then says
+    // "open it."
+    await this.awaitApproval(ctx, 'open_pr', {
       mode: 'scripted',
-      note: 'Scripted pipeline — no real PR was opened. These are the files Convoy would author.',
+      note: 'Scripted pipeline — no real PR will be opened. These are the files Convoy would commit after rehearsal.',
+      rehearsal: summarizeRehearsalForApproval(ctx.prior['rehearse']),
       files,
     });
 
@@ -435,6 +463,29 @@ export class AuthorStage extends BaseStage {
     }
     this.emit(ctx, 'progress', { phase: 'gh.authenticated', user: auth.user, scopes: auth.scopes });
 
+    // Pre-PR gate: before any git mutation, show the operator what rehearsal
+    // produced + the authored file set, and wait for approval to open the
+    // PR. This is the "rehearsal must pass AND operator must confirm before
+    // PR opens" gate — without it, the sequence was PR-first, prove-later,
+    // which meant rehearsal failures could leave the repo merged but
+    // undeployed.
+    const authoredForApproval = cfg.authoredFiles.map((f) => ({
+      path: f.path,
+      lines: f.contentPreview.split(/\r?\n/).length,
+      summary: f.summary ?? '',
+      contentPreview: f.contentPreview,
+    }));
+
+    await this.awaitApproval(ctx, 'open_pr', {
+      mode: 'real',
+      repo: `${repo.owner}/${repo.repo}`,
+      default_branch: repo.defaultBranch,
+      branch_to_create: `convoy/${ctx.run.id.slice(0, 8)}`,
+      note: 'Rehearsal passed. Convoy will open a PR with these deployment-surface files only — no application source is touched.',
+      rehearsal: summarizeRehearsalForApproval(ctx.prior['rehearse']),
+      files: authoredForApproval,
+    });
+
     let pr;
     try {
       pr = await createPrFromAuthoredFiles(
@@ -462,15 +513,10 @@ export class AuthorStage extends BaseStage {
       pr_url: pr.prUrl,
       pr_number: pr.prNumber,
       branch: pr.branch,
-      note: 'Only Convoy-authored deployment files were committed. Source code is untouched.',
+      note: 'Only Convoy-authored deployment files were committed. Source code is untouched. Review on GitHub and approve to merge.',
       // Full file shape so the approval card can render the same content
       // preview the plan page shows. Operator should never approve blind.
-      files: cfg.authoredFiles.map((f) => ({
-        path: f.path,
-        lines: f.contentPreview.split(/\r?\n/).length,
-        summary: f.summary ?? '',
-        contentPreview: f.contentPreview,
-      })),
+      files: authoredForApproval,
     });
 
     if (cfg.mergeOnApproval) {
@@ -1277,11 +1323,18 @@ function percentile(latencies: number[], q: number): number | undefined {
 }
 
 export function defaultStages(): Stage[] {
+  // Order matters: rehearse runs BEFORE author so no PR is opened and no
+  // repo state is mutated until Convoy has proof the service boots and
+  // responds healthy. The operator approves opening the PR with rehearsal
+  // evidence on-screen, then approves merging the PR after reviewing it on
+  // GitHub. Previously author ran first and could merge before rehearsal,
+  // which meant a rehearsal failure could leave the repo in a merged-but-
+  // undeployed state.
   return [
     new ScanStage(),
     new PickStage(),
-    new AuthorStage(),
     new RehearseStage(),
+    new AuthorStage(),
     new CanaryStage(),
     new PromoteStage(),
     new ObserveStage(),

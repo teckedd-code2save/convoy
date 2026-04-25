@@ -1,30 +1,37 @@
 @import "tailwindcss";
 
 @theme {
-  --color-ink: #0b0d10;
-  --color-paper: #fafaf9;
-  --color-card: #ffffff;
-  --color-muted: #6b7280;
-  --color-rule: #e5e7eb;
-  --color-accent: #0f6fff;
-  --color-success: #0a8754;
-  --color-warn: #b45309;
-  --color-danger: #b91c1c;
+  --color-ink: #f4f4f5;
+  --color-paper: #0a0a0b;
+  --color-card: #14141a;
+  --color-card-elevated: #1c1c25;
+  --color-muted: #8a8a99;
+  --color-rule: #26262f;
+  --color-accent: #6ea8ff;
+  --color-accent-glow: #6ea8ff33;
+  --color-success: #38d399;
+  --color-warn: #f5a524;
+  --color-danger: #ef4444;
+  --color-medic: #c084fc;
+  --color-medic-glow: #c084fc26;
 
-  --font-sans: ui-sans-serif, -apple-system, 'BlinkMacSystemFont', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
-  --font-mono: ui-monospace, 'SF Mono', 'Menlo', 'Consolas', monospace;
+  --font-sans: var(--font-inter), ui-sans-serif, -apple-system, 'BlinkMacSystemFont', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, 'SF Mono', 'Menlo', 'Consolas', monospace;
 }
 
 html {
-  color-scheme: light;
+  color-scheme: dark;
 }
 
 body {
-  background: var(--color-paper);
+  background:
+    radial-gradient(ellipse 80% 50% at 50% -20%, color-mix(in srgb, var(--color-accent) 8%, transparent), transparent),
+    var(--color-paper);
   color: var(--color-ink);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  font-feature-settings: 'cv11', 'ss01', 'ss03';
 }
 
 pre,
@@ -35,4 +42,39 @@ code {
 a {
   color: inherit;
   text-decoration: none;
+}
+
+/* Active-stage glow — used by ProgressBar + StagesSection */
+@keyframes convoy-pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 0 0 var(--color-accent-glow), 0 0 12px 0 var(--color-accent-glow);
+    border-color: var(--color-accent);
+  }
+  50% {
+    box-shadow: 0 0 0 4px var(--color-accent-glow), 0 0 24px 2px var(--color-accent-glow);
+    border-color: color-mix(in srgb, var(--color-accent) 80%, white);
+  }
+}
+.convoy-pulse {
+  animation: convoy-pulse-glow 2s ease-in-out infinite;
+}
+
+/* Medic spotlight — distinct from accent so the operator sees medic specifically */
+@keyframes convoy-medic-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 var(--color-medic-glow), 0 0 18px 0 var(--color-medic-glow);
+  }
+  50% {
+    box-shadow: 0 0 0 6px var(--color-medic-glow), 0 0 32px 4px var(--color-medic-glow);
+  }
+}
+.convoy-medic-glow {
+  animation: convoy-medic-pulse 2.4s ease-in-out infinite;
+}
+
+/* Subtle scanline fill so the progress bar reads as "deployment console" */
+.convoy-progress-fill {
+  background-image:
+    linear-gradient(90deg, var(--color-accent), color-mix(in srgb, var(--color-accent) 70%, white));
+  box-shadow: 0 0 16px var(--color-accent-glow);
 }

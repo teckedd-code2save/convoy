@@ -201,7 +201,50 @@ const SYMBOL = {
   bullet: '·',
   decision: '→',
   pause: '⏸',
+  rule: '│',
+  cornerTL: '╭',
+  cornerTR: '╮',
+  cornerBL: '╰',
+  cornerBR: '╯',
+  hRule: '─',
 } as const;
+
+/**
+ * Visual prefix for every Convoy log line — a dim cyan vertical rule that
+ * makes Convoy output unmistakable inside a Claude Code transcript or any
+ * terminal where it shares space with other tools. Replaces the prior bare
+ * 2-space indent without widening the layout.
+ */
+const CONVOY_RULE = `${pc.dim(pc.cyan(SYMBOL.rule))} `;
+
+/**
+ * Top-of-run banner. Drawn once when the orchestrator emits run.created.
+ * Renders a 3-line unicode box with the run id + repository so screenshots
+ * and demo recordings have a clear "this is Convoy starting" anchor.
+ */
+function convoyBanner(title: string, subtitle: string): string {
+  const stripAnsi = (s: string): string => s.replace(/\[[0-9;]*m/g, '');
+  const titleLen = stripAnsi(title).length;
+  const subtitleLen = stripAnsi(subtitle).length;
+  const inner = Math.max(titleLen, subtitleLen) + 4;
+  const horiz = SYMBOL.hRule.repeat(inner);
+  const padTitle = ' '.repeat(inner - titleLen - 4);
+  const padSubtitle = ' '.repeat(inner - subtitleLen - 4);
+  return [
+    `${pc.cyan(SYMBOL.cornerTL)}${pc.cyan(horiz)}${pc.cyan(SYMBOL.cornerTR)}`,
+    `${pc.cyan(SYMBOL.rule)}  ${title}${padTitle}  ${pc.cyan(SYMBOL.rule)}`,
+    `${pc.cyan(SYMBOL.rule)}  ${subtitle}${padSubtitle}  ${pc.cyan(SYMBOL.rule)}`,
+    `${pc.cyan(SYMBOL.cornerBL)}${pc.cyan(horiz)}${pc.cyan(SYMBOL.cornerBR)}`,
+  ].join('\n');
+}
+
+/**
+ * Bottom-of-run rule. Drawn once when the run reaches a terminal status,
+ * closing the visual block opened by the banner.
+ */
+function convoyClosingRule(): string {
+  return pc.dim(pc.cyan(`${SYMBOL.cornerBL}${SYMBOL.hRule.repeat(48)}`));
+}
 
 function isPlatform(value: string): value is Platform {
   return (SUPPORTED_PLATFORMS as readonly string[]).includes(value);
@@ -242,13 +285,13 @@ function formatDuration(ms: number): string {
 function renderRunEvent(event: RunEvent): void {
   switch (event.kind) {
     case 'started':
-      process.stdout.write(`\n${pc.cyan(SYMBOL.stage)} ${pc.bold(event.stage)}\n`);
+      process.stdout.write(`${CONVOY_RULE}\n${CONVOY_RULE}${pc.cyan(SYMBOL.stage)} ${pc.bold(event.stage)}\n`);
       return;
     case 'finished':
-      process.stdout.write(`  ${pc.green(SYMBOL.ok)} ${pc.dim(compact(event.payload))}\n`);
+      process.stdout.write(`${CONVOY_RULE}${pc.green(SYMBOL.ok)} ${pc.dim(compact(event.payload))}\n`);
       return;
     case 'failed':
-      process.stdout.write(`  ${pc.red(SYMBOL.fail)} ${compact(event.payload)}\n`);
+      process.stdout.write(`${CONVOY_RULE}${pc.red(SYMBOL.fail)} ${compact(event.payload)}\n`);
       return;
     case 'progress': {
       // Give medic agent tool calls a distinct line so the operator sees
@@ -266,21 +309,21 @@ function renderRunEvent(event: RunEvent): void {
           else if (typeof io['n'] === 'number') hint = `n=${io['n']}`;
         }
         process.stdout.write(
-          `  ${pc.magenta('◇')} ${pc.magenta('medic')} ${pc.dim(tool)} ${hint ? pc.dim(hint) : ''}\n`,
+          `${CONVOY_RULE}${pc.magenta('◇')} ${pc.magenta('medic')} ${pc.dim(tool)} ${hint ? pc.dim(hint) : ''}\n`,
         );
         return;
       }
-      process.stdout.write(`  ${pc.dim(SYMBOL.bullet)} ${pc.dim(compact(event.payload))}\n`);
+      process.stdout.write(`${CONVOY_RULE}${pc.dim(SYMBOL.bullet)} ${pc.dim(compact(event.payload))}\n`);
       return;
     }
     case 'decision':
-      process.stdout.write(`  ${pc.cyan(SYMBOL.decision)} ${compact(event.payload, 2)}\n`);
+      process.stdout.write(`${CONVOY_RULE}${pc.cyan(SYMBOL.decision)} ${compact(event.payload, 2)}\n`);
       return;
     case 'diagnosis':
-      process.stdout.write(`  ${pc.yellow('!')} ${compact(event.payload)}\n`);
+      process.stdout.write(`${CONVOY_RULE}${pc.yellow('!')} ${compact(event.payload)}\n`);
       return;
     case 'log':
-      process.stdout.write(`  ${pc.dim('|')} ${pc.dim(compact(event.payload))}\n`);
+      process.stdout.write(`${CONVOY_RULE}${pc.dim('|')} ${pc.dim(compact(event.payload))}\n`);
       return;
   }
 }
@@ -289,35 +332,42 @@ function attachRenderer(bus: ConvoyBus, startedAt: Date, openInUI = false): () =
   return bus.subscribe((e: ConvoyBusEvent) => {
     switch (e.type) {
       case 'run.created': {
-        const head = `${pc.bold(pc.cyan(SYMBOL.run))} ${pc.bold(`Convoy run ${e.run.id.slice(0, 8)} started`)}`;
         const url = webUrl(`/runs/${e.run.id}`);
-        process.stdout.write(`${head}\n  ${pc.dim('Repository:')} ${e.run.repoUrl}\n`);
-        process.stdout.write(`  ${pc.cyan('▶')} ${pc.dim('Watch live:')} ${pc.cyan(url)}\n`);
+        const title = `${pc.bold(pc.cyan('▲ CONVOY'))}  ${pc.dim('·')}  run ${pc.bold(e.run.id.slice(0, 8))}`;
+        const subtitle = `${pc.dim('target:')} ${e.run.repoUrl}`;
+        process.stdout.write(`\n${convoyBanner(title, subtitle)}\n`);
+        process.stdout.write(`${CONVOY_RULE}${pc.cyan('▶')} ${pc.dim('Watch live:')} ${pc.cyan(url)}\n`);
         if (openInUI) void openInBrowser(url);
         return;
       }
       case 'run.updated': {
         if (e.run.status === 'succeeded') {
           const ms = Date.now() - startedAt.getTime();
+          process.stdout.write(`${CONVOY_RULE}\n`);
           process.stdout.write(
-            `\n${pc.bold(pc.green(SYMBOL.run))} ${pc.bold(pc.green(`Convoy succeeded in ${formatDuration(ms)}`))}\n`,
+            `${CONVOY_RULE}${pc.bold(pc.green(SYMBOL.run))} ${pc.bold(pc.green(`Convoy succeeded in ${formatDuration(ms)}`))}\n`,
           );
           if (e.run.liveUrl) {
-            process.stdout.write(`  ${pc.dim('Live URL:')} ${pc.cyan(e.run.liveUrl)}\n`);
+            process.stdout.write(`${CONVOY_RULE}${pc.dim('Live URL:')} ${pc.cyan(e.run.liveUrl)}\n`);
           }
+          process.stdout.write(`${convoyClosingRule()}\n`);
         } else if (e.run.status === 'awaiting_fix') {
           const ms = Date.now() - startedAt.getTime();
+          process.stdout.write(`${CONVOY_RULE}\n`);
           process.stdout.write(
-            `\n${pc.bold(pc.yellow(SYMBOL.pause))} ${pc.bold(pc.yellow(`Paused after ${formatDuration(ms)} — awaiting developer fix`))}\n`,
+            `${CONVOY_RULE}${pc.bold(pc.yellow(SYMBOL.pause))} ${pc.bold(pc.yellow(`Paused after ${formatDuration(ms)} — awaiting developer fix`))}\n`,
           );
           process.stdout.write(
-            `  ${pc.dim('Medic diagnosed a code-level failure. Fix your code, push the commit, and re-run \`convoy apply\`.')}\n`,
+            `${CONVOY_RULE}${pc.dim('Medic diagnosed a code-level failure. Fix your code, then re-run with')} ${pc.bold('convoy resume')}${pc.dim('.')}\n`,
           );
+          process.stdout.write(`${convoyClosingRule()}\n`);
         } else if (e.run.status === 'failed') {
           const ms = Date.now() - startedAt.getTime();
+          process.stdout.write(`${CONVOY_RULE}\n`);
           process.stdout.write(
-            `\n${pc.bold(pc.red(SYMBOL.run))} ${pc.bold(pc.red(`Convoy failed after ${formatDuration(ms)}`))}\n`,
+            `${CONVOY_RULE}${pc.bold(pc.red(SYMBOL.run))} ${pc.bold(pc.red(`Convoy failed after ${formatDuration(ms)}`))}\n`,
           );
+          process.stdout.write(`${convoyClosingRule()}\n`);
         }
         return;
       }
@@ -326,12 +376,12 @@ function attachRenderer(bus: ConvoyBus, startedAt: Date, openInUI = false): () =
         return;
       case 'approval.requested':
         process.stdout.write(
-          `  ${pc.yellow(SYMBOL.pause)} ${pc.yellow(`awaiting ${e.approval.kind} approval`)}\n`,
+          `${CONVOY_RULE}${pc.yellow(SYMBOL.pause)} ${pc.yellow(`awaiting ${e.approval.kind} approval`)}\n`,
         );
         return;
       case 'approval.decided': {
         const mark = e.approval.status === 'approved' ? pc.green(SYMBOL.ok) : pc.red(SYMBOL.fail);
-        process.stdout.write(`  ${mark} ${pc.dim(`${e.approval.kind} ${e.approval.status}`)}\n`);
+        process.stdout.write(`${CONVOY_RULE}${mark} ${pc.dim(`${e.approval.kind} ${e.approval.status}`)}\n`);
         return;
       }
     }
@@ -1314,8 +1364,11 @@ function buildRealRehearsalOpts(plan: ConvoyPlan, opts: ApplyOpts): RealRehearsa
   if (!startCommand) return null;
 
   const port = rehearsal.expectedPort ?? 8080;
-  const healthPath = '/health';
-  const metricsPath = '/metrics';
+  // Prefer what the plan says — that's what the operator reviewed. Fall back
+  // to `/health` and `/metrics` for legacy plans that didn't persist these
+  // fields, so older saved plans keep working.
+  const healthPath = rehearsal.healthPath ?? '/health';
+  const metricsPath = rehearsal.metricsPath ?? '/metrics';
   const installCommand = detectInstallCommand(plan);
   const buildCommand = rehearsal.buildCommand ?? undefined;
 
@@ -1594,6 +1647,17 @@ async function runStatus(runId?: string): Promise<void> {
       process.stdout.write(`  ${pc.dim('Reason:')}     ${run.outcomeReason}\n`);
     }
 
+    // The timeline URL is the main reason to run `status` on a paused run —
+    // it's where the operator approves gates and reads the medic diagnosis.
+    // Spawn the viewer if it's down so the URL we print actually resolves.
+    const viewer = await ensureWebViewerRunning(convoyWebDir());
+    const timelineUrl = webUrl(`/runs/${run.id}`);
+    if (viewer.up) {
+      process.stdout.write(`  ${pc.dim('Timeline:')}   ${pc.cyan(timelineUrl)}${viewer.spawned ? pc.dim(' (web viewer started)') : ''}\n`);
+    } else {
+      process.stdout.write(`  ${pc.dim('Timeline:')}   ${pc.cyan(timelineUrl)} ${pc.yellow('(viewer not reachable')}${viewer.note ? pc.yellow(`: ${viewer.note}`) : ''}${pc.yellow(')')}\n`);
+    }
+
     const events = store.listEvents(run.id);
     const perStage = new Map<StageName, { started: boolean; finished: boolean; failed: boolean }>();
     for (const event of events) {
@@ -1628,6 +1692,76 @@ async function runStatus(runId?: string): Promise<void> {
   } finally {
     store.close();
   }
+}
+
+/**
+ * `convoy resume [runId]` — re-applies the plan associated with a paused or
+ * failed run after the developer has fixed the underlying code. The orchestrator
+ * always creates a fresh run row on apply (stages are not idempotent across
+ * partial state), so this is "rerun the same plan", not "continue the same row".
+ *
+ * Defaults to the most recent run when no id is given, matching `convoy status`.
+ * Refuses to resume runs that succeeded or are still in flight.
+ */
+async function runResume(runId: string | undefined, opts: ApplyOpts): Promise<void> {
+  const store = new RunStateStore(STATE_PATH);
+  let planId: string | null = null;
+  let resumedFromShort = '';
+  let priorReason: string | null = null;
+  try {
+    const run: Run | null = runId
+      ? store.getRun(runId)
+      : (store.listRecentRuns(1)[0] ?? null);
+
+    if (!run) {
+      console.error(pc.yellow(runId ? `Run not found: ${runId}` : 'No runs found.'));
+      console.error(pc.dim('Run `convoy plans` then `convoy apply <planId>` to start a fresh run.'));
+      process.exitCode = 1;
+      return;
+    }
+
+    if (run.status === 'running' || run.status === 'pending') {
+      console.error(
+        pc.yellow(`Run ${run.id.slice(0, 8)} is still ${run.status} — wait for it to finish or pause before resuming.`),
+      );
+      process.exitCode = 1;
+      return;
+    }
+    if (run.status === 'succeeded') {
+      console.error(
+        pc.yellow(`Run ${run.id.slice(0, 8)} already succeeded — nothing to resume.`),
+      );
+      console.error(pc.dim(`Apply the plan again with: convoy apply ${run.planId ?? '<planId>'}`));
+      process.exitCode = 1;
+      return;
+    }
+    if (!run.planId) {
+      console.error(
+        pc.red(`Run ${run.id.slice(0, 8)} has no plan_id — cannot resume.`),
+      );
+      console.error(pc.dim('This run was started before plan tracking; create a fresh plan with `convoy plan <path> --save`.'));
+      process.exitCode = 2;
+      return;
+    }
+
+    planId = run.planId;
+    resumedFromShort = run.id.slice(0, 8);
+    priorReason = run.outcomeReason;
+  } finally {
+    store.close();
+  }
+
+  process.stdout.write(
+    `${pc.bold(pc.cyan(SYMBOL.run))} ${pc.dim('Resuming from run')} ${pc.bold(resumedFromShort)} ${pc.dim('— re-applying plan')} ${pc.bold(planId.slice(0, 8))}\n`,
+  );
+  if (priorReason) {
+    process.stdout.write(`  ${pc.dim('Prior failure:')} ${priorReason}\n`);
+  }
+  process.stdout.write(
+    `  ${pc.dim('Note: a new run id will be assigned. The previous run row is preserved for history.')}\n\n`,
+  );
+
+  await runApply(planId, opts);
 }
 
 const program = new Command()
@@ -1744,6 +1878,51 @@ program
   }, {} as Record<string, string>)
   .action(async (planId: string, options: ApplyOpts) => {
     await runApply(planId, options);
+  });
+
+program
+  .command('resume [runId]')
+  .description('Re-apply the plan from a paused or failed run after fixing the code. Defaults to the most recent run. Creates a new run row.')
+  .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
+  .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
+  .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
+  .option(
+    '--already-set <keys>',
+    'comma-separated env var names the operator declares are already set on the deploy target (no platform queries). Example: --already-set=DATABASE_URL,CLERK_SECRET_KEY',
+    (value: string) => value.split(',').map((k) => k.trim()).filter((k) => k.length > 0),
+  )
+  .option('--recurring', 'declare this as an update to an already-live service (adjusts preflight tone; no platform probing)')
+  .option('--platform <platform>', 'override the plan\'s chosen platform: fly | railway | vercel | cloudrun — re-scored at apply time')
+  .option('--demo', 'scripted pipeline (no PR, no subprocess, no Fly deploy)')
+  .option('--no-real-author', 'stub the author stage instead of opening a real PR')
+  .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
+  .option('--no-real-fly', 'stub the deploy stages instead of deploying to Fly')
+  .option('--no-auto-merge', 'on approval, wait for you to merge the PR on GitHub instead of merging automatically')
+  .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
+  .option('--fly-app <name>', 'Fly.io app name (auto-generated from target if omitted)')
+  .option('--fly-org <org>', 'Fly.io organization (default: personal)')
+  .option('--no-fly-create-app', 'do NOT create the Fly app if it does not exist (default: create)')
+  .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate (default: canary)')
+  .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set` (default: <target>/.env.convoy-secrets)')
+  .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds (default: 60)', (v) => Number(v))
+  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary (triggers medic with fixture logs)')
+  .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
+  .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
+  .option(
+    '--probe-path <path>',
+    'probe path for real rehearsal load (repeatable; default: the detected health path)',
+    (value: string, acc: string[]) => [...acc, value],
+    [] as string[],
+  )
+  .option('--probe-requests <n>', 'number of requests in the real rehearsal probe', (v) => Number(v))
+  .option('--probe-concurrency <n>', 'concurrency in the real rehearsal probe', (v) => Number(v))
+  .option('--env <kv>', 'env var to pass to the subprocess, KEY=VALUE (repeatable)', (value: string, acc: Record<string, string>) => {
+    const idx = value.indexOf('=');
+    if (idx > 0) acc[value.slice(0, idx)] = value.slice(idx + 1);
+    return acc;
+  }, {} as Record<string, string>)
+  .action(async (runId: string | undefined, options: ApplyOpts) => {
+    await runResume(runId, options);
   });
 
 program

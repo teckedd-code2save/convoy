@@ -84,6 +84,19 @@ export interface PlanRehearsalSection {
   buildCommand: string | null;
   startCommand: string | null;
   expectedPort: number | null;
+  /**
+   * Health route the scanner detected (or null if unknown). Runtime
+   * rehearsal uses this as the authoritative probe path so the plan and
+   * the runner agree on what "healthy" means. Plans written before this
+   * field existed will be null, and the CLI falls back to `/health`.
+   */
+  healthPath: string | null;
+  /**
+   * Metrics route, if one was detected. The rehearsal runner scrapes this
+   * for baseline + final snapshots. Null means "no metrics available" —
+   * the runner synthesizes metrics from synthetic load in that case.
+   */
+  metricsPath: string | null;
   validations: string[];
   estimatedDurationSeconds: number;
   estimatedCost: string;
@@ -102,7 +115,7 @@ export interface PlanRollbackSection {
 }
 
 export interface PlanApproval {
-  kind: 'merge_pr' | 'promote' | 'rollback' | 'apply_migration';
+  kind: 'open_pr' | 'merge_pr' | 'promote' | 'rollback' | 'apply_migration';
   description: string;
   required: true;
 }
