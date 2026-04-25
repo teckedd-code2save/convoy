@@ -24,15 +24,25 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # Scripted ship of the in-repo demo-app. --demo runs every stage as the
+      # scripted variant — no PR, no rehearsal subprocess, no Fly deploy — so
+      # the runner needs zero external auth. --auto-approve clears every gate.
+      # CONVOY_NO_AUTOSPAWN=1 skips the web-viewer auto-spawn (no `web/`
+      # node_modules in this job, and a viewer makes no sense in CI anyway).
       - name: Smoke — ship dry-run
         env:
           CONVOY_STATE_PATH: ${{ runner.temp }}/convoy-state.db
-        run: npm run convoy -- ship https://github.com/convoy/smoke-test
+          CONVOY_PLANS_DIR: ${{ runner.temp }}/convoy-plans
+          CONVOY_NO_AUTOSPAWN: '1'
+        run: npm run convoy -- ship ./demo-app --demo --auto-approve
 
       - name: Smoke — status
         env:
           CONVOY_STATE_PATH: ${{ runner.temp }}/convoy-state.db
+          CONVOY_NO_AUTOSPAWN: '1'
         run: npm run convoy -- status
 
       - name: Smoke — plan (deterministic fallback)
+        env:
+          CONVOY_PLANS_DIR: ${{ runner.temp }}/convoy-plans
         run: npm run convoy -- plan . --no-ai
