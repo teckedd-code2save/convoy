@@ -4,7 +4,7 @@ import pc from 'picocolors';
 
 import { dirname, resolve } from 'node:path';
 
-import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import * as readline from 'node:readline/promises';
 import { setTimeout as sleepMs } from 'node:timers/promises';
 import { stdin, stdout } from 'node:process';
@@ -328,17 +328,19 @@ function formatDuration(ms: number): string {
   return `${minutes}m ${rest}s`;
 }
 
-function renderRunEvent(event: RunEvent): void {
+/**
+ * Format a single run event as the operator-facing CLI line(s). Returns the
+ * string with trailing newline(s); callers either write it to stdout (live
+ * rendering) or accumulate it for replay artifacts.
+ */
+function formatRunEvent(event: RunEvent): string {
   switch (event.kind) {
     case 'started':
-      process.stdout.write(`${CONVOY_RULE}\n${CONVOY_RULE}${pc.cyan(SYMBOL.stage)} ${pc.bold(event.stage)}\n`);
-      return;
+      return `${CONVOY_RULE}\n${CONVOY_RULE}${pc.cyan(SYMBOL.stage)} ${pc.bold(event.stage)}\n`;
     case 'finished':
-      process.stdout.write(`${CONVOY_RULE}${pc.green(SYMBOL.ok)} ${pc.dim(compact(event.payload))}\n`);
-      return;
+      return `${CONVOY_RULE}${pc.green(SYMBOL.ok)} ${pc.dim(compact(event.payload))}\n`;
     case 'failed':
-      process.stdout.write(`${CONVOY_RULE}${pc.red(SYMBOL.fail)} ${compact(event.payload)}\n`);
-      return;
+      return `${CONVOY_RULE}${pc.red(SYMBOL.fail)} ${compact(event.payload)}\n`;
     case 'progress': {
       // Give medic agent tool calls a distinct line so the operator sees
       // "medic is reading src/..., medic is grepping for..." as investigative
@@ -354,32 +356,26 @@ function renderRunEvent(event: RunEvent): void {
           else if (typeof io['pattern'] === 'string') hint = `/${io['pattern']}/`;
           else if (typeof io['n'] === 'number') hint = `n=${io['n']}`;
         }
-        process.stdout.write(
-          `${CONVOY_RULE}${pc.magenta('◇')} ${pc.magenta('medic')} ${pc.dim(tool)} ${hint ? pc.dim(hint) : ''}\n`,
-        );
-        return;
+        return `${CONVOY_RULE}${pc.magenta('◇')} ${pc.magenta('medic')} ${pc.dim(tool)} ${hint ? pc.dim(hint) : ''}\n`;
       }
-      process.stdout.write(`${CONVOY_RULE}${pc.dim(SYMBOL.bullet)} ${pc.dim(compact(event.payload))}\n`);
-      return;
+      return `${CONVOY_RULE}${pc.dim(SYMBOL.bullet)} ${pc.dim(compact(event.payload))}\n`;
     }
     case 'decision':
-      process.stdout.write(`${CONVOY_RULE}${pc.cyan(SYMBOL.decision)} ${compact(event.payload, 2)}\n`);
-      return;
+      return `${CONVOY_RULE}${pc.cyan(SYMBOL.decision)} ${compact(event.payload, 2)}\n`;
     case 'diagnosis':
-      process.stdout.write(`${CONVOY_RULE}${pc.yellow('!')} ${compact(event.payload)}\n`);
-      return;
+      return `${CONVOY_RULE}${pc.yellow('!')} ${compact(event.payload)}\n`;
     case 'log':
-      process.stdout.write(`${CONVOY_RULE}${pc.dim('|')} ${pc.dim(compact(event.payload))}\n`);
-      return;
+      return `${CONVOY_RULE}${pc.dim('|')} ${pc.dim(compact(event.payload))}\n`;
     case 'skipped':
       // Render skipped on its own line block matching `started → finished`,
       // since the user is replacing both. Reads as: "I remembered this was
       // already done; I'm not redoing it."
-      process.stdout.write(
-        `${CONVOY_RULE}\n${CONVOY_RULE}${pc.dim('⤳')} ${pc.dim(`${event.stage} ${pc.italic('skipped — already finished in prior attempt')}`)}\n`,
-      );
-      return;
+      return `${CONVOY_RULE}\n${CONVOY_RULE}${pc.dim('⤳')} ${pc.dim(`${event.stage} ${pc.italic('skipped — already finished in prior attempt')}`)}\n`;
   }
+}
+
+function renderRunEvent(event: RunEvent): void {
+  process.stdout.write(formatRunEvent(event));
 }
 
 function attachRenderer(bus: ConvoyBus, startedAt: Date, openInUI = false): () => void {
@@ -1958,6 +1954,272 @@ async function runResume(runId: string | undefined, opts: ApplyOpts): Promise<vo
   await runApply(planId, resumeOpts);
 }
 
+interface ReplayOpts {
+  outDir?: string;
+  noAnsi?: boolean;
+}
+
+/**
+ * `convoy replay [runId]` — read a finished run from the state DB and
+ * generate demo media artifacts. Outputs `terminal.txt` (re-rendered CLI
+ * output, banner + rules + medic + skipped + outcome) and `story.md`
+ * (human-readable narrative with stage table, medic involvement, and
+ * outcome card).
+ *
+ * The first cut is intentionally text-only — no Playwright screenshots,
+ * no ffmpeg. The operator records their own screen as the demo source of
+ * truth (per the "show the real product, don't fake it" rule); these
+ * artifacts back-fill the cue cards, social copy, and README hero.
+ *
+ * Defaults to the most recent run when no id is given.
+ */
+async function runReplay(runId: string | undefined, opts: ReplayOpts): Promise<void> {
+  const store = new RunStateStore(STATE_PATH);
+  try {
+    const run = runId
+      ? store.getRun(runId)
+      : (store.listRecentRuns(1)[0] ?? null);
+    if (!run) {
+      console.error(pc.yellow(runId ? `Run not found: ${runId}` : 'No runs found.'));
+      process.exitCode = 1;
+      return;
+    }
+
+    const events = store.listEvents(run.id);
+    if (events.length === 0) {
+      console.error(pc.yellow(`Run ${run.id.slice(0, 8)} has no events — nothing to replay.`));
+      process.exitCode = 1;
+      return;
+    }
+
+    const baseOut = opts.outDir ?? resolve(process.cwd(), 'demo-output');
+    const outDir = resolve(baseOut, run.id.slice(0, 8));
+    mkdirSync(outDir, { recursive: true });
+
+    // ---- terminal.txt ----
+    // Re-render the run as if it were live, so the file `cat`'s back to a
+    // terminal looking exactly like a real apply did. ANSI codes preserved
+    // by default; --no-ansi strips them for plain-text social posts.
+    const terminalLines: string[] = [];
+    const startedAt = new Date(run.startedAt);
+    const completedAt = run.completedAt ? new Date(run.completedAt) : new Date();
+    const elapsedMs = completedAt.getTime() - startedAt.getTime();
+
+    // Banner — same shape attachRenderer prints on run.created.
+    const planShort = run.planId ? run.planId.slice(0, 8) : 'unknown';
+    const platformLabel = run.platform ? ` ${pc.dim('·')} ${pc.bold(run.platform)}` : '';
+    const title = `${pc.bold(pc.cyan('▲ CONVOY'))}  ${pc.dim('·')}  run ${pc.bold(run.id.slice(0, 8))}  ${pc.dim('·')}  plan ${pc.bold(planShort)}${platformLabel}`;
+    const subtitle = `${pc.dim('target:')} ${run.repoUrl}`;
+    terminalLines.push(`\n${convoyBanner(title, subtitle)}\n`);
+    terminalLines.push(`${CONVOY_RULE}${pc.cyan('▶')} ${pc.dim('Watch live:')} ${pc.cyan(webUrl(`/runs/${run.id}`))}\n`);
+
+    for (const event of events) {
+      terminalLines.push(formatRunEvent(event));
+    }
+
+    // Final status — mirror attachRenderer's run.updated handling.
+    if (run.status === 'succeeded') {
+      terminalLines.push(`${CONVOY_RULE}\n`);
+      terminalLines.push(`${CONVOY_RULE}${pc.bold(pc.green(SYMBOL.run))} ${pc.bold(pc.green(`Convoy succeeded in ${formatDuration(elapsedMs)}`))}\n`);
+      if (run.liveUrl) terminalLines.push(`${CONVOY_RULE}${pc.dim('Live URL:')} ${pc.cyan(run.liveUrl)}\n`);
+    } else if (run.status === 'awaiting_fix') {
+      terminalLines.push(`${CONVOY_RULE}\n`);
+      terminalLines.push(`${CONVOY_RULE}${pc.bold(pc.yellow(SYMBOL.pause))} ${pc.bold(pc.yellow(`Paused after ${formatDuration(elapsedMs)} — awaiting developer fix`))}\n`);
+      if (run.outcomeReason) terminalLines.push(`${CONVOY_RULE}${pc.dim('Reason:')} ${run.outcomeReason}\n`);
+    } else if (run.status === 'failed' || run.status === 'rolled_back') {
+      terminalLines.push(`${CONVOY_RULE}\n`);
+      const color = run.status === 'rolled_back' ? pc.yellow : pc.red;
+      terminalLines.push(`${CONVOY_RULE}${pc.bold(color(SYMBOL.run))} ${pc.bold(color(`Convoy ${run.status} after ${formatDuration(elapsedMs)}`))}\n`);
+      if (run.outcomeReason) terminalLines.push(`${CONVOY_RULE}${pc.dim('Reason:')} ${run.outcomeReason}\n`);
+    }
+    terminalLines.push(`${convoyClosingRule()}\n`);
+
+    let terminalOut = terminalLines.join('');
+    if (opts.noAnsi) {
+      // Strip ANSI escape sequences (ESC[...m). Keeps unicode glyphs (│ ⤳ ◇).
+      terminalOut = terminalOut.replace(/\x1b\[[0-9;]*m/g, '');
+    }
+    const terminalPath = resolve(outDir, 'terminal.txt');
+    writeFileSync(terminalPath, terminalOut, 'utf8');
+
+    // ---- story.md ----
+    const storyPath = resolve(outDir, 'story.md');
+    writeFileSync(storyPath, generateStoryMarkdown(run, events, elapsedMs), 'utf8');
+
+    // ---- events.json ----
+    // Raw events for archival; useful when iterating on story.md format
+    // without re-running.
+    const eventsPath = resolve(outDir, 'events.json');
+    writeFileSync(
+      eventsPath,
+      JSON.stringify(
+        {
+          run: {
+            id: run.id,
+            repoUrl: run.repoUrl,
+            platform: run.platform,
+            status: run.status,
+            startedAt: run.startedAt,
+            completedAt: run.completedAt,
+            liveUrl: run.liveUrl,
+            planId: run.planId,
+            outcomeReason: run.outcomeReason,
+          },
+          events,
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+
+    process.stdout.write(`${pc.green('✓')} Replay artifacts for run ${pc.bold(run.id.slice(0, 8))}:\n`);
+    process.stdout.write(`  ${pc.dim('terminal:')} ${terminalPath}\n`);
+    process.stdout.write(`  ${pc.dim('story:')}    ${storyPath}\n`);
+    process.stdout.write(`  ${pc.dim('events:')}   ${eventsPath}\n`);
+    process.stdout.write(`\n  ${pc.dim('Preview the terminal replay:')} ${pc.bold(`cat ${terminalPath}`)}\n`);
+  } finally {
+    store.close();
+  }
+}
+
+/**
+ * Markdown summary of a run — stages table with durations, medic involvement
+ * if any, the outcome card. Readable as a postmortem; embeddable in social
+ * posts; pasteable into a PR description.
+ */
+function generateStoryMarkdown(run: Run, events: RunEvent[], elapsedMs: number): string {
+  const STAGE_ORDER: StageName[] = ['scan', 'pick', 'rehearse', 'author', 'canary', 'promote', 'observe'];
+  type StageState = 'idle' | 'started' | 'finished' | 'failed' | 'skipped';
+  const lastStateByStage = new Map<StageName, StageState>();
+  const stageStartByStage = new Map<StageName, Date>();
+  const stageEndByStage = new Map<StageName, Date>();
+  const finishPayloadByStage = new Map<StageName, unknown>();
+  const failPayloadByStage = new Map<StageName, unknown>();
+  for (const event of events) {
+    const ts = new Date(event.createdAt);
+    if (event.kind === 'started') {
+      lastStateByStage.set(event.stage, 'started');
+      stageStartByStage.set(event.stage, ts);
+    } else if (event.kind === 'finished') {
+      lastStateByStage.set(event.stage, 'finished');
+      stageEndByStage.set(event.stage, ts);
+      finishPayloadByStage.set(event.stage, event.payload);
+    } else if (event.kind === 'failed') {
+      lastStateByStage.set(event.stage, 'failed');
+      stageEndByStage.set(event.stage, ts);
+      failPayloadByStage.set(event.stage, event.payload);
+    } else if (event.kind === 'skipped') {
+      lastStateByStage.set(event.stage, 'skipped');
+    }
+  }
+
+  const medicEvents = events.filter((e) => {
+    if (e.kind !== 'progress') return false;
+    const p = e.payload as Record<string, unknown> | null | undefined;
+    return p?.['phase'] === 'medic.tool_use';
+  });
+  const diagnosis = events.find((e) => e.kind === 'diagnosis');
+
+  const statusEmoji = run.status === 'succeeded' ? '✅' : run.status === 'awaiting_fix' ? '⏸' : run.status === 'rolled_back' ? '↺' : '❌';
+  const lines: string[] = [];
+  lines.push(`# Convoy run \`${run.id.slice(0, 8)}\` ${statusEmoji}`);
+  lines.push('');
+  lines.push(`**Target:** \`${run.repoUrl}\``);
+  if (run.platform) lines.push(`**Platform:** \`${run.platform}\``);
+  if (run.planId) lines.push(`**Plan:** \`${run.planId.slice(0, 8)}\``);
+  lines.push(`**Status:** \`${run.status}\``);
+  lines.push(`**Started:** ${new Date(run.startedAt).toISOString()}`);
+  if (run.completedAt) lines.push(`**Completed:** ${new Date(run.completedAt).toISOString()}`);
+  lines.push(`**Wall-clock:** ${formatDuration(elapsedMs)}`);
+  if (run.liveUrl) lines.push(`**Live URL:** ${run.liveUrl}`);
+  if (run.outcomeReason) lines.push(`**Outcome reason:** ${run.outcomeReason}`);
+  lines.push('');
+
+  lines.push('## Pipeline');
+  lines.push('');
+  lines.push('| Stage | Outcome | Duration | Detail |');
+  lines.push('|---|---|---|---|');
+  for (const stage of STAGE_ORDER) {
+    const state = lastStateByStage.get(stage) ?? 'idle';
+    const start = stageStartByStage.get(stage);
+    const end = stageEndByStage.get(stage);
+    const duration = start && end ? formatDuration(end.getTime() - start.getTime()) : '—';
+    const detail = state === 'finished'
+      ? compactNoAnsi(finishPayloadByStage.get(stage))
+      : state === 'failed'
+        ? compactNoAnsi(failPayloadByStage.get(stage))
+        : state === 'skipped'
+          ? 'replayed from prior attempt'
+          : state === 'idle'
+            ? 'not run'
+            : 'in flight';
+    const icon = state === 'finished' ? '✓' : state === 'failed' ? '✗' : state === 'skipped' ? '⤳' : state === 'started' ? '◐' : '○';
+    lines.push(`| \`${stage}\` | ${icon} ${state} | ${duration} | ${detail.replace(/\|/g, '\\|')} |`);
+  }
+  lines.push('');
+
+  if (medicEvents.length > 0 || diagnosis) {
+    lines.push('## Medic involvement');
+    lines.push('');
+    if (medicEvents.length > 0) {
+      lines.push(`Medic ran a Claude agent loop with ${medicEvents.length} tool call${medicEvents.length === 1 ? '' : 's'}:`);
+      lines.push('');
+      lines.push('```');
+      for (const e of medicEvents) {
+        const p = e.payload as Record<string, unknown>;
+        const tool = String(p['tool'] ?? 'tool');
+        const input = p['input'] as Record<string, unknown> | undefined;
+        let hint = '';
+        if (input) {
+          if (typeof input['path'] === 'string') hint = input['path'];
+          else if (typeof input['pattern'] === 'string') hint = `/${input['pattern']}/`;
+          else if (typeof input['n'] === 'number') hint = `n=${input['n']}`;
+        }
+        lines.push(`◇ medic ${tool} ${hint}`);
+      }
+      lines.push('```');
+      lines.push('');
+    }
+    if (diagnosis) {
+      const dp = diagnosis.payload as Record<string, unknown>;
+      lines.push('### Diagnosis');
+      lines.push('');
+      if (dp['rootCause']) lines.push(`- **Root cause:** ${String(dp['rootCause'])}`);
+      if (dp['classification']) lines.push(`- **Classification:** \`${String(dp['classification'])}\``);
+      if (dp['confidence']) lines.push(`- **Confidence:** \`${String(dp['confidence'])}\``);
+      if (dp['owned']) lines.push(`- **Owned:** \`${String(dp['owned'])}\` (${dp['owned'] === 'developer' ? 'developer fixes; Convoy pauses for resume' : 'Convoy iterates on the authored file'})`);
+      if (dp['narrative']) lines.push(`- **Narrative:** ${String(dp['narrative']).split('\n')[0]}`);
+      lines.push('');
+    }
+  }
+
+  lines.push('## Outcome');
+  lines.push('');
+  if (run.status === 'succeeded') {
+    lines.push(`Convoy succeeded in **${formatDuration(elapsedMs)}**.`);
+    if (run.liveUrl) lines.push(`Live at: ${run.liveUrl}`);
+  } else if (run.status === 'awaiting_fix') {
+    lines.push(`Run paused at **\`awaiting_fix\`** after ${formatDuration(elapsedMs)} — medic diagnosed a code-level failure. Resume with \`convoy resume\` after fixing the code.`);
+  } else if (run.status === 'rolled_back') {
+    lines.push(`Run **rolled back** after ${formatDuration(elapsedMs)}. ${run.outcomeReason ?? ''}`);
+  } else if (run.status === 'failed') {
+    lines.push(`Run **failed** after ${formatDuration(elapsedMs)}. ${run.outcomeReason ?? ''}`);
+  } else {
+    lines.push(`Run status: \`${run.status}\` after ${formatDuration(elapsedMs)}.`);
+  }
+  lines.push('');
+  lines.push('---');
+  lines.push('');
+  lines.push(`Generated by \`convoy replay ${run.id.slice(0, 8)}\``);
+  lines.push('');
+  return lines.join('\n');
+}
+
+function compactNoAnsi(payload: unknown, limit = 4): string {
+  return compact(payload, limit).replace(/\x1b\[[0-9;]*m/g, '');
+}
+
 const program = new Command()
   .name('convoy')
   .description('Deployment agent that rehearses, ships, and observes — without touching your code.')
@@ -2118,6 +2380,15 @@ program
   }, {} as Record<string, string>)
   .action(async (runId: string | undefined, options: ApplyOpts) => {
     await runResume(runId, options);
+  });
+
+program
+  .command('replay [runId]')
+  .description('Generate demo media (terminal.txt + story.md + events.json) from a finished run. Defaults to the most recent run.')
+  .option('--out-dir <path>', 'output directory (default: ./demo-output)')
+  .option('--no-ansi', 'strip ANSI color codes from terminal.txt (for plain-text social posts)')
+  .action(async (runId: string | undefined, options: ReplayOpts) => {
+    await runReplay(runId, options);
   });
 
 program
