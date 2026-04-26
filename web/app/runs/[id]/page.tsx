@@ -7,6 +7,7 @@ import { AutoRefresher } from './refresher';
 import { ApprovalActions } from './approval-form';
 import { FixActions } from './fix-actions';
 import { MedicChat } from './medic-chat';
+import { ScrollIntoFailure } from './scroll-into-failure';
 
 export const dynamic = 'force-dynamic';
 
@@ -173,6 +174,13 @@ function StageNav({
     else if (event.kind === 'finished' || event.kind === 'failed') stageEndByStage.set(event.stage as Stage, ts);
     eventCountByStage.set(event.stage as Stage, (eventCountByStage.get(event.stage as Stage) ?? 0) + 1);
   }
+  // Pending approvals scoped to a specific stage so the row gets its own
+  // ⏸ pulse, not just the footer block.
+  const pendingApprovalByStage = new Map<Stage, ApprovalRow>();
+  for (const approval of pendingApprovals) {
+    const stage = approvalToStage(approval.kind);
+    if (stage) pendingApprovalByStage.set(stage, approval);
+  }
 
   return (
     <nav className="lg:sticky lg:top-20 self-start space-y-1.5">
@@ -184,6 +192,7 @@ function StageNav({
         const duration = start && end ? formatDuration(end.toISOString(), start.toISOString()) : null;
         const eventCount = eventCountByStage.get(stage) ?? 0;
         const isActive = activeStage === stage;
+        const pendingApproval = pendingApprovalByStage.get(stage);
         // computeStageStatus uses 'done' for the finished state — match it.
         const icon = state === 'done' ? '●' : state === 'failed' ? '✗' : state === 'skipped' ? '⤳' : state === 'running' ? '◐' : '○';
         const iconColor =
@@ -193,31 +202,57 @@ function StageNav({
           state === 'running' ? 'text-accent' :
           'text-muted/50';
 
+        // Severity halos: failed stages glow red so a glance at the nav
+        // surfaces the breach; pending approvals glow warn so the gate
+        // is unmissable. Active state still wins on color (accent), but
+        // the halos compose — a stage that's both active AND failed
+        // shows the active border + the danger glow.
+        const severityHalo =
+          state === 'failed'
+            ? 'shadow-[0_0_20px_color-mix(in_srgb,var(--color-danger)_40%,transparent)]'
+            : pendingApproval
+              ? 'shadow-[0_0_20px_color-mix(in_srgb,var(--color-warn)_30%,transparent)]'
+              : '';
+        const severityBorder =
+          state === 'failed'
+            ? 'border-danger/50'
+            : pendingApproval
+              ? 'border-warn/40'
+              : '';
+        const baseBorder = isActive
+          ? 'border-accent/60 bg-accent/5 shadow-[0_0_24px_var(--color-accent-glow)]'
+          : severityBorder
+            ? `${severityBorder} bg-card/60 hover:-translate-y-px`
+            : 'border-rule/40 hover:border-rule hover:bg-card/60 hover:-translate-y-px';
+
         return (
           <a
             key={stage}
             href={`/runs/${runId}?stage=${stage}`}
-            className={`group relative block rounded-lg border px-3 py-2.5 transition-all ${
-              isActive
-                ? 'border-accent/60 bg-accent/5 shadow-[0_0_24px_var(--color-accent-glow)]'
-                : 'border-rule/40 hover:border-rule hover:bg-card/60 hover:-translate-y-px'
-            }`}
+            className={`group relative block rounded-lg border px-3 py-2.5 transition-all ${baseBorder} ${!isActive ? severityHalo : ''}`}
           >
             {isActive ? (
               <span aria-hidden className="absolute left-0 top-1/2 -translate-y-1/2 h-6 w-0.5 bg-accent rounded-r" />
+            ) : state === 'failed' ? (
+              <span aria-hidden className="absolute left-0 top-1/2 -translate-y-1/2 h-6 w-0.5 bg-danger rounded-r" />
+            ) : pendingApproval ? (
+              <span aria-hidden className="absolute left-0 top-1/2 -translate-y-1/2 h-6 w-0.5 bg-warn rounded-r animate-pulse" />
             ) : null}
             <div className="flex items-center gap-2.5">
-              <span className={`text-base leading-none ${iconColor} ${state === 'running' ? 'animate-pulse' : ''}`}>
+              <span className={`text-base leading-none ${iconColor} ${state === 'running' || state === 'failed' ? 'animate-pulse' : ''}`}>
                 {icon}
               </span>
               <span className={`font-mono text-sm font-medium flex-1 ${isActive ? 'text-ink' : state === 'idle' ? 'text-muted' : 'text-ink/90'}`}>
                 {stage}
               </span>
+              {pendingApproval ? (
+                <span aria-hidden className="text-warn text-xs animate-pulse" title={`awaiting ${pendingApproval.kind}`}>⏸</span>
+              ) : null}
               {duration ? (
                 <span className="text-[11px] text-muted/80 tabular-nums">{duration}</span>
               ) : null}
             </div>
-            {(eventCount > 0 || state === 'running') && (
+            {(eventCount > 0 || state === 'running' || pendingApproval) && (
               <div className="mt-1 ml-7 flex items-center gap-2 text-[11px] text-muted">
                 {eventCount > 0 ? (
                   <span>{eventCount} event{eventCount === 1 ? '' : 's'}</span>
@@ -226,6 +261,9 @@ function StageNav({
                   <span className="text-accent inline-flex items-center gap-1">
                     <span className="w-1 h-1 rounded-full bg-accent animate-pulse" />live
                   </span>
+                ) : null}
+                {pendingApproval ? (
+                  <span className="text-warn font-mono">awaiting {pendingApproval.kind}</span>
                 ) : null}
               </div>
             )}
@@ -312,6 +350,16 @@ function StageDetail({
           <span className="text-sm text-muted tabular-nums font-mono">{duration}</span>
         ) : null}
       </header>
+
+      {/* Failure spotlight pinned at the top so the operator sees what broke
+          AND the next action without scrolling through the events list. */}
+      {state === 'failed' ? (
+        <FailureSpotlight
+          run={run}
+          events={events}
+          stageEvents={stageEvents}
+        />
+      ) : null}
 
       {/* Stage-specific artifact card */}
       <StageArtifactCard
@@ -674,6 +722,296 @@ function ObserveArtifactCard({ run, finished, failed }: { run: RunRow; finished?
           <div className="text-xs text-muted">live</div>
           <div className="text-sm text-accent break-all">{run.liveUrl} ↗</div>
         </a>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Pinned at the top of the StageDetail body when the active stage failed.
+ * Three pieces visible without scrolling:
+ *   1. Failure headline + the run's outcomeReason (so the operator reads
+ *      Convoy's own "what broke" before any event payload).
+ *   2. The last 4–6 events leading up to the failure, expanded — the
+ *      breadcrumbs you'd otherwise hunt through the timeline for.
+ *   3. NextActionCard — a remedy adaptive to the failure shape (medic
+ *      diagnosis, secrets, platform auth, generic).
+ *
+ * The wrapping <a id="failed-event"> + the ScrollIntoFailure client
+ * component below cause the browser to auto-anchor to this section on
+ * page load when the stage failed, so landing on a failed run jumps
+ * the operator to the breach instead of the page top.
+ */
+function FailureSpotlight({
+  run,
+  events,
+  stageEvents,
+}: {
+  run: RunRow;
+  events: EventRow[];
+  stageEvents: EventRow[];
+}) {
+  const failedEvent = stageEvents.find((e) => e.kind === 'failed');
+  if (!failedEvent) return null;
+
+  // Find events leading up to the failure within the same stage. We cap at
+  // 6 so the spotlight stays compact; full timeline is below for the
+  // operator who wants every breath.
+  const failedIdx = stageEvents.indexOf(failedEvent);
+  const leadUp = stageEvents.slice(Math.max(0, failedIdx - 6), failedIdx);
+
+  const failedPayload = failedEvent.payload as Record<string, unknown> | null;
+  const errorMessage = (failedPayload?.['error'] as string | undefined) ?? '';
+  const headline = run.outcomeReason ?? errorMessage ?? 'Stage failed.';
+
+  return (
+    <section
+      id="failed-event"
+      data-failed-event=""
+      className="rounded-xl border border-danger/50 bg-gradient-to-br from-danger/10 via-danger/5 to-transparent p-5 space-y-4"
+    >
+      <ScrollIntoFailure />
+      <header className="flex items-start gap-3">
+        <span aria-hidden className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-danger/20 text-danger text-base shrink-0">✗</span>
+        <div className="flex-1 min-w-0">
+          <h3 className="text-base font-semibold text-danger tracking-tight">
+            {failedEvent.stage} failed
+          </h3>
+          <p className="text-sm text-ink/90 mt-1 break-words">{headline}</p>
+          {failedPayload?.['classification'] ? (
+            <p className="text-xs text-muted mt-2 font-mono">
+              classification=<span className="text-ink/80">{String(failedPayload['classification'])}</span>
+              {failedPayload['reason'] ? <> · reason=<span className="text-ink/80">{String(failedPayload['reason'])}</span></> : null}
+            </p>
+          ) : null}
+        </div>
+      </header>
+
+      {leadUp.length > 0 ? (
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted mb-2">
+            Leading up to the breach
+          </p>
+          <ol className="space-y-1">
+            {leadUp.map((e) => {
+              const isMedic = isMedicToolUse(e);
+              const compact = renderPayload(e.payload);
+              return (
+                <li key={e.id} className="font-mono text-xs flex items-baseline gap-2 text-muted">
+                  <span className={`shrink-0 ${
+                    e.kind === 'started' ? 'text-accent' :
+                    e.kind === 'finished' ? 'text-success' :
+                    isMedic ? 'text-medic' :
+                    'text-muted/60'
+                  }`}>
+                    {e.kind === 'started' ? '▸' : e.kind === 'finished' ? '✓' : isMedic ? '◇' : '·'}
+                  </span>
+                  <span className="text-muted/70 tabular-nums shrink-0">
+                    {new Date(e.createdAt).toLocaleTimeString()}
+                  </span>
+                  <span className="text-ink/80 break-all">
+                    {isMedic ? renderMedicToolLine(e.payload) : compact || <em className="text-muted/60">{e.kind}</em>}
+                  </span>
+                </li>
+              );
+            })}
+          </ol>
+        </div>
+      ) : null}
+
+      <NextActionCard run={run} events={events} failedEvent={failedEvent} />
+    </section>
+  );
+}
+
+/**
+ * Adaptive remedy card. Reads the failure shape and the medic verdict (if
+ * present) to surface the most actionable next step inline, instead of
+ * making the operator infer it from the logs. Falls back to a generic
+ * "fix and resume" hint when no specific signal matches.
+ *
+ * Patterns matched:
+ *   - Medic diagnosis with owned=developer  → fix code, then `convoy resume`
+ *   - Reason mentions DATABASE_URL / secret / env / unset / unreachable
+ *     / Prisma / connection / sslmode → likely missing platform env vars
+ *     (the softpharmamanager case) — link to stage-secrets
+ *   - Reason mentions auth / token / permission / 401 / 403 / Invalid
+ *     token / not authenticated → re-auth platform CLI
+ *   - Reason mentions did not respond 200 with status=401 → very likely
+ *     Vercel SSO/preview-protection on a preview URL — surface as a
+ *     distinct case
+ *   - Generic fallback → read the timeline below + resume
+ */
+function NextActionCard({
+  run,
+  events,
+  failedEvent,
+}: {
+  run: RunRow;
+  events: EventRow[];
+  failedEvent: EventRow;
+}) {
+  const reason = (run.outcomeReason ?? '').toLowerCase();
+  const failedPayload = failedEvent.payload as Record<string, unknown> | null;
+  const errorMessage = ((failedPayload?.['error'] as string | undefined) ?? '').toLowerCase();
+  const hay = `${reason} ${errorMessage}`;
+
+  const diagnosis = events.find((e) => e.kind === 'diagnosis');
+  const diagnosisPayload = diagnosis?.payload as Record<string, unknown> | undefined;
+  // owned is sometimes missing from the medic verdict (older runs, or
+  // when classification didn't reach finalize_diagnosis). Treat presence
+  // of a rootCause as sufficient to surface the medic-driven remedy —
+  // the medic already filtered "convoy-authored vs developer" via its
+  // system prompt; if rootCause names a developer file we trust it.
+  const owned = String(diagnosisPayload?.['owned'] ?? '').toLowerCase();
+  const rootCause = diagnosisPayload?.['rootCause'] as string | undefined;
+
+  // Pattern detection — first match wins, ordered by specificity.
+  type Action = {
+    title: string;
+    body: React.ReactNode;
+    cta: { label: string; href?: string; command?: string }[];
+  };
+  let action: Action;
+
+  if (diagnosis && rootCause) {
+    const isConvoyOwned = owned === 'convoy';
+    action = {
+      title: isConvoyOwned ? 'Convoy will iterate on the authored file' : 'Fix your code, then resume',
+      body: (
+        <>
+          <p className="text-sm">
+            {isConvoyOwned
+              ? 'Medic flagged a config-level failure in a Convoy-authored file. The pipeline can iterate on it via re-author.'
+              : 'Medic identified the root cause as a code-level failure in your repo. Convoy paused so you can fix it without losing pipeline state.'}
+          </p>
+          <p className="text-xs text-muted mt-2 italic">
+            &ldquo;{rootCause}&rdquo;
+          </p>
+        </>
+      ),
+      cta: [
+        { label: 'Read full diagnosis', href: '#diagnosis' },
+        { label: 'After fixing', command: 'convoy resume' },
+      ],
+    };
+  } else if (
+    /\bdid not respond 200\b.*\bstatus=401\b/.test(hay) ||
+    /\bvercel\b.*\bsso\b/.test(hay) ||
+    /\bpreview\b.*\bauthentication\b/.test(hay)
+  ) {
+    action = {
+      title: 'Vercel preview is gated by SSO',
+      body: (
+        <p className="text-sm">
+          The preview URL returned 401 — Vercel teams have <strong>preview deployment protection</strong> on by default, which blocks Convoy&apos;s observe probe. Disable it on this deployment or set a deployment-protection bypass header for Convoy to probe through.
+        </p>
+      ),
+      cta: [
+        { label: 'Vercel deployment-protection settings', href: 'https://vercel.com/docs/deployment-protection' },
+        { label: 'Or bypass with header', command: 'vercel env add VERCEL_PROTECTION_BYPASS production' },
+        { label: 'Then', command: 'convoy resume' },
+      ],
+    };
+  } else if (
+    /\bprisma\b.*\b(localhost|connection|reach|database server)\b/.test(hay) ||
+    /\bdatabase_url\b/.test(hay) ||
+    /\bunable to connect\b.*\bdatabase\b/.test(hay)
+  ) {
+    action = {
+      title: 'Likely missing DATABASE_URL on the platform',
+      body: (
+        <p className="text-sm">
+          The deployed app fell back to <code className="text-ink/90">localhost:5432</code> — your platform doesn&apos;t have <code className="text-ink/90">DATABASE_URL</code> set. Stage it via Convoy so Convoy pushes the value to the platform with the deploy.
+        </p>
+      ),
+      cta: [
+        { label: 'Stage interactively', command: `convoy stage-secrets ${run.planId?.slice(0, 8) ?? '<plan>'}` },
+        { label: 'Or self-declare if you set it manually', command: 'convoy resume --already-set=DATABASE_URL' },
+      ],
+    };
+  } else if (/\b(secret|env(ironment)? variable|unset|missing)\b/.test(hay)) {
+    action = {
+      title: 'Probably an unset env var on the platform',
+      body: (
+        <p className="text-sm">
+          The failure mentions a missing or unset variable. Stage the required vars in Convoy so they ride into the deploy with the secrets push, instead of being set after the fact.
+        </p>
+      ),
+      cta: [
+        { label: 'Stage interactively', command: `convoy stage-secrets ${run.planId?.slice(0, 8) ?? '<plan>'}` },
+      ],
+    };
+  } else if (/\b(invalid token|not authenticated|gh auth|fly auth|vercel login|permission denied|401|403)\b/.test(hay)) {
+    action = {
+      title: 'Re-authenticate the platform CLI',
+      body: (
+        <p className="text-sm">
+          The failure looks like an auth problem. Re-authenticate the platform CLI Convoy uses for this deploy, then resume.
+        </p>
+      ),
+      cta: [
+        { label: 'GitHub', command: 'gh auth login' },
+        { label: 'Fly', command: 'fly auth login' },
+        { label: 'Vercel', command: 'vercel login' },
+        { label: 'Then', command: 'convoy resume' },
+      ],
+    };
+  } else if (/\btls\b|\bhandshake\b|\bcanceled\b/.test(hay)) {
+    action = {
+      title: 'Build builder lost auth or network',
+      body: (
+        <p className="text-sm">
+          The platform builder returned mid-build (TLS handshake / token expiry / canceled). Often this is a build context that&apos;s too large — make sure a <code className="text-ink/90">.dockerignore</code> is present so the upload finishes inside the auth window. Convoy now drafts one alongside every Dockerfile.
+        </p>
+      ),
+      cta: [
+        { label: 'Resume after the fix lands', command: 'convoy resume' },
+      ],
+    };
+  } else {
+    action = {
+      title: 'Inspect the events below, then resume',
+      body: (
+        <p className="text-sm">
+          Convoy doesn&apos;t have a specific remedy for this failure shape. Read through the timeline below to identify the root cause, fix it locally, and run <code className="text-ink/90">convoy resume</code> — Convoy will continue from this stage on the same run row.
+        </p>
+      ),
+      cta: [
+        { label: 'After fixing', command: 'convoy resume' },
+      ],
+    };
+  }
+
+  return (
+    <div className="rounded-lg border border-warn/40 bg-warn/5 p-4 space-y-3">
+      <h4 className="text-sm font-semibold text-warn flex items-center gap-2">
+        <span aria-hidden>→</span> What to do next
+      </h4>
+      <div className="text-ink/90">{action.body}</div>
+      {action.cta.length > 0 ? (
+        <ul className="space-y-1.5">
+          {action.cta.map((c, idx) => (
+            <li key={idx} className="text-xs flex items-baseline gap-2 flex-wrap">
+              <span className="text-muted shrink-0">{c.label}</span>
+              {c.command ? (
+                <code className="font-mono bg-card border border-rule/40 rounded px-1.5 py-0.5 text-ink/90 break-all">
+                  {c.command}
+                </code>
+              ) : null}
+              {c.href ? (
+                <a
+                  href={c.href}
+                  target={c.href.startsWith('http') ? '_blank' : undefined}
+                  rel={c.href.startsWith('http') ? 'noreferrer' : undefined}
+                  className="text-accent hover:underline"
+                >
+                  {c.href.startsWith('http') ? `${c.href} ↗` : c.href}
+                </a>
+              ) : null}
+            </li>
+          ))}
+        </ul>
       ) : null}
     </div>
   );
