@@ -52,6 +52,10 @@ cd convoy
 npm install
 cp .env.example .env                 # add ANTHROPIC_API_KEY
 
+# Optional but recommended: install shell helpers
+./scripts/install
+source ~/.zshrc                      # or ~/.bashrc / config.fish
+
 # Plan for any local repo or GitHub URL. --save persists the plan;
 # --open pops the plan straight into the web viewer.
 npm run convoy -- plan ../my-web-app --save --open
@@ -79,6 +83,16 @@ npm run convoy -- resume          # continues the same run; carries dirty tree o
 ```
 
 You **don't have to push your fix to main first**. Convoy detects the uncommitted changes, carries them onto the plan-keyed `convoy/<plan>` branch as a separate `fix:` commit (the medic's diagnosis becomes the commit subject), and surfaces the combined diff in the `open_pr` approval card. The fix and the deploy plumbing land in the same PR — main only sees them at merge time, after rehearsal proved they work. This is what makes Convoy safe on git-deploy platforms (Vercel, Netlify, Cloud Run) where pushing to main would otherwise trigger a prod build outside Convoy's gates.
+
+If you ran `./scripts/install`, you also get raw shell helpers:
+
+```bash
+convoy status
+convoy ship /absolute/path/to/repo
+convoy-ship-here --demo
+```
+
+`convoy-ship-here` uses the current repo's absolute path, which is the safest way to ship a local checkout.
 
 ---
 
@@ -203,6 +217,15 @@ convoy rollback <service>              # not yet implemented
 ```
 
 `convoy resume` is the answer to "I fixed the code, now what?" It looks up the run, refuses to resume `running` / `pending` / `succeeded` runs, prints the prior failure reason for context, and re-applies the saved plan. A new run row is created — the previous one is preserved as history. Stages aren't idempotent across partial state, so resume always replays from `scan`.
+
+If you installed the shell helpers, the same commands work without `npm run`:
+
+```bash
+convoy plan <path-or-url>
+convoy apply <plan-id>
+convoy ship /absolute/path/to/repo
+convoy-ship-here
+```
 
 Environment:
 - `ANTHROPIC_API_KEY` — enables Opus-authored file content, ship narrative, and the medic's agent loop. Without it, enricher and medic fall back to deterministic output.

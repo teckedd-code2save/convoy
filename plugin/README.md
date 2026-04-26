@@ -4,7 +4,7 @@ Ship any repo end-to-end from inside Claude Code. Slash commands drive the real 
 
 ## Install in 60 seconds
 
-Copy-paste these four commands into a terminal. At the end, every Claude Code session has `/convoy:*` available without `--plugin-dir` and `CONVOY_HOME` is set permanently.
+Copy-paste these four commands into a terminal. At the end, every Claude Code session has `/convoy:*` available without `--plugin-dir`, `CONVOY_HOME` is set permanently, and your shell gets raw CLI helpers (`convoy`, `convoy-ship-here`).
 
 ```bash
 # 1. Clone Convoy (anywhere you like; path doesn't matter after step 3)
@@ -17,6 +17,7 @@ echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
 
 # 3. One-shot setup — writes CONVOY_HOME to your shell profile and
 #    registers the plugin as a local-path marketplace in Claude Code.
+#    It also installs raw CLI helpers: `convoy` and `convoy-ship-here`.
 ./scripts/install
 
 # 4. Reload your shell + restart Claude Code
@@ -30,6 +31,16 @@ Inside any Claude Code session, verify:
 ```
 
 Should print where Convoy is installed, state DB size, recent plans, whether the web viewer is live. No `--plugin-dir` flag needed — the plugin is registered globally.
+
+Outside Claude Code, the installer also gives you:
+
+```bash
+convoy status
+convoy ship /absolute/path/to/repo
+convoy-ship-here --demo
+```
+
+`convoy-ship-here` always passes the current directory as an absolute path, so it avoids the `.`-resolves-from-`$CONVOY_HOME` footgun.
 
 If you'd rather run without the global install (one-off / testing), the old path still works:
 
@@ -102,6 +113,13 @@ Flags on `/convoy:ship` (most useful):
 | `--no-auto-merge` | On approval, wait for you to merge the PR manually on GitHub. |
 
 Full list: `cd ~/convoy && npm run convoy -- ship --help`
+
+For raw terminal use without slash commands:
+
+```bash
+convoy ship /absolute/path/to/repo
+convoy-ship-here --no-auto-approve
+```
 
 ## Principles
 

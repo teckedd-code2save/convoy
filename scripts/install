@@ -58,6 +58,9 @@ esac
 mkdir -p "$(dirname "$PROFILE")"
 touch "$PROFILE"
 
+HELPERS_START="# >>> Convoy helpers >>>"
+HELPERS_END="# <<< Convoy helpers <<<"
+
 if grep -qE '^\s*(export|set\s+-x)\s+CONVOY_HOME(=|\s)' "$PROFILE"; then
   # Update an existing line in place only if the current value is different.
   current=$(grep -E '^\s*(export|set\s+-x)\s+CONVOY_HOME(=|\s)' "$PROFILE" | tail -1)
@@ -77,6 +80,62 @@ else
   } >> "$PROFILE"
   echo "  ✓ Added CONVOY_HOME export to $PROFILE"
 fi
+
+# ---------------------------------------------------------------------------
+# Step 1b — install shell helpers for raw CLI use.
+# ---------------------------------------------------------------------------
+
+case "$shell_name" in
+  fish)
+    HELPER_BLOCK=$(cat <<EOF
+$HELPERS_START
+function convoy
+  if test -z "\$CONVOY_HOME"
+    echo "CONVOY_HOME is not set" 1>&2
+    return 1
+  end
+
+  begin
+    cd "\$CONVOY_HOME"; or return 1
+    npm run convoy -- \$argv
+  end
+end
+
+function convoy-ship-here
+  convoy ship "\$PWD" \$argv
+end
+$HELPERS_END
+EOF
+)
+    ;;
+  *)
+    HELPER_BLOCK=$(cat <<EOF
+$HELPERS_START
+convoy() {
+  (
+    cd "\$CONVOY_HOME" || return 1
+    npm run convoy -- "\$@"
+  )
+}
+
+convoy-ship-here() {
+  convoy ship "\$PWD" "\$@"
+}
+$HELPERS_END
+EOF
+)
+    ;;
+esac
+
+tmp_profile="$(mktemp)"
+awk -v start="$HELPERS_START" -v end="$HELPERS_END" '
+  $0 == start { skip = 1; next }
+  $0 == end { skip = 0; next }
+  !skip { print }
+' "$PROFILE" > "$tmp_profile"
+mv "$tmp_profile" "$PROFILE"
+printf '\n%s\n' "$HELPER_BLOCK" >> "$PROFILE"
+echo "  ✓ Installed shell helpers in $PROFILE: convoy, convoy-ship-here"
 
 # ---------------------------------------------------------------------------
 # Step 2 — register the plugin in Claude Code settings.
@@ -152,6 +211,8 @@ echo "                                 (or open a new terminal)"
 echo "  2. Restart Claude Code if it's running (picks up the new plugin)"
 echo
 echo "Then from any directory:"
+echo "  convoy status              — raw CLI helper"
+echo "  convoy-ship-here           — raw CLI helper for the current repo"
 echo "  /convoy:where             — orient"
 echo "  /convoy:ship <target>     — ship a repo end-to-end"
 echo
