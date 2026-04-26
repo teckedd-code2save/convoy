@@ -10,10 +10,55 @@ import { MedicChat } from './medic-chat';
 
 export const dynamic = 'force-dynamic';
 
-const STAGE_ORDER = ['scan', 'pick', 'author', 'rehearse', 'canary', 'promote', 'observe'];
+const STAGE_ORDER = ['scan', 'pick', 'rehearse', 'author', 'canary', 'promote', 'observe'];
+type Stage = typeof STAGE_ORDER[number];
 
-export default async function RunPage({ params }: { params: Promise<{ id: string }> }) {
+/**
+ * Pick the stage that should be selected when the operator lands on the
+ * page without an explicit `?stage=` choice. Priority: actively-running >
+ * most-recently-failed > most-recently-finished > first idle. Matches
+ * "what does the operator most likely want to look at right now."
+ */
+function defaultActiveStage(events: EventRow[]): Stage {
+  const lastTerminalByStage = new Map<Stage, 'finished' | 'failed' | 'started' | 'skipped'>();
+  for (const event of events) {
+    if (
+      event.kind === 'started' ||
+      event.kind === 'finished' ||
+      event.kind === 'failed' ||
+      event.kind === 'skipped'
+    ) {
+      lastTerminalByStage.set(event.stage as Stage, event.kind);
+    }
+  }
+  // Running: started but no terminal yet.
+  for (const stage of STAGE_ORDER) {
+    if (lastTerminalByStage.get(stage) === 'started') return stage;
+  }
+  // Failed: walk in reverse pipeline order so a downstream failure wins
+  // over an upstream skipped retry.
+  for (let i = STAGE_ORDER.length - 1; i >= 0; i--) {
+    const stage = STAGE_ORDER[i]!;
+    if (lastTerminalByStage.get(stage) === 'failed') return stage;
+  }
+  // Most-recently-finished/skipped: walk reverse, pick last completed.
+  for (let i = STAGE_ORDER.length - 1; i >= 0; i--) {
+    const stage = STAGE_ORDER[i]!;
+    const state = lastTerminalByStage.get(stage);
+    if (state === 'finished' || state === 'skipped') return stage;
+  }
+  return STAGE_ORDER[0]!;
+}
+
+export default async function RunPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ id: string }>;
+  searchParams: Promise<{ stage?: string }>;
+}) {
   const { id } = await params;
+  const sp = await searchParams;
   const run = getRun(id);
   if (!run) notFound();
 
@@ -23,13 +68,16 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
   const pendingApprovals = approvals.filter((a) => a.status === 'pending');
   const isLive = run.status === 'running' || run.status === 'awaiting_approval';
 
+  const requestedStage = sp.stage && STAGE_ORDER.includes(sp.stage) ? (sp.stage as Stage) : null;
+  const activeStage: Stage = requestedStage ?? defaultActiveStage(events);
+
   return (
-    <article className="space-y-10">
+    <article className="space-y-8">
       <AutoRefresher enabled={isLive} />
 
       <header className="space-y-3">
         <div className="flex items-center gap-3">
-          <a href="/runs" className="text-sm text-muted hover:text-ink">
+          <a href="/runs" className="text-sm text-muted hover:text-ink transition-colors">
             ← Runs
           </a>
           <span className="font-mono text-xs text-muted">{run.id.slice(0, 8)}</span>
@@ -74,33 +122,573 @@ export default async function RunPage({ params }: { params: Promise<{ id: string
 
       <MedicSpotlight events={events} runStatus={run.status} />
 
+      <div className="grid grid-cols-1 lg:grid-cols-[260px_1fr] gap-6 lg:gap-8 items-start">
+        <StageNav
+          events={events}
+          activeStage={activeStage}
+          runId={run.id}
+          pendingApprovals={pendingApprovals}
+        />
+        <StageDetail
+          run={run}
+          events={events}
+          approvals={approvals}
+          pendingApprovals={pendingApprovals}
+          activeStage={activeStage}
+          chatTurns={chatTurns}
+        />
+      </div>
+    </article>
+  );
+}
+
+/**
+ * Sticky vertical sidebar listing the seven stages with state, duration,
+ * event count, and active highlight. Each row is a server-side link to
+ * `?stage=<name>` so navigation is free (no client JS, no hydration cost).
+ *
+ * Active state: 2px left border accent + soft glow halo. Hover state on
+ * inactive rows lifts subtly via translateY(-1px) and bumps the border
+ * weight. Approval pings show as a small ⏸ badge inline; pending approvals
+ * across the run get a sticky footer block below the stages.
+ */
+function StageNav({
+  events,
+  activeStage,
+  runId,
+  pendingApprovals,
+}: {
+  events: EventRow[];
+  activeStage: Stage;
+  runId: string;
+  pendingApprovals: ApprovalRow[];
+}) {
+  const stageStatus = computeStageStatus(events);
+  const stageStartByStage = new Map<Stage, Date>();
+  const stageEndByStage = new Map<Stage, Date>();
+  const eventCountByStage = new Map<Stage, number>();
+  for (const event of events) {
+    const ts = new Date(event.createdAt);
+    if (event.kind === 'started') stageStartByStage.set(event.stage as Stage, ts);
+    else if (event.kind === 'finished' || event.kind === 'failed') stageEndByStage.set(event.stage as Stage, ts);
+    eventCountByStage.set(event.stage as Stage, (eventCountByStage.get(event.stage as Stage) ?? 0) + 1);
+  }
+
+  return (
+    <nav className="lg:sticky lg:top-20 self-start space-y-1.5">
+      <h2 className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted px-1 mb-3">Pipeline</h2>
+      {STAGE_ORDER.map((stage) => {
+        const state = stageStatus[stage] ?? 'idle';
+        const start = stageStartByStage.get(stage);
+        const end = stageEndByStage.get(stage);
+        const duration = start && end ? formatDuration(end.toISOString(), start.toISOString()) : null;
+        const eventCount = eventCountByStage.get(stage) ?? 0;
+        const isActive = activeStage === stage;
+        // computeStageStatus uses 'done' for the finished state — match it.
+        const icon = state === 'done' ? '●' : state === 'failed' ? '✗' : state === 'skipped' ? '⤳' : state === 'running' ? '◐' : '○';
+        const iconColor =
+          state === 'done' ? 'text-success' :
+          state === 'failed' ? 'text-danger' :
+          state === 'skipped' ? 'text-muted' :
+          state === 'running' ? 'text-accent' :
+          'text-muted/50';
+
+        return (
+          <a
+            key={stage}
+            href={`/runs/${runId}?stage=${stage}`}
+            className={`group relative block rounded-lg border px-3 py-2.5 transition-all ${
+              isActive
+                ? 'border-accent/60 bg-accent/5 shadow-[0_0_24px_var(--color-accent-glow)]'
+                : 'border-rule/40 hover:border-rule hover:bg-card/60 hover:-translate-y-px'
+            }`}
+          >
+            {isActive ? (
+              <span aria-hidden className="absolute left-0 top-1/2 -translate-y-1/2 h-6 w-0.5 bg-accent rounded-r" />
+            ) : null}
+            <div className="flex items-center gap-2.5">
+              <span className={`text-base leading-none ${iconColor} ${state === 'running' ? 'animate-pulse' : ''}`}>
+                {icon}
+              </span>
+              <span className={`font-mono text-sm font-medium flex-1 ${isActive ? 'text-ink' : state === 'idle' ? 'text-muted' : 'text-ink/90'}`}>
+                {stage}
+              </span>
+              {duration ? (
+                <span className="text-[11px] text-muted/80 tabular-nums">{duration}</span>
+              ) : null}
+            </div>
+            {(eventCount > 0 || state === 'running') && (
+              <div className="mt-1 ml-7 flex items-center gap-2 text-[11px] text-muted">
+                {eventCount > 0 ? (
+                  <span>{eventCount} event{eventCount === 1 ? '' : 's'}</span>
+                ) : null}
+                {state === 'running' ? (
+                  <span className="text-accent inline-flex items-center gap-1">
+                    <span className="w-1 h-1 rounded-full bg-accent animate-pulse" />live
+                  </span>
+                ) : null}
+              </div>
+            )}
+          </a>
+        );
+      })}
+
       {pendingApprovals.length > 0 ? (
-        <section className="space-y-3">
-          <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">
-            Waiting on you
+        <div className="mt-5 pt-5 border-t border-rule/40">
+          <h2 className="text-[11px] font-semibold uppercase tracking-[0.16em] text-warn px-1 mb-2">
+            ⏸ Awaiting you
           </h2>
-          <div className="space-y-3">
+          <div className="space-y-1.5 px-1">
             {pendingApprovals.map((approval) => (
-              <ApprovalCard key={approval.id} runId={run.id} approval={approval} />
+              <div
+                key={approval.id}
+                className="text-xs text-muted flex items-center gap-2"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-warn animate-pulse" />
+                <span className="font-mono">{approval.kind}</span>
+              </div>
             ))}
           </div>
-        </section>
+        </div>
       ) : null}
+    </nav>
+  );
+}
 
-      <DiagnosisSection
+/**
+ * Right-side detail panel. Sticky header with stage name, big status badge,
+ * duration, and a `live` indicator if the stage is in flight. Body is the
+ * filtered event timeline for this stage, plus a stage-specific artifact
+ * card (see StageArtifactCard) inserted right below the header. Empty
+ * states for stages that haven't run yet.
+ */
+function StageDetail({
+  run,
+  events,
+  approvals,
+  pendingApprovals,
+  activeStage,
+  chatTurns,
+}: {
+  run: RunRow;
+  events: EventRow[];
+  approvals: ApprovalRow[];
+  pendingApprovals: ApprovalRow[];
+  activeStage: Stage;
+  chatTurns: MedicChatTurn[];
+}) {
+  const stageEvents = events.filter((e) => e.stage === activeStage);
+  const status = computeStageStatus(events);
+  const state = status[activeStage] ?? 'idle';
+  const stageStart = stageEvents.find((e) => e.kind === 'started');
+  const stageEnd = stageEvents.find((e) => e.kind === 'finished' || e.kind === 'failed');
+  const duration = stageStart && stageEnd
+    ? formatDuration(stageEnd.createdAt, stageStart.createdAt)
+    : null;
+  const statePillColor: Record<string, string> = {
+    done: 'border-success/50 bg-success/10 text-success',
+    failed: 'border-danger/60 bg-danger/10 text-danger',
+    skipped: 'border-muted/40 bg-card/60 text-muted',
+    running: 'border-accent/60 bg-accent/10 text-accent',
+    idle: 'border-rule/40 bg-card text-muted',
+  };
+  const stagePendingApproval = pendingApprovals.find((a) => approvalToStage(a.kind) === activeStage);
+
+  return (
+    <section className="min-w-0 space-y-6">
+      <header className="flex items-center gap-3 flex-wrap">
+        <h2 className="text-2xl font-semibold tracking-tight font-mono">{activeStage}</h2>
+        <span className={`inline-flex items-center gap-2 text-xs font-medium px-2.5 py-1 rounded-full border ${statePillColor[state] ?? statePillColor['idle']}`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${state === 'running' ? 'animate-pulse' : ''} ${
+            state === 'done' ? 'bg-success' :
+            state === 'failed' ? 'bg-danger' :
+            state === 'skipped' ? 'bg-muted' :
+            state === 'running' ? 'bg-accent' :
+            'bg-muted/50'
+          }`} />
+          {state === 'idle' ? 'not run' : state === 'skipped' ? 'replayed' : state === 'done' ? 'finished' : state}
+        </span>
+        {duration ? (
+          <span className="text-sm text-muted tabular-nums font-mono">{duration}</span>
+        ) : null}
+      </header>
+
+      {/* Stage-specific artifact card */}
+      <StageArtifactCard
+        run={run}
+        stage={activeStage}
         events={events}
-        runId={run.id}
-        planId={run.planId}
-        repoUrl={run.repoUrl}
+        stageEvents={stageEvents}
         chatTurns={chatTurns}
       />
 
+      {/* Pending approval scoped to this stage gets surfaced here. */}
+      {stagePendingApproval ? (
+        <ApprovalCard runId={run.id} approval={stagePendingApproval} />
+      ) : null}
+
+      {/* Filtered timeline */}
+      {stageEvents.length === 0 ? (
+        <div className="rounded-lg border border-rule/40 bg-card/40 p-6 text-center">
+          <span className="text-2xl text-muted/50 block mb-2">○</span>
+          <p className="text-sm text-muted">
+            <span className="font-mono">{activeStage}</span> hasn&apos;t run yet.
+          </p>
+        </div>
+      ) : (
+        <div>
+          <h3 className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted mb-3">
+            Events
+          </h3>
+          <ol className="border-l border-rule/40 ml-2 space-y-3">
+            {stageEvents.map((e) => (
+              <li key={e.id} className="pl-5 relative">
+                <span
+                  className={`absolute -left-[5px] top-1.5 w-2.5 h-2.5 rounded-full ${markerForEvent(e)}`}
+                />
+                <TimelineEvent event={e} />
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/**
+ * Pending approvals are tied to a stage by their `kind`. This map mirrors
+ * the orchestrator's awaitApproval() call sites in src/core/stages.ts.
+ */
+function approvalToStage(kind: string): Stage | null {
+  if (kind === 'open_pr' || kind === 'merge_pr') return 'author';
+  if (kind === 'promote') return 'canary';
+  if (kind === 'rollback') return 'observe';
+  if (kind === 'apply_migration') return 'rehearse';
+  return null;
+}
+
+/**
+ * Per-stage detail card. Each stage gets a tailored summary derived from
+ * its key events: scan signals, pick decision, rehearse metrics + medic
+ * link, author PR + carry list, canary/promote traffic split, observe
+ * SLO + bake. Falls back to a minimal "stage info" block when the stage
+ * is idle or has no recognizable artifacts yet.
+ */
+function StageArtifactCard({
+  run,
+  stage,
+  events,
+  stageEvents,
+  chatTurns,
+}: {
+  run: RunRow;
+  stage: Stage;
+  events: EventRow[];
+  stageEvents: EventRow[];
+  chatTurns: MedicChatTurn[];
+}) {
+  const finished = stageEvents.find((e) => e.kind === 'finished');
+  const failed = stageEvents.find((e) => e.kind === 'failed');
+  const skipped = stageEvents.find((e) => e.kind === 'skipped');
+
+  if (skipped) {
+    const skippedPayload = skipped.payload as Record<string, unknown> | null;
+    const replayedPayload = skippedPayload?.['replayed_payload'] as Record<string, unknown> | null;
+    return (
+      <div className="rounded-xl border border-muted/30 bg-card/40 p-5">
+        <div className="flex items-center gap-2.5 text-sm">
+          <span className="text-muted text-lg">⤳</span>
+          <span className="text-muted">
+            Skipped — already finished in a prior attempt. Convoy replayed the prior payload into the run context.
+          </span>
+        </div>
+        {replayedPayload ? (
+          <div className="mt-4 text-xs font-mono text-muted/80 break-all">
+            {Object.entries(replayedPayload).slice(0, 5).map(([k, v]) => (
+              <div key={k} className="py-0.5">
+                <span className="text-muted/60">{k}=</span>
+                <span className="text-ink/80">{renderValue(v)}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  // Diagnosis + medic spotlight live with rehearse since that's where breach + diagnose happens.
+  if (stage === 'rehearse') {
+    return (
+      <RehearseArtifactCard run={run} events={events} stageEvents={stageEvents} chatTurns={chatTurns} finished={finished} failed={failed} />
+    );
+  }
+  if (stage === 'author') {
+    return <AuthorArtifactCard finished={finished} failed={failed} stageEvents={stageEvents} />;
+  }
+  if (stage === 'scan') {
+    return <ScanArtifactCard finished={finished} />;
+  }
+  if (stage === 'pick') {
+    return <PickArtifactCard finished={finished} stageEvents={stageEvents} />;
+  }
+  if (stage === 'canary' || stage === 'promote') {
+    return <DeployArtifactCard stage={stage} finished={finished} failed={failed} stageEvents={stageEvents} />;
+  }
+  if (stage === 'observe') {
+    return <ObserveArtifactCard run={run} finished={finished} failed={failed} />;
+  }
+  return null;
+}
+
+function ScanArtifactCard({ finished }: { finished?: EventRow }) {
+  if (!finished) return null;
+  const p = finished.payload as Record<string, unknown> | null;
+  const signals = (p?.['signals'] ?? p) as Record<string, unknown> | undefined;
+  if (!signals) return null;
+  const interesting = ['ecosystem', 'framework', 'topology', 'packageManager', 'startCommand', 'healthPath', 'port', 'isMonorepo', 'dataLayer'];
+  return (
+    <div className="rounded-xl border border-rule/40 bg-card/60 p-5">
+      <h3 className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted mb-3">Repo signals</h3>
+      <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-sm">
+        {interesting.map((key) => {
+          const value = signals[key];
+          if (value === undefined || value === null || (Array.isArray(value) && value.length === 0)) return null;
+          return (
+            <div key={key} className="flex justify-between gap-3">
+              <dt className="text-muted">{key}</dt>
+              <dd className="font-mono text-ink/90 truncate">{renderValue(value)}</dd>
+            </div>
+          );
+        })}
+      </dl>
+    </div>
+  );
+}
+
+function PickArtifactCard({ finished, stageEvents }: { finished?: EventRow; stageEvents: EventRow[] }) {
+  const decision = stageEvents.find((e) => e.kind === 'decision');
+  const payload = (decision?.payload ?? finished?.payload) as Record<string, unknown> | undefined;
+  if (!payload) return null;
+  return (
+    <div className="rounded-xl border border-rule/40 bg-card/60 p-5">
+      <h3 className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted mb-3">Platform decision</h3>
+      <div className="space-y-2 text-sm">
+        {payload['chosen'] ? (
+          <div className="flex items-baseline gap-3">
+            <span className="text-muted">chose</span>
+            <span className="font-mono font-semibold text-accent text-base">{String(payload['chosen'])}</span>
+            {payload['source'] ? <span className="text-xs text-muted/70">via {String(payload['source'])}</span> : null}
+          </div>
+        ) : null}
+        {payload['reason'] ? (
+          <p className="text-ink/90">{String(payload['reason'])}</p>
+        ) : null}
+        {Array.isArray(payload['candidates']) && (payload['candidates'] as unknown[]).length > 0 ? (
+          <div className="text-xs text-muted">scored against {(payload['candidates'] as unknown[]).length} platform{(payload['candidates'] as unknown[]).length === 1 ? '' : 's'}</div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function RehearseArtifactCard({ run, events, stageEvents, chatTurns, finished, failed }: {
+  run: RunRow;
+  events: EventRow[];
+  stageEvents: EventRow[];
+  chatTurns: MedicChatTurn[];
+  finished?: EventRow;
+  failed?: EventRow;
+}) {
+  const finishedPayload = finished?.payload as Record<string, unknown> | undefined;
+  const failedPayload = failed?.payload as Record<string, unknown> | undefined;
+  const breach = stageEvents.find((e) => {
+    const p = e.payload as Record<string, unknown> | null;
+    return e.kind === 'progress' && (typeof p?.['phase'] === 'string') && (p['phase'] as string).includes('breach');
+  });
+  const breachPayload = breach?.payload as Record<string, unknown> | undefined;
+  const stats = finishedPayload ?? breachPayload;
+
+  return (
+    <div className="space-y-4">
+      {stats ? (
+        <div className="rounded-xl border border-rule/40 bg-card/60 p-5">
+          <h3 className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted mb-3">Rehearsal evidence</h3>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+            {typeof stats['p99_ms'] === 'number' ? (
+              <Metric label="p99" value={`${stats['p99_ms']}ms`} status={Number(stats['p99_ms']) > 500 ? 'warn' : 'ok'} />
+            ) : null}
+            {typeof stats['error_rate_pct'] === 'number' ? (
+              <Metric label="error rate" value={`${stats['error_rate_pct']}%`} status={Number(stats['error_rate_pct']) > 1 ? 'fail' : 'ok'} />
+            ) : null}
+            {typeof stats['smoke_tests_passed'] === 'number' ? (
+              <Metric label="smoke tests" value={`${stats['smoke_tests_passed']}/${stats['smoke_tests_passed']}`} status="ok" />
+            ) : null}
+            {typeof stats['healthy'] === 'boolean' ? (
+              <Metric label="healthy" value={stats['healthy'] ? 'yes' : 'no'} status={stats['healthy'] ? 'ok' : 'fail'} />
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+      {failedPayload?.['reason'] === 'rehearsal_breach' ? (
+        <DiagnosisSection events={events} runId={run.id} planId={run.planId} repoUrl={run.repoUrl} chatTurns={chatTurns} />
+      ) : null}
       <MedicInvestigationSection events={events} />
+    </div>
+  );
+}
 
-      <StagesSection events={events} />
+function AuthorArtifactCard({ finished, failed, stageEvents }: { finished?: EventRow; failed?: EventRow; stageEvents: EventRow[] }) {
+  const fp = (finished?.payload ?? failed?.payload) as Record<string, unknown> | undefined;
+  const carry = stageEvents.find((e) => {
+    const p = e.payload as Record<string, unknown> | null;
+    return p?.['phase'] === 'pr.carry_committed';
+  });
+  const carryPayload = carry?.payload as Record<string, unknown> | undefined;
+  const alreadyShipped = stageEvents.find((e) => {
+    const p = e.payload as Record<string, unknown> | null;
+    return p?.['phase'] === 'pr.already_shipped' || p?.['phase'] === 'pr.already_merged' || p?.['phase'] === 'pr.no_op';
+  });
+  const alreadyPayload = alreadyShipped?.payload as Record<string, unknown> | undefined;
+  const prUrl = (fp?.['pr_url'] as string | null | undefined) ?? (alreadyPayload?.['pr_url'] as string | undefined);
+  const prNumber = fp?.['pr_number'] ?? alreadyPayload?.['pr_number'];
+  const branch = (fp?.['branch'] as string | undefined) ?? (alreadyPayload?.['branch'] as string | undefined);
+  const files = (fp?.['files'] as string[] | undefined) ?? (alreadyPayload?.['files'] as string[] | undefined);
+  if (!fp && !alreadyPayload) return null;
 
-      <TimelineSection events={events} />
-    </article>
+  return (
+    <div className="rounded-xl border border-rule/40 bg-card/60 p-5 space-y-4">
+      <h3 className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted">Pull request</h3>
+      {alreadyPayload ? (
+        <div className="rounded-md border border-muted/30 bg-card/40 p-3 text-sm flex items-start gap-2">
+          <span className="text-muted shrink-0">⤳</span>
+          <span className="text-muted">
+            {alreadyPayload['note'] as string ?? 'Plumbing already shipped — author skipped.'}
+          </span>
+        </div>
+      ) : null}
+      {prUrl ? (
+        <a href={prUrl} target="_blank" rel="noreferrer" className="block group">
+          <div className="rounded-md border border-rule/60 hover:border-accent/60 transition-colors p-3 flex items-start justify-between gap-3">
+            <div>
+              <div className="text-xs text-muted">PR #{String(prNumber)} {branch ? <span className="font-mono ml-1">on {branch}</span> : null}</div>
+              <div className="text-sm text-accent group-hover:underline break-all">{prUrl}</div>
+            </div>
+            <span className="text-accent shrink-0">↗</span>
+          </div>
+        </a>
+      ) : branch ? (
+        <div className="text-xs text-muted">branch <span className="font-mono">{branch}</span></div>
+      ) : null}
+      {carryPayload ? (
+        <div className="rounded-md border border-medic/30 bg-medic/5 p-3 space-y-2">
+          <div className="text-xs font-medium text-medic">Carried operator-authored fix</div>
+          <div className="text-sm font-mono">{String(carryPayload['commit_subject'])}</div>
+          {Array.isArray(carryPayload['files']) ? (
+            <ul className="text-xs text-muted font-mono space-y-0.5">
+              {(carryPayload['files'] as string[]).slice(0, 6).map((f) => (
+                <li key={f}>· {f}</li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+      {Array.isArray(files) && files.length > 0 ? (
+        <div>
+          <div className="text-xs text-muted mb-1.5">Convoy authored {files.length} file{files.length === 1 ? '' : 's'}</div>
+          <ul className="text-xs text-muted font-mono space-y-0.5">
+            {files.map((f) => (
+              <li key={f}>· {f}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function DeployArtifactCard({ stage, finished, failed, stageEvents }: { stage: Stage; finished?: EventRow; failed?: EventRow; stageEvents: EventRow[] }) {
+  const trafficEvents = stageEvents.filter((e) => {
+    const p = e.payload as Record<string, unknown> | null;
+    return e.kind === 'progress' && typeof p?.['traffic_split_percent'] === 'number';
+  });
+  const lastTraffic = trafficEvents.at(-1);
+  const trafficPercent = (lastTraffic?.payload as Record<string, unknown> | undefined)?.['traffic_split_percent'];
+  const fp = (finished?.payload ?? failed?.payload) as Record<string, unknown> | undefined;
+  if (!fp && trafficEvents.length === 0) return null;
+
+  return (
+    <div className="rounded-xl border border-rule/40 bg-card/60 p-5 space-y-4">
+      <h3 className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted">{stage === 'canary' ? 'Canary deploy' : 'Promote to production'}</h3>
+      {typeof trafficPercent === 'number' ? (
+        <div>
+          <div className="flex items-baseline justify-between mb-2">
+            <span className="text-sm text-muted">traffic on canary</span>
+            <span className="text-2xl font-semibold tabular-nums">{trafficPercent}<span className="text-base text-muted ml-0.5">%</span></span>
+          </div>
+          <div className="h-2 bg-rule/60 rounded-full overflow-hidden">
+            <div className="h-full bg-accent rounded-full transition-all" style={{ width: `${Math.min(100, Number(trafficPercent))}%` }} />
+          </div>
+        </div>
+      ) : null}
+      {fp ? (
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 text-sm">
+          {typeof fp['p99_delta_ms'] === 'number' ? (
+            <Metric label="p99 Δ" value={`${fp['p99_delta_ms']}ms`} status={Number(fp['p99_delta_ms']) > 100 ? 'warn' : 'ok'} />
+          ) : null}
+          {typeof fp['error_rate_delta_pct'] === 'number' ? (
+            <Metric label="err Δ" value={`${fp['error_rate_delta_pct']}%`} status={Number(fp['error_rate_delta_pct']) > 0.5 ? 'warn' : 'ok'} />
+          ) : null}
+          {typeof fp['healthy'] === 'boolean' ? (
+            <Metric label="healthy" value={fp['healthy'] ? 'yes' : 'no'} status={fp['healthy'] ? 'ok' : 'fail'} />
+          ) : null}
+          {fp['preview_url'] ? (
+            <a href={String(fp['preview_url'])} target="_blank" rel="noreferrer" className="col-span-2 sm:col-span-3 text-xs text-accent hover:underline break-all">
+              {String(fp['preview_url'])} ↗
+            </a>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ObserveArtifactCard({ run, finished, failed }: { run: RunRow; finished?: EventRow; failed?: EventRow }) {
+  const fp = (finished?.payload ?? failed?.payload) as Record<string, unknown> | undefined;
+  if (!fp && !run.liveUrl) return null;
+  return (
+    <div className="rounded-xl border border-rule/40 bg-card/60 p-5 space-y-4">
+      <h3 className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted">Observe</h3>
+      {fp ? (
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 text-sm">
+          {typeof fp['window_seconds'] === 'number' ? (
+            <Metric label="bake window" value={`${fp['window_seconds']}s`} status="ok" />
+          ) : null}
+          {typeof fp['slo_healthy'] === 'boolean' ? (
+            <Metric label="SLO" value={fp['slo_healthy'] ? 'healthy' : 'breach'} status={fp['slo_healthy'] ? 'ok' : 'fail'} />
+          ) : null}
+        </div>
+      ) : null}
+      {run.liveUrl ? (
+        <a href={run.liveUrl} target="_blank" rel="noreferrer" className="block rounded-md border border-rule/60 hover:border-accent/60 transition-colors p-3">
+          <div className="text-xs text-muted">live</div>
+          <div className="text-sm text-accent break-all">{run.liveUrl} ↗</div>
+        </a>
+      ) : null}
+    </div>
+  );
+}
+
+function Metric({ label, value, status }: { label: string; value: string; status: 'ok' | 'warn' | 'fail' }) {
+  const color =
+    status === 'ok' ? 'text-success' :
+    status === 'warn' ? 'text-warn' :
+    'text-danger';
+  return (
+    <div>
+      <div className="text-[11px] uppercase tracking-wider text-muted">{label}</div>
+      <div className={`text-lg font-semibold tabular-nums font-mono ${color}`}>{value}</div>
+    </div>
   );
 }
 
