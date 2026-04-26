@@ -8,6 +8,7 @@ import { ApprovalActions } from './approval-form';
 import { FixActions } from './fix-actions';
 import { MedicChat } from './medic-chat';
 import { ScrollIntoFailure } from './scroll-into-failure';
+import { SecretStagingForm } from './secret-staging-form';
 
 export const dynamic = 'force-dynamic';
 
@@ -410,7 +411,7 @@ function StageDetail({
  */
 function approvalToStage(kind: string): Stage | null {
   if (kind === 'open_pr' || kind === 'merge_pr') return 'author';
-  if (kind === 'promote') return 'canary';
+  if (kind === 'promote' || kind === 'stage_secrets') return 'canary';
   if (kind === 'rollback') return 'observe';
   if (kind === 'apply_migration') return 'rehearse';
   return null;
@@ -1647,6 +1648,9 @@ function ApprovalCard({ runId, approval }: { runId: string; approval: ApprovalRo
   if (approval.kind === 'merge_pr' && summary) {
     return <MergePrApprovalCard runId={runId} approval={approval} summary={summary} />;
   }
+  if (approval.kind === 'stage_secrets' && summary) {
+    return <StageSecretsApprovalCard runId={runId} approval={approval} summary={summary} />;
+  }
 
   return (
     <div className="border border-warn/40 bg-warn/5 rounded-lg p-5 space-y-3">
@@ -1798,6 +1802,73 @@ function RehearsalEvidence({ rehearsal }: { rehearsal: Record<string, unknown> }
           ))}
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function StageSecretsApprovalCard({
+  runId,
+  approval,
+  summary,
+}: {
+  runId: string;
+  approval: ApprovalRow;
+  summary: Record<string, unknown>;
+}) {
+  const note = typeof summary['note'] === 'string' ? summary['note'] : null;
+  const platform = (summary['platform'] as 'fly' | 'vercel' | 'cloudrun' | 'railway' | undefined) ?? 'fly';
+  const planId = typeof summary['plan_id'] === 'string' ? (summary['plan_id'] as string) : '';
+  const flyApp = typeof summary['fly_app'] === 'string' ? (summary['fly_app'] as string) : null;
+  const targetCwd = typeof summary['target_cwd'] === 'string' ? (summary['target_cwd'] as string) : '';
+  const sources = Array.isArray(summary['sources']) ? (summary['sources'] as string[]) : [];
+
+  const rawMissing = summary['missing'];
+  const missing: { key: string; severity: 'critical' | 'standard'; purpose: string }[] = Array.isArray(rawMissing)
+    ? rawMissing.map((m) => {
+        if (m && typeof m === 'object') {
+          const obj = m as Record<string, unknown>;
+          return {
+            key: typeof obj['key'] === 'string' ? obj['key'] : '(unknown)',
+            severity: obj['severity'] === 'critical' ? 'critical' : 'standard',
+            purpose: typeof obj['purpose'] === 'string' ? obj['purpose'] : 'required',
+          };
+        }
+        return { key: '(unknown)', severity: 'standard' as const, purpose: 'required' };
+      })
+    : [];
+
+  return (
+    <div className="border border-warn/40 bg-warn/5 rounded-lg p-5 space-y-4">
+      <div className="flex items-center gap-3 flex-wrap">
+        <span className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-warn">
+          <span className="w-1.5 h-1.5 rounded-full bg-warn animate-pulse" />
+          stage secrets before deploy
+        </span>
+        <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-rule text-muted">
+          {platform}
+        </span>
+        <span className="font-mono text-xs text-muted ml-auto">{approval.id.slice(0, 8)}</span>
+      </div>
+      {note ? <p className="text-sm text-muted leading-relaxed">{note}</p> : null}
+      {sources.length > 0 ? (
+        <p className="text-xs text-muted">
+          Required keys derived from: {sources.join(', ')}.
+        </p>
+      ) : null}
+
+      {planId && missing.length > 0 ? (
+        <SecretStagingForm
+          runId={runId}
+          approvalId={approval.id}
+          planId={planId}
+          missing={missing}
+          platform={platform}
+          flyApp={flyApp}
+          targetCwd={targetCwd}
+        />
+      ) : (
+        <ApprovalActions runId={runId} approvalId={approval.id} kind={approval.kind} />
+      )}
     </div>
   );
 }

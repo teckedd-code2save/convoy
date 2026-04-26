@@ -41,7 +41,8 @@ export type ApprovalKind =
   | 'merge_pr'
   | 'promote'
   | 'rollback'
-  | 'apply_migration';
+  | 'apply_migration'
+  | 'stage_secrets';
 
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 

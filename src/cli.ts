@@ -1315,6 +1315,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     autoApprove: opts.autoApprove === true,
     planId: plan.id,
     plan,
+    alreadySetKeys: opts.alreadySet ?? [],
     ...(platformOverride !== undefined && { platformOverride }),
     ...(opts.continueRunId !== undefined && { continueRunId: opts.continueRunId }),
   };

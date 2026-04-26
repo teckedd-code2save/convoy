@@ -50,6 +50,14 @@ export interface OrchestratorOpts {
   injectFailure?: InjectFailureOpt;
   planId?: string | null;
   /**
+   * Keys the operator self-declared via --already-set (or wrote to
+   * .env.convoy-already-set) at apply time. CanaryStage's secrets gate
+   * uses this to skip the approval pause for keys the operator vouched
+   * for. The CLI computes the set in preflight and threads it through
+   * here so CanaryStage doesn't need access to ApplyOpts.
+   */
+  alreadySetKeys?: string[];
+  /**
    * When set, the orchestrator continues an existing run row instead of
    * creating a new one. Stages whose last event in this run is `finished`
    * are skipped and their prior payload is replayed into the context. The
@@ -883,6 +891,22 @@ export class CanaryStage extends BaseStage {
   readonly name = 'canary' as const;
 
   override async run(ctx: StageContext): Promise<unknown> {
+    // Secrets gate — fires only when we're about to do a real platform
+    // deploy. Computes expected vs staged keys; if any required keys are
+    // missing AND the operator hasn't self-declared them, request a
+    // stage_secrets approval and pause. The approval form (web UI) lets
+    // the operator paste values inline; the server action writes them to
+    // .env.convoy-secrets AND pushes them to the platform via the
+    // platform CLI, so the deploy that follows actually has them.
+    //
+    // No probing of platform state — operator's declarations (file or
+    // --already-set) are trusted as the source of truth. Verification
+    // can be added later as a separate gate.
+    const isRealDeploy = Boolean(ctx.opts.realFly || ctx.opts.realVercel);
+    if (isRealDeploy && ctx.opts.plan) {
+      await this.#secretsGate(ctx, ctx.opts.plan);
+    }
+
     if (ctx.opts.realFly) {
       return this.#runRealFly(ctx, ctx.opts.realFly);
     }
@@ -1054,6 +1078,205 @@ export class CanaryStage extends BaseStage {
     };
     this.emit(ctx, 'finished', result);
     return result;
+  }
+
+  /**
+   * Secrets gate. Computes which required keys aren't yet staged and
+   * requests a stage_secrets approval if any are missing. The approval's
+   * summary carries the missing-key list + the platform context (so the
+   * web UI's paste form knows what to render and which platform CLI to
+   * push to). Ambient operator decisions:
+   *   - file: <repo>/.env.convoy-secrets (KEY=VALUE)
+   *   - file: <repo>/.env.convoy-already-set (KEY= names)
+   *   - flag: --already-set=K1,K2 (passed via opts.alreadySetKeys)
+   *
+   * No platform probing — `--already-set` claims are still trusted on
+   * faith here. Verification is a separate v2 gate.
+   */
+  async #secretsGate(ctx: StageContext, plan: ConvoyPlan): Promise<void> {
+    const { keys: expected, sources } = computeExpectedKeysFromPlan(plan);
+    if (expected.size === 0) return;
+
+    const targetCwd = plan.target.workspace
+      ? `${plan.target.localPath}/${plan.target.workspace}`
+      : plan.target.localPath;
+    const secretsPath = `${plan.target.localPath}/.env.convoy-secrets`;
+    const alreadyPath = `${plan.target.localPath}/.env.convoy-already-set`;
+
+    const fileSecrets = readEnvKeyOnly(secretsPath);
+    const fileAlready = readEnvKeyOnly(alreadyPath);
+    const cliAlready = ctx.opts.alreadySetKeys ?? [];
+
+    const staged = new Set<string>([...fileSecrets, ...fileAlready, ...cliAlready]);
+    const missing = [...expected].filter((k) => !staged.has(k));
+
+    // Filter platform-managed keys we never expect operators to stage.
+    const filtered = missing.filter((k) => !isPlatformManagedKey(k, plan.platform.chosen));
+
+    if (filtered.length === 0) {
+      this.emit(ctx, 'progress', {
+        phase: 'secrets.staged',
+        sources,
+        expected_count: expected.size,
+        staged_count: expected.size - missing.length,
+      });
+      return;
+    }
+
+    const platform = plan.platform.chosen;
+    const flyAppName = platform === 'fly'
+      ? (ctx.opts.realFly?.appName ?? null)
+      : null;
+
+    this.emit(ctx, 'progress', {
+      phase: 'secrets.gate',
+      missing: filtered,
+      sources,
+      platform,
+      note: 'pausing for stage_secrets approval — paste values in the UI or self-declare and Convoy will push to the platform before the deploy command runs',
+    });
+
+    await this.awaitApproval(ctx, 'stage_secrets', {
+      mode: 'real',
+      missing: filtered.map((key) => ({
+        key,
+        severity: classifySecretSeverity(key),
+        purpose: secretPurposeHint(key),
+      })),
+      sources,
+      platform,
+      plan_id: plan.id,
+      fly_app: flyAppName,
+      target_cwd: targetCwd,
+      secrets_path: secretsPath,
+      already_set_path: alreadyPath,
+      note:
+        'These required env vars aren\'t staged yet. Paste each value below to push it to the platform now, mark it as already set if you set it elsewhere, or skip with explicit acknowledgment.',
+    });
+
+    this.emit(ctx, 'progress', { phase: 'secrets.gate.cleared', missing: filtered });
+  }
+}
+
+/**
+ * Per-key severity classifier — drives the visual weight in the stage_secrets
+ * approval card. DB / credential / token keys read as critical (the deploy
+ * provably can't function without them); everything else is "standard."
+ *
+ * Pattern-based and intentionally heuristic — false negatives just downgrade
+ * a key to "standard" (still surfaced, just less alarming). False positives
+ * upgrade harmless keys to "critical" (operator notices, no harm done).
+ */
+function classifySecretSeverity(key: string): 'critical' | 'standard' {
+  const k = key.toUpperCase();
+  if (/(DATABASE|POSTGRES|MONGODB|REDIS|MYSQL|SQL)_?URL$/.test(k)) return 'critical';
+  if (/_DATABASE_URL$|^PRISMA_DATABASE_URL$/.test(k)) return 'critical';
+  if (/_CONNECTION_STRING$|_CONNECTION_URI$/.test(k)) return 'critical';
+  if (/(API_KEY|SECRET|TOKEN|PRIVATE_KEY|CLIENT_SECRET)$/.test(k)) return 'critical';
+  if (/^(STRIPE_|CLERK_SECRET|JWT_SECRET|AUTH_SECRET|NEXTAUTH_SECRET)/.test(k)) return 'critical';
+  return 'standard';
+}
+
+/**
+ * Hint string surfaced under the key name in the approval card so the
+ * operator sees what the value is *for* without having to grep their schema.
+ * Heuristic again — when no pattern matches we just say "required by .env.schema".
+ */
+function secretPurposeHint(key: string): string {
+  const k = key.toUpperCase();
+  if (/(DATABASE|POSTGRES|MYSQL|SQL)_?URL$/.test(k)) return 'database connection string';
+  if (/MONGODB_?URL$/.test(k)) return 'MongoDB connection string';
+  if (/REDIS_?URL$/.test(k)) return 'Redis connection string';
+  if (/_API_KEY$/.test(k)) return 'API key';
+  if (/_SECRET$|^.*_SECRET$/.test(k)) return 'secret';
+  if (/_TOKEN$/.test(k)) return 'token';
+  if (/^STRIPE_/.test(k)) return 'Stripe credential';
+  if (/^CLERK_/.test(k)) return 'Clerk auth credential';
+  if (/^NEXT_PUBLIC_/.test(k)) return 'public env var (shipped to client bundle)';
+  return 'required by .env.schema';
+}
+
+/**
+ * Filter out keys the platform itself sets at runtime — operators shouldn't
+ * have to stage these and Convoy shouldn't pause for them.
+ */
+function isPlatformManagedKey(key: string, platform: Platform): boolean {
+  if (platform === 'vercel') {
+    return key.startsWith('VERCEL_') || key.startsWith('NEXT_PUBLIC_VERCEL_');
+  }
+  if (platform === 'fly') {
+    return key.startsWith('FLY_') || key === 'PORT';
+  }
+  if (platform === 'cloudrun') {
+    return key === 'PORT' || key === 'K_SERVICE' || key === 'K_REVISION' || key === 'K_CONFIGURATION';
+  }
+  return false;
+}
+
+/**
+ * Plan-only computation of expected keys — duplicated from cli.ts's
+ * computeExpectedKeys to keep stages.ts self-contained (the cli version
+ * is imported from cli.ts, which would create a circular dep). Reads
+ * .env.schema from the plan's authoredFiles + the target's .env.example.
+ */
+function computeExpectedKeysFromPlan(plan: ConvoyPlan): {
+  keys: Set<string>;
+  sources: string[];
+} {
+  const keys = new Set<string>();
+  const sources: string[] = [];
+
+  const schema = plan.author.convoyAuthoredFiles.find((f) => f.path === '.env.schema');
+  if (schema) {
+    const k = extractEnvKeysFromText(schema.contentPreview);
+    k.forEach((key) => keys.add(key));
+    if (k.length > 0) sources.push(`.env.schema (${k.length})`);
+  }
+
+  const fs = require('node:fs') as typeof import('node:fs');
+  const path = require('node:path') as typeof import('node:path');
+  const targetCwd = plan.target.workspace
+    ? path.resolve(plan.target.localPath, plan.target.workspace)
+    : plan.target.localPath;
+  for (const cand of ['.env.example', '.env.local.example']) {
+    const candidates = [path.resolve(targetCwd, cand), path.resolve(plan.target.localPath, cand)];
+    for (const p of candidates) {
+      if (fs.existsSync(p)) {
+        try {
+          const k = extractEnvKeysFromText(fs.readFileSync(p, 'utf8'));
+          k.forEach((key) => keys.add(key));
+          if (k.length > 0) sources.push(`${cand} (${k.length})`);
+          break;
+        } catch {
+          // unreadable, skip
+        }
+      }
+    }
+  }
+
+  return { keys, sources };
+}
+
+function extractEnvKeysFromText(text: string): string[] {
+  const out: string[] = [];
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const idx = trimmed.indexOf('=');
+    if (idx <= 0) continue;
+    const key = trimmed.slice(0, idx).trim();
+    if (/^[A-Z_][A-Z0-9_]*$/i.test(key)) out.push(key);
+  }
+  return out;
+}
+
+function readEnvKeyOnly(filePath: string): string[] {
+  const fs = require('node:fs') as typeof import('node:fs');
+  if (!fs.existsSync(filePath)) return [];
+  try {
+    return extractEnvKeysFromText(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return [];
   }
 }
 

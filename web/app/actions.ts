@@ -21,6 +21,210 @@ import { decideApproval as decide, listEvents } from '@/lib/runs';
 const MEDIC_MODEL = 'claude-opus-4-7';
 const CHAT_MAX_TOKENS = 900;
 
+/**
+ * Per-key action shape submitted by the stage_secrets approval form. The
+ * form composes one of three resolutions per missing key:
+ *   - paste a value (pushes to the platform + writes .env.convoy-secrets)
+ *   - mark "already set on platform" (writes .env.convoy-already-set)
+ *   - skip (does nothing — operator accepts the risk for this key)
+ */
+export type SecretAction =
+  | { kind: 'paste'; key: string; value: string }
+  | { kind: 'already_set'; key: string }
+  | { kind: 'skip'; key: string };
+
+/**
+ * Submit the stage_secrets approval form. For each pasted value: write to
+ * .env.convoy-secrets AND attempt to push to the platform via its CLI
+ * (`vercel env add` / `flyctl secrets set`) so the deploy command that
+ * follows actually has the value. For each "already set" mark: write to
+ * .env.convoy-already-set so future runs don't re-prompt. After all
+ * actions are applied, approve the approval — the orchestrator unblocks
+ * and CanaryStage proceeds with the platform deploy.
+ *
+ * Best-effort on the platform push: the function returns per-key results
+ * so the UI can surface "wrote locally but platform push failed" cases,
+ * but a partial failure does NOT block the approval. The deploy step that
+ * follows will fail loudly if a critical secret didn't actually land,
+ * which is the point — Convoy never silently swallows a half-staged state.
+ */
+export async function submitStagedSecrets(
+  runId: string,
+  approvalId: string,
+  planId: string,
+  actions: SecretAction[],
+  context: {
+    platform: 'fly' | 'vercel' | 'cloudrun' | 'railway';
+    flyApp?: string | null;
+    targetCwd: string;
+  },
+): Promise<{
+  ok: boolean;
+  reason?: string;
+  results: { key: string; status: 'staged' | 'declared' | 'skipped' | 'error'; message?: string }[];
+}> {
+  if (!runId || typeof runId !== 'string') return { ok: false, reason: 'invalid runId', results: [] };
+  if (!approvalId || typeof approvalId !== 'string') return { ok: false, reason: 'invalid approvalId', results: [] };
+  if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId', results: [] };
+  if (!Array.isArray(actions) || actions.length === 0) return { ok: false, reason: 'no actions submitted', results: [] };
+
+  const plan = getPlan(planId);
+  if (!plan) return { ok: false, reason: 'plan not found', results: [] };
+
+  const results: { key: string; status: 'staged' | 'declared' | 'skipped' | 'error'; message?: string }[] = [];
+
+  for (const action of actions) {
+    if (!VALID_ENV_KEY.test(action.key)) {
+      results.push({ key: action.key, status: 'error', message: 'invalid env key' });
+      continue;
+    }
+
+    if (action.kind === 'skip') {
+      results.push({ key: action.key, status: 'skipped' });
+      continue;
+    }
+
+    if (action.kind === 'already_set') {
+      try {
+        unstageKey(plan, action.key);
+        appendAlreadySet(plan, action.key);
+        results.push({ key: action.key, status: 'declared' });
+      } catch (err) {
+        results.push({
+          key: action.key,
+          status: 'error',
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+      continue;
+    }
+
+    // kind === 'paste'
+    if (typeof action.value !== 'string' || action.value.length === 0) {
+      results.push({ key: action.key, status: 'error', message: 'value cannot be empty' });
+      continue;
+    }
+    if (action.value.length > 8192) {
+      results.push({ key: action.key, status: 'error', message: 'value too long (max 8192 chars)' });
+      continue;
+    }
+    if (action.value.includes('\n')) {
+      results.push({ key: action.key, status: 'error', message: 'value cannot contain newlines' });
+      continue;
+    }
+
+    // 1. Write to local .env.convoy-secrets so future Convoy runs see it.
+    try {
+      unstageKey(plan, action.key);
+      appendSecret(plan, action.key, action.value);
+    } catch (err) {
+      results.push({
+        key: action.key,
+        status: 'error',
+        message: `local write failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      continue;
+    }
+
+    // 2. Push to platform CLI. Best-effort — failure here doesn't block
+    // the approval. The deploy step that follows will fail loud if the
+    // secret didn't actually land on the platform, which is the right
+    // surface for that failure.
+    const pushResult = await pushSecretToPlatform(
+      action.key,
+      action.value,
+      context.platform,
+      { flyApp: context.flyApp ?? null, cwd: context.targetCwd },
+    );
+    results.push({
+      key: action.key,
+      status: pushResult.ok ? 'staged' : 'error',
+      ...(pushResult.message ? { message: pushResult.message } : {}),
+    });
+  }
+
+  // Approve the approval gate so the orchestrator unblocks. We approve
+  // even when individual platform pushes failed — the deploy will surface
+  // the breach in that case, which is more informative than a generic
+  // "approval rejected, retry."
+  const updated = decide(runId, approvalId, 'approved');
+  if (!updated) {
+    return {
+      ok: false,
+      reason: 'approval already decided, not found, or does not belong to this run',
+      results,
+    };
+  }
+
+  revalidatePath(`/runs/${runId}`);
+  return { ok: true, results };
+}
+
+/**
+ * Spawn the platform CLI to set a single secret. Returns ok=true on
+ * exit code 0; ok=false with the captured stderr otherwise. Vercel and
+ * Fly have different shapes — Vercel reads value from stdin and prompts
+ * for environment, Fly takes KEY=VALUE on argv.
+ */
+async function pushSecretToPlatform(
+  key: string,
+  value: string,
+  platform: 'fly' | 'vercel' | 'cloudrun' | 'railway',
+  ctx: { flyApp: string | null; cwd: string },
+): Promise<{ ok: boolean; message?: string }> {
+  if (platform === 'fly') {
+    if (!ctx.flyApp) return { ok: false, message: 'no fly app name in approval context' };
+    return runOnce('flyctl', ['secrets', 'set', `${key}=${value}`, '--app', ctx.flyApp, '--stage'], { cwd: ctx.cwd });
+  }
+  if (platform === 'vercel') {
+    // `vercel env add KEY production` prompts for value on stdin. We pipe.
+    // --force overwrites if the key already exists at that target; without
+    // it, Vercel errors on duplicate. We always pass --force here because
+    // the operator just typed a fresh value and meant to commit to it.
+    return runOnce('vercel', ['env', 'add', key, 'production', '--force'], { cwd: ctx.cwd, stdin: value });
+  }
+  if (platform === 'cloudrun') {
+    return { ok: false, message: 'cloudrun adapter does not yet support push (manual gcloud run services update --update-env-vars)' };
+  }
+  if (platform === 'railway') {
+    return { ok: false, message: 'railway adapter does not yet support push (manual railway variables set)' };
+  }
+  return { ok: false, message: `unknown platform: ${platform}` };
+}
+
+function runOnce(
+  cmd: string,
+  args: string[],
+  opts: { cwd: string; stdin?: string },
+): Promise<{ ok: boolean; message?: string }> {
+  return new Promise((resolveResult) => {
+    let stderr = '';
+    let stdout = '';
+    const child = spawn(cmd, args, {
+      cwd: opts.cwd,
+      env: process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    child.stdout?.on('data', (c: Buffer) => { stdout += c.toString('utf8'); });
+    child.stderr?.on('data', (c: Buffer) => { stderr += c.toString('utf8'); });
+    child.on('error', (err) => resolveResult({ ok: false, message: err.message }));
+    child.on('exit', (code) => {
+      if (code === 0) {
+        resolveResult({ ok: true });
+      } else {
+        const msg = (stderr || stdout || `exit ${code}`).trim().slice(0, 240);
+        resolveResult({ ok: false, message: msg });
+      }
+    });
+    if (opts.stdin !== undefined) {
+      child.stdin.write(opts.stdin);
+      child.stdin.end();
+    } else {
+      child.stdin.end();
+    }
+  });
+}
+
 export async function decideApproval(
   runId: string,
   approvalId: string,
