@@ -20,3 +20,10 @@ coverage/
 .convoy/clones/
 .convoy/cache/
 .convoy/plans/
+
+# Local replay artifacts — regenerate via `convoy replay <runId>`
+demo-output/
+
+# Local-only prep docs (hackathon submission, video cut, adversarial review)
+docs/adversarial-*.md
+docs/hackathon-*.md
