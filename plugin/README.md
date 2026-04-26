@@ -153,6 +153,8 @@ Every Convoy command runs from `$CONVOY_HOME`, not from this project's directory
 cd "${CONVOY_HOME:-$HOME/convoy}" && npm run convoy -- <subcommand> <args>
 ```
 
+For `ship` with a local target, pass an absolute path. Relative paths like `.` or `./app` will resolve from `$CONVOY_HOME`, not from the directory Claude was launched in.
+
 If `CONVOY_HOME` is unset and `~/convoy` doesn't exist, ask the user for the path before running anything.
 
 ### Principles Convoy enforces

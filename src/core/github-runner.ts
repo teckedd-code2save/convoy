@@ -36,6 +36,11 @@ export interface AuthResult {
   error?: string;
 }
 
+export interface RepoSourceSnapshot {
+  headSha: string;
+  branchName?: string;
+}
+
 /**
  * Execute a shell command in a directory, capturing stdout/stderr. Throws on
  * non-zero exit with the combined output.
@@ -143,6 +148,26 @@ export async function gitHubAuthStatus(): Promise<AuthResult> {
     return out;
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+export async function captureSourceSnapshot(targetPath: string): Promise<RepoSourceSnapshot | null> {
+  const abs = resolve(targetPath);
+  if (!existsSync(join(abs, '.git'))) return null;
+
+  try {
+    const head = await sh('git', ['rev-parse', 'HEAD'], { cwd: abs });
+    const branch = await sh('git', ['branch', '--show-current'], {
+      cwd: abs,
+      allowFailure: true,
+    });
+    const branchName = branch.stdout.trim() || undefined;
+    return {
+      headSha: head.stdout.trim(),
+      branchName,
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -265,15 +290,17 @@ export interface CarryUncommittedInput {
  *
  * Idempotent across resumes: callers pass a stable plan-keyed branch name
  * (see `planBranchName`). When the branch already exists locally or on
- * origin we reset it to the default branch HEAD and force-push the new
- * content. The caller is expected to have already probed for an existing
- * open/merged PR via `findExistingConvoyPr` and passed `existingPrUrl` if
- * a same-branch PR is open — in that case we skip `gh pr create` and
- * return the existing URL with the new commits pushed to its head.
+ * origin we reset it to the rehearsed local HEAD (when provided) or the
+ * default branch HEAD and force-push the new content. The caller is
+ * expected to have already probed for an existing open/merged PR via
+ * `findExistingConvoyPr` and passed `existingPrUrl` if a same-branch PR is
+ * open — in that case we skip `gh pr create` and return the existing URL
+ * with the new commits pushed to its head.
  *
  * Carry flow when `carry` is provided:
  *   1. git stash push -u (preserve the dirty tree across the checkout)
- *   2. git fetch + checkout -B <branch> from origin/<default>
+ *   2. git fetch + checkout -B <branch> from the rehearsed local HEAD
+ *      (fallback: origin/<default>)
  *   3. git stash pop (restore dirty tree onto the new branch)
  *   4. git add -A; git commit -m "<carry.message>" (the operator's fix)
  *   5. write Convoy plumbing files
@@ -292,6 +319,7 @@ export async function createPrFromAuthoredFiles(
   body: string,
   existingPrUrl?: string,
   carry?: CarryUncommittedInput,
+  sourceSnapshot?: RepoSourceSnapshot,
 ): Promise<PrResult> {
   if (files.length === 0) {
     throw new Error('createPrFromAuthoredFiles called with no files');
@@ -332,13 +360,15 @@ export async function createPrFromAuthoredFiles(
     );
   }
 
-  // Step 2 — make sure we're branching from the latest default branch. -B
-  // resets the branch to that commit, which is what we want for re-attempts:
-  // the prior run's commits on this branch (if any) are overwritten with
-  // fresh content built from the plan's authored files. Force-push later
-  // cements that.
+  // Step 2 — branch from the exact local HEAD rehearsal validated when the
+  // caller provides one. This keeps author/deploy aligned with the code
+  // state that actually booted and passed probes. Fallback stays the latest
+  // origin/<default> snapshot for older callers that don't pass source info.
   await sh('git', ['fetch', 'origin', ctx.defaultBranch], { cwd: ctx.path });
-  await sh('git', ['checkout', '-B', branch, `origin/${ctx.defaultBranch}`], { cwd: ctx.path });
+  const defaultHead = (await sh('git', ['rev-parse', `origin/${ctx.defaultBranch}`], { cwd: ctx.path })).stdout.trim();
+  const checkoutBase = sourceSnapshot?.headSha ?? defaultHead;
+  await sh('git', ['checkout', '-B', branch, checkoutBase], { cwd: ctx.path });
+  const baseDiffersFromDefault = checkoutBase !== defaultHead;
 
   // Step 3 — pop the stash if we created one. This puts the operator's
   // uncommitted changes back into the working tree, now on convoy's branch.
@@ -354,7 +384,7 @@ export async function createPrFromAuthoredFiles(
       // proceeding would produce an inconsistent commit.
       throw new Error(
         `stash pop failed when carrying uncommitted changes onto ${branch}: ${err instanceof Error ? err.message : String(err)}. ` +
-          `The operator's changes may conflict with origin/${ctx.defaultBranch}. ` +
+          `The operator's changes may conflict with the rehearsed source snapshot or origin/${ctx.defaultBranch}. ` +
           `Resolve manually: cd ${ctx.path} && git stash pop, then re-run \`convoy resume\`.`,
       );
     }
@@ -402,13 +432,16 @@ export async function createPrFromAuthoredFiles(
     plumbingCommitted = true;
   }
 
-  // Did this whole flow result in any new commits? Possible no-op cases:
+  // Did this whole flow result in any new commits or a different base
+  // snapshot to push? Possible no-op cases:
   //   - plumbing already on origin/<default> AND no carry was instructed
   //   - plumbing already on origin/<default> AND carry's diff was empty
-  // In both, the branch points at origin/<default> and there's nothing to
-  // push. Surface that clearly so AuthorStage skips with pr.already_shipped.
+  // In both, when the branch base also matches origin/<default>, there's
+  // nothing to push. If the rehearsed local HEAD differs from default, we
+  // still push/open the PR even with no new Convoy-authored commits so the
+  // operator's committed feature work rides through the same reviewed branch.
   const anythingCommitted = plumbingCommitted || carryCommitted;
-  if (!anythingCommitted) {
+  if (!anythingCommitted && !baseDiffersFromDefault) {
     return {
       branch,
       prUrl: existingPrUrl ?? '',

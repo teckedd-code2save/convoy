@@ -696,6 +696,7 @@ interface PreflightReport {
   realFly: boolean;
   checks: PreflightCheck[];
   hardFailures: string[];
+  sourceSnapshot?: { headSha: string; branchName?: string };
   /**
    * Captured at preflight when --real-author is on and the target's working
    * tree has uncommitted changes. The author stage carries these onto the
@@ -1011,7 +1012,11 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
         detail: 'skipped — plan has no files to author',
       });
     } else {
-      const { detectRepo: detect, gitHubAuthStatus: authStatus } = await import('./core/github-runner.js');
+      const {
+        captureSourceSnapshot,
+        detectRepo: detect,
+        gitHubAuthStatus: authStatus,
+      } = await import('./core/github-runner.js');
       const repo = await detect(plan.target.localPath);
       if (!repo) {
         report.realAuthor = false;
@@ -1044,6 +1049,18 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
             ok: true,
             detail: `gh authed as ${auth.user ?? 'unknown'} — will open PR on ${repo.owner}/${repo.repo}`,
           });
+          const sourceSnapshot = await captureSourceSnapshot(plan.target.localPath);
+          if (sourceSnapshot) {
+            report.sourceSnapshot = sourceSnapshot;
+            report.checks.push({
+              name: 'real author',
+              ok: true,
+              detail:
+                `author branch will be based on local HEAD ${sourceSnapshot.headSha.slice(0, 7)}` +
+                `${sourceSnapshot.branchName ? ` from ${sourceSnapshot.branchName}` : ''} ` +
+                `so Convoy deploys the same revision rehearsal validated.`,
+            });
+          }
 
           // Dirty tree handling: previously we hard-failed here and told the
           // operator to commit + push to main. That was wrong for git-deploy
@@ -1352,6 +1369,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
       prBody: buildPrBody(plan),
       mergeOnApproval: opts.autoMerge !== false,
       mergeMethod: method,
+      sourceSnapshot: preflight.sourceSnapshot,
     };
     if (preflight.carryUncommittedChanges) {
       const reasonForMessage = (opts.carryCommitMessage ?? '').trim();

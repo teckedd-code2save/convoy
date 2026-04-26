@@ -1,3 +1,5 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import {
   flyAppExists,
   flyAuthStatus,
@@ -26,6 +28,7 @@ import {
   plumbingMatchesDefaultBranch,
   prStatus,
   type GitRepoContext,
+  type RepoSourceSnapshot,
 } from './github-runner.js';
 import { diagnose, type DiagnoseOptions } from './medic.js';
 import type { ConvoyPlan } from './plan.js';
@@ -86,6 +89,13 @@ export interface RealAuthorOpt {
   prBody: string;
   mergeOnApproval: boolean;
   mergeMethod?: 'merge' | 'squash' | 'rebase';
+  /**
+   * Snapshot of the exact local git HEAD that rehearsal validated. Author
+   * must branch from this commit, not blindly from origin/<default>, or a
+   * feature branch's committed-but-unpushed work disappears between rehearse
+   * and deploy.
+   */
+  sourceSnapshot?: RepoSourceSnapshot;
   /**
    * Operator-authored uncommitted changes captured at preflight. When set,
    * AuthorStage carries these onto the plan-keyed branch as a separate
@@ -548,7 +558,8 @@ export class AuthorStage extends BaseStage {
       cfg.authoredFiles.map((f) => ({ path: f.path, contentPreview: f.contentPreview })),
     );
     const willCarry = cfg.carryUncommittedChanges !== undefined;
-    if (plumbingShipped && !willCarry && !existing) {
+    const sourceDiffersFromDefault = cfg.sourceSnapshot !== undefined;
+    if (plumbingShipped && !willCarry && !existing && !sourceDiffersFromDefault) {
       this.emit(ctx, 'progress', {
         phase: 'pr.already_shipped',
         branch,
@@ -595,10 +606,21 @@ export class AuthorStage extends BaseStage {
             'These uncommitted files will be committed to the convoy branch as a separate `fix:` commit before Convoy writes its plumbing. Main stays untouched until you approve the merge.',
         }
       : undefined;
+    const sourceForApproval = cfg.sourceSnapshot
+      ? {
+          branch: cfg.sourceSnapshot.branchName ?? null,
+          head_sha: cfg.sourceSnapshot.headSha,
+          note:
+            'Convoy will branch from this local HEAD so the PR and deploy use the same code revision rehearsal validated.',
+        }
+      : undefined;
 
     const baseNote = existing?.state === 'open'
       ? `Rehearsal passed. A PR for this plan is already open at ${existing.prUrl}; Convoy will force-push the latest authored files to its branch and reuse it.`
-      : 'Rehearsal passed. Convoy will open a PR with these deployment-surface files only — no application source is touched.';
+      : 'Rehearsal passed. Convoy will open a PR from the rehearsed local snapshot and add these deployment-surface files.';
+    const sourceNote = sourceForApproval
+      ? ` The branch base is local HEAD ${sourceForApproval.head_sha.slice(0, 7)}${sourceForApproval.branch ? ` from \`${sourceForApproval.branch}\`` : ''}, so committed feature work from that snapshot stays in the run.`
+      : '';
     const carryNote = carryForApproval
       ? ` In addition, Convoy is carrying ${carryForApproval.file_count} operator-authored file${carryForApproval.file_count === 1 ? '' : 's'} from your working tree as a separate \`fix:\` commit on the same branch — no push to ${repo.defaultBranch} is needed for those changes to deploy.`
       : '';
@@ -609,9 +631,10 @@ export class AuthorStage extends BaseStage {
       default_branch: repo.defaultBranch,
       branch_to_create: branch,
       reuse_pr_url: existing?.state === 'open' ? existing.prUrl : undefined,
-      note: `${baseNote}${carryNote}`,
+      note: `${baseNote}${sourceNote}${carryNote}`,
       rehearsal: summarizeRehearsalForApproval(ctx.prior['rehearse']),
       files: authoredForApproval,
+      source: sourceForApproval,
       carry: carryForApproval,
     });
 
@@ -630,6 +653,7 @@ export class AuthorStage extends BaseStage {
               message: cfg.carryUncommittedChanges.messageDefault,
             }
           : undefined,
+        cfg.sourceSnapshot,
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -684,10 +708,13 @@ export class AuthorStage extends BaseStage {
       pr_url: pr.prUrl,
       pr_number: pr.prNumber,
       branch: pr.branch,
-      note: 'Only Convoy-authored deployment files were committed. Source code is untouched. Review on GitHub and approve to merge.',
+      note: sourceForApproval
+        ? `This PR is based on local HEAD ${sourceForApproval.head_sha.slice(0, 7)}${sourceForApproval.branch ? ` from \`${sourceForApproval.branch}\`` : ''}. Review the full GitHub diff, including any operator-authored application commits from that snapshot, then approve to merge.`
+        : 'Review the full GitHub diff and approve to merge.',
       // Full file shape so the approval card can render the same content
       // preview the plan page shows. Operator should never approve blind.
       files: authoredForApproval,
+      source: sourceForApproval,
     });
 
     if (cfg.mergeOnApproval) {
@@ -1233,8 +1260,6 @@ function computeExpectedKeysFromPlan(plan: ConvoyPlan): {
     if (k.length > 0) sources.push(`.env.schema (${k.length})`);
   }
 
-  const fs = require('node:fs') as typeof import('node:fs');
-  const path = require('node:path') as typeof import('node:path');
   const targetCwd = plan.target.workspace
     ? path.resolve(plan.target.localPath, plan.target.workspace)
     : plan.target.localPath;
@@ -1271,7 +1296,6 @@ function extractEnvKeysFromText(text: string): string[] {
 }
 
 function readEnvKeyOnly(filePath: string): string[] {
-  const fs = require('node:fs') as typeof import('node:fs');
   if (!fs.existsSync(filePath)) return [];
   try {
     return extractEnvKeysFromText(fs.readFileSync(filePath, 'utf8'));

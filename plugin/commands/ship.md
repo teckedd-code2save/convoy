@@ -20,6 +20,14 @@ If `CONVOY_HOME` is unset and `~/convoy` doesn't exist, ask the user for the pat
 
 ## Run the CLI
 
+Before invoking Convoy, normalize any relative local target to an absolute path based on the user's current session cwd. Do not pass `.` / `..` / `./foo` / `../foo` through unchanged after switching to `$CONVOY_HOME`, or Convoy will resolve them relative to its own repo.
+
+Examples:
+
+- If the user is in `/work/softpharmamanager` and says `/convoy:ship .`, invoke Convoy with `/work/softpharmamanager`.
+- If the user says `/convoy:ship ./apps/web`, invoke Convoy with `/work/softpharmamanager/apps/web`.
+- GitHub URLs and `owner/repo` shorthands should be forwarded unchanged.
+
 Use the Bash tool to run:
 
 ```bash
