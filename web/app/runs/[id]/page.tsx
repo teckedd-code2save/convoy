@@ -1068,6 +1068,15 @@ interface MedicDiagnosis {
   source: 'ai' | 'skipped-no-key' | 'error';
 }
 
+interface FailureLogPayload {
+  phase: 'rehearsal.failure_logs';
+  reason: string;
+  excerpt: string;
+  totalLines: number;
+  excerptLines: number;
+  truncated: boolean;
+}
+
 function DiagnosisSection({
   events,
   runId,
@@ -1087,6 +1096,13 @@ function DiagnosisSection({
   // scoped per-run, so showing chat on every historical diagnosis would
   // duplicate turns.
   const latestId = diagnoses[diagnoses.length - 1]?.id;
+  const latestFailureLog = events
+    .filter((e) => {
+      if (e.kind !== 'log' || e.stage !== 'rehearse') return false;
+      const p = e.payload as Record<string, unknown> | null;
+      return p !== null && p['phase'] === 'rehearsal.failure_logs';
+    })
+    .at(-1)?.payload as FailureLogPayload | undefined;
 
   // Extract the medic's tool call trace from progress events so the handoff
   // prompt can tell Claude Code what evidence was gathered. Cheap per render.
@@ -1127,6 +1143,7 @@ function DiagnosisSection({
             repoUrl={repoUrl}
             toolCalls={e.id === latestId ? toolCalls : []}
             chatTurns={e.id === latestId ? chatTurns : []}
+            rawFailureLog={e.id === latestId ? latestFailureLog ?? null : null}
           />
         ))}
       </div>
@@ -1142,6 +1159,7 @@ function DiagnosisCard({
   repoUrl,
   toolCalls,
   chatTurns,
+  rawFailureLog,
 }: {
   diagnosis: MedicDiagnosis;
   createdAt: string;
@@ -1150,6 +1168,7 @@ function DiagnosisCard({
   repoUrl: string;
   toolCalls: { tool: string; inputSummary: string; timestamp: string }[];
   chatTurns: MedicChatTurn[];
+  rawFailureLog: FailureLogPayload | null;
 }) {
   const classColors: Record<string, string> = {
     code: 'border-warn/50 bg-warn/5',
@@ -1224,6 +1243,25 @@ function DiagnosisCard({
         <DisclosureSection label="What I see" defaultOpen={false}>
           <p className="leading-relaxed text-sm whitespace-pre-wrap">{diagnosis.narrative}</p>
         </DisclosureSection>
+
+        {rawFailureLog?.excerpt && diagnosis.source !== 'ai' ? (
+          <DisclosureSection
+            label={`Raw failure output${rawFailureLog.truncated ? ' (tail)' : ''}`}
+            defaultOpen={diagnosis.source === 'error' || diagnosis.classification === 'unknown'}
+          >
+            <div className="space-y-3">
+              <p className="text-xs text-muted leading-relaxed">
+                {rawFailureLog.reason}
+                {' · '}
+                showing {rawFailureLog.excerptLines} of {rawFailureLog.totalLines} captured lines
+                {rawFailureLog.truncated ? ' from the tail of the log' : ''}
+              </p>
+              <pre className="text-xs font-mono bg-ink text-paper rounded-md p-3 overflow-auto max-h-96 whitespace-pre-wrap break-words">
+                {rawFailureLog.excerpt}
+              </pre>
+            </div>
+          </DisclosureSection>
+        ) : null}
 
         {diagnosis.suggestedFix ? (
           <DisclosureSection

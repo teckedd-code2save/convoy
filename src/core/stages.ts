@@ -328,6 +328,34 @@ abstract class BaseStage implements Stage {
   }
 }
 
+const FAILURE_LOG_TAIL_LINE_LIMIT = 120;
+const FAILURE_LOG_TAIL_CHAR_LIMIT = 12_000;
+
+function buildFailureLogPayload(logs: string[], reason: string): {
+  phase: 'rehearsal.failure_logs';
+  reason: string;
+  excerpt: string;
+  totalLines: number;
+  excerptLines: number;
+  truncated: boolean;
+} {
+  const tail = logs.slice(-FAILURE_LOG_TAIL_LINE_LIMIT);
+  let excerpt = tail.join('\n').trim();
+  let truncated = logs.length > tail.length;
+  if (excerpt.length > FAILURE_LOG_TAIL_CHAR_LIMIT) {
+    excerpt = excerpt.slice(excerpt.length - FAILURE_LOG_TAIL_CHAR_LIMIT).trimStart();
+    truncated = true;
+  }
+  return {
+    phase: 'rehearsal.failure_logs',
+    reason,
+    excerpt,
+    totalLines: logs.length,
+    excerptLines: tail.length,
+    truncated,
+  };
+}
+
 export class ScanStage extends BaseStage {
   readonly name = 'scan' as const;
 
@@ -853,6 +881,14 @@ export class RehearseStage extends BaseStage {
     );
 
     if (!rehearsal.ok) {
+      this.emit(
+        ctx,
+        'log',
+        buildFailureLogPayload(
+          rehearsal.logs,
+          rehearsal.reason ?? 'rehearsal failed',
+        ),
+      );
       this.emit(ctx, 'progress', { phase: 'medic.invoked' });
       const diagnosis = await diagnose({
         stage: 'rehearse',

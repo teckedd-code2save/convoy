@@ -7,7 +7,7 @@
     "dev": "next dev --port 3737",
     "build": "next build",
     "start": "next start --port 3737",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "next typegen && tsc --noEmit"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.90.0",
