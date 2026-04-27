@@ -12,6 +12,18 @@ Built for the *Built with Opus 4.7* Claude Code hackathon (April 21–26, 2026).
 
 ---
 
+## See it in action
+
+[![Convoy: AI Deployment Agent from Commit to Production — Built with Opus 4.7](https://img.youtube.com/vi/5btzce8adeE/maxresdefault.jpg)](https://www.youtube.com/watch?v=5btzce8adeE)
+
+A walkthrough of the real pipeline — plan, rehearse, medic agent, canary, observe — recorded against the actual product. ▶ [Watch on YouTube](https://www.youtube.com/watch?v=5btzce8adeE)
+
+The CLI and the web viewer follow the same run. Boot the viewer with `(cd web && npm run dev)` and open <http://localhost:3737>:
+
+![Convoy web viewer home at http://localhost:3737](./docs/images/viewer-home.png)
+
+---
+
 ## The medic is a Claude agent
 
 This is the part we think is new.
