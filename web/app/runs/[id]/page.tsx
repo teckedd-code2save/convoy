@@ -1244,7 +1244,7 @@ function DiagnosisCard({
           <p className="leading-relaxed text-sm whitespace-pre-wrap">{diagnosis.narrative}</p>
         </DisclosureSection>
 
-        {rawFailureLog?.excerpt && diagnosis.source !== 'ai' ? (
+        {rawFailureLog?.excerpt ? (
           <DisclosureSection
             label={`Raw failure output${rawFailureLog.truncated ? ' (tail)' : ''}`}
             defaultOpen={diagnosis.source === 'error' || diagnosis.classification === 'unknown'}

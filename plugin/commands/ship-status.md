@@ -27,6 +27,8 @@ Surface the output verbatim. It includes:
 - Per-stage success / failure markers
 - Pending approvals (with approval id)
 - Outcome reason and restored version when a run was rolled back
+- Latest medic diagnosis summary when one exists
+- Captured raw failure output from rehearsal when Convoy recorded it
 
 If the user wants to see the full timeline, point them at:
 
@@ -35,3 +37,5 @@ http://localhost:3737/runs/<run-id>
 ```
 
 That page auto-refreshes every 1.5s while the run is live and renders the medic diagnosis card prominently when present.
+
+Do not query SQLite for diagnosis or failure-log details unless the `convoy status` command itself fails or the user explicitly asks for the DB.

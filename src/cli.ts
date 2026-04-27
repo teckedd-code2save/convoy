@@ -31,8 +31,56 @@ const PLANS_DIR = process.env['CONVOY_PLANS_DIR'] ?? '.convoy/plans';
 const SUPPORTED_PLATFORMS: readonly Platform[] = ['fly', 'railway', 'vercel', 'cloudrun'];
 const WEB_BASE = (process.env['CONVOY_WEB_URL'] ?? 'http://localhost:3737').replace(/\/$/, '');
 
+interface StatusDiagnosisPayload {
+  rootCause?: string;
+  classification?: string;
+  confidence?: string;
+  location?: { file?: string; line?: number };
+  reproduction?: string;
+  narrative?: string;
+  suggestedFix?: { file?: string; owned?: string; description?: string };
+  owned?: string;
+}
+
+interface StatusFailureLogPayload {
+  phase: 'rehearsal.failure_logs';
+  reason?: string;
+  excerpt?: string;
+  totalLines?: number;
+  excerptLines?: number;
+  truncated?: boolean;
+}
+
 function webUrl(path: string): string {
   return `${WEB_BASE}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
+function getLatestDiagnosisPayload(events: RunEvent[]): StatusDiagnosisPayload | null {
+  const event = [...events].reverse().find((e) => e.kind === 'diagnosis');
+  if (!event || !event.payload || typeof event.payload !== 'object') return null;
+  return event.payload as StatusDiagnosisPayload;
+}
+
+function getLatestFailureLogPayload(events: RunEvent[]): StatusFailureLogPayload | null {
+  const event = [...events].reverse().find((e) => {
+    if (e.kind !== 'log' || e.stage !== 'rehearse') return false;
+    const payload = e.payload as Record<string, unknown> | null | undefined;
+    return payload?.['phase'] === 'rehearsal.failure_logs';
+  });
+  if (!event || !event.payload || typeof event.payload !== 'object') return null;
+  return event.payload as StatusFailureLogPayload;
+}
+
+function statusOwnedLabel(diagnosis: StatusDiagnosisPayload): string | null {
+  const owned = diagnosis.owned ?? diagnosis.suggestedFix?.owned;
+  return typeof owned === 'string' && owned.length > 0 ? owned : null;
+}
+
+function indentMultiline(text: string, prefix = '    '): string {
+  return text
+    .split('\n')
+    .map((line) => `${prefix}${line}`)
+    .join('\n');
 }
 
 async function openInBrowser(url: string): Promise<void> {
@@ -1842,6 +1890,47 @@ async function runStatus(runId?: string): Promise<void> {
       for (const approval of pending) {
         process.stdout.write(`  ${pc.yellow(SYMBOL.pause)} ${approval.kind} (${approval.id.slice(0, 8)})\n`);
       }
+    }
+
+    const diagnosis = getLatestDiagnosisPayload(events);
+    if (diagnosis?.rootCause) {
+      const location = diagnosis.location?.file
+        ? `${diagnosis.location.file}${typeof diagnosis.location.line === 'number' ? `:${diagnosis.location.line}` : ''}`
+        : null;
+      const classification = diagnosis.classification ?? 'unknown';
+      const confidence = diagnosis.confidence ?? 'unknown';
+      const owned = statusOwnedLabel(diagnosis);
+      process.stdout.write(`\n  ${pc.magenta('Latest diagnosis')}\n`);
+      process.stdout.write(`  ${pc.dim('Root cause:')} ${diagnosis.rootCause}\n`);
+      process.stdout.write(`  ${pc.dim('Verdict:')}    ${classification} (${confidence} confidence)${owned ? `, ${owned}-owned fix` : ''}\n`);
+      if (location) {
+        process.stdout.write(`  ${pc.dim('Location:')}   ${location}\n`);
+      }
+      if (diagnosis.suggestedFix?.file) {
+        process.stdout.write(`  ${pc.dim('Fix file:')}   ${diagnosis.suggestedFix.file}\n`);
+      }
+      if (diagnosis.reproduction) {
+        process.stdout.write(`  ${pc.dim('Repro:')}      ${diagnosis.reproduction}\n`);
+      }
+      if (diagnosis.narrative) {
+        process.stdout.write(`  ${pc.dim('Narrative:')}  ${diagnosis.narrative.split('\n')[0]}\n`);
+      }
+    }
+
+    const failureLog = getLatestFailureLogPayload(events);
+    if (failureLog?.excerpt) {
+      process.stdout.write(`\n  ${pc.red('Captured failure output')}${failureLog.truncated ? pc.dim(' (tail)') : ''}\n`);
+      const summaryParts = [
+        failureLog.reason,
+        typeof failureLog.excerptLines === 'number' && typeof failureLog.totalLines === 'number'
+          ? `showing ${failureLog.excerptLines} of ${failureLog.totalLines} captured lines`
+          : null,
+        failureLog.truncated ? 'from the tail of the log' : null,
+      ].filter((part): part is string => typeof part === 'string' && part.length > 0);
+      if (summaryParts.length > 0) {
+        process.stdout.write(`  ${pc.dim(summaryParts.join(' · '))}\n`);
+      }
+      process.stdout.write(`${indentMultiline(failureLog.excerpt)}\n`);
     }
   } finally {
     store.close();
