@@ -36,8 +36,8 @@ export type SecretAction =
 /**
  * Submit the stage_secrets approval form. For each pasted value: write to
  * .env.convoy-secrets AND attempt to push to the platform via its CLI
- * (`vercel env add` / `flyctl secrets set`) so the deploy command that
- * follows actually has the value. For each "already set" mark: write to
+ * (`vercel env add` / `flyctl secrets set` / Railway / Cloud Run) so the
+ * deploy command that follows actually has the value. For each "already set" mark: write to
  * .env.convoy-already-set so future runs don't re-prompt. After all
  * actions are applied, approve the approval — the orchestrator unblocks
  * and CanaryStage proceeds with the platform deploy.
@@ -53,10 +53,15 @@ export async function submitStagedSecrets(
   approvalId: string,
   planId: string,
   actions: SecretAction[],
-  context: {
+ context: {
     platform: 'fly' | 'vercel' | 'cloudrun' | 'railway';
     flyApp?: string | null;
     targetCwd: string;
+    projectBinding?: string | null;
+    railwayService?: string | null;
+    railwayEnvironment?: string | null;
+    cloudRunService?: string | null;
+    cloudRunRegion?: string | null;
   },
 ): Promise<{
   ok: boolean;
@@ -162,15 +167,23 @@ export async function submitStagedSecrets(
 
 /**
  * Spawn the platform CLI to set a single secret. Returns ok=true on
- * exit code 0; ok=false with the captured stderr otherwise. Vercel and
- * Fly have different shapes — Vercel reads value from stdin and prompts
- * for environment, Fly takes KEY=VALUE on argv.
+ * exit code 0; ok=false with the captured stderr otherwise. The adapters
+ * differ in shape: Vercel and Railway read from stdin, Fly takes KEY=VALUE
+ * on argv, and Cloud Run updates the bound service in place.
  */
 async function pushSecretToPlatform(
   key: string,
   value: string,
   platform: 'fly' | 'vercel' | 'cloudrun' | 'railway',
-  ctx: { flyApp: string | null; cwd: string },
+  ctx: {
+    flyApp: string | null;
+    cwd: string;
+    projectBinding?: string | null;
+    railwayService?: string | null;
+    railwayEnvironment?: string | null;
+    cloudRunService?: string | null;
+    cloudRunRegion?: string | null;
+  },
 ): Promise<{ ok: boolean; message?: string }> {
   if (platform === 'fly') {
     if (!ctx.flyApp) return { ok: false, message: 'no fly app name in approval context' };
@@ -184,10 +197,22 @@ async function pushSecretToPlatform(
     return runOnce('vercel', ['env', 'add', key, 'production', '--force'], { cwd: ctx.cwd, stdin: value });
   }
   if (platform === 'cloudrun') {
-    return { ok: false, message: 'cloudrun adapter does not yet support push (manual gcloud run services update --update-env-vars)' };
+    if (!ctx.cloudRunService) {
+      return {
+        ok: false,
+        message: `no Cloud Run service binding in approval context${ctx.projectBinding ? ` (${ctx.projectBinding})` : ''}`,
+      };
+    }
+    const args = ['run', 'services', 'update', ctx.cloudRunService];
+    if (ctx.cloudRunRegion) args.push('--region', ctx.cloudRunRegion);
+    args.push('--update-env-vars', `${key}=${value}`);
+    return runOnce('gcloud', args, { cwd: ctx.cwd });
   }
   if (platform === 'railway') {
-    return { ok: false, message: 'railway adapter does not yet support push (manual railway variables set)' };
+    const args = ['variables', 'set', key, '--stdin', '--skip-deploys'];
+    if (ctx.railwayService) args.push('--service', ctx.railwayService);
+    if (ctx.railwayEnvironment) args.push('--environment', ctx.railwayEnvironment);
+    return runOnce('railway', args, { cwd: ctx.cwd, stdin: `${value}\n` });
   }
   return { ok: false, message: `unknown platform: ${platform}` };
 }

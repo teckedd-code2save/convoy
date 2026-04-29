@@ -36,6 +36,12 @@ export function SecretStagingForm({
   platform,
   flyApp,
   targetCwd,
+  laneLabel,
+  projectBinding,
+  railwayService,
+  railwayEnvironment,
+  cloudRunService,
+  cloudRunRegion,
 }: {
   runId: string;
   approvalId: string;
@@ -44,6 +50,12 @@ export function SecretStagingForm({
   platform: Platform;
   flyApp: string | null;
   targetCwd: string;
+  laneLabel?: string | null;
+  projectBinding?: string | null;
+  railwayService?: string | null;
+  railwayEnvironment?: string | null;
+  cloudRunService?: string | null;
+  cloudRunRegion?: string | null;
 }) {
   const [resolutions, setResolutions] = useState<Record<string, Resolution>>(
     () =>
@@ -88,6 +100,11 @@ export function SecretStagingForm({
         platform,
         flyApp,
         targetCwd,
+        projectBinding,
+        railwayService,
+        railwayEnvironment,
+        cloudRunService,
+        cloudRunRegion,
       });
       if (!res.ok) {
         setTopError(res.reason ?? 'submit failed');
@@ -111,6 +128,11 @@ export function SecretStagingForm({
 
   return (
     <div className="space-y-4">
+      {(laneLabel || projectBinding) ? (
+        <p className="text-xs text-muted">
+          {laneLabel ? `${laneLabel}` : 'lane'}{projectBinding ? ` · ${projectBinding}` : ''}.
+        </p>
+      ) : null}
       <ul className="space-y-3">
         {missing.map((m) => {
           const resolution = resolutions[m.key] ?? 'paste';

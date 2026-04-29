@@ -1187,15 +1187,15 @@ export class CanaryStage extends BaseStage {
   /**
    * Secrets gate. Computes which required keys aren't yet staged and
    * requests a stage_secrets approval if any are missing. The approval's
-   * summary carries the missing-key list + the platform context (so the
-   * web UI's paste form knows what to render and which platform CLI to
-   * push to). Ambient operator decisions:
+   * summary carries the missing-key list plus platform/binding context so
+   * the web UI can push values into the correct target. Ambient operator
+   * decisions:
    *   - file: <repo>/.env.convoy-secrets (KEY=VALUE)
    *   - file: <repo>/.env.convoy-already-set (KEY= names)
    *   - flag: --already-set=K1,K2 (passed via opts.alreadySetKeys)
    *
-   * No platform probing — `--already-set` claims are still trusted on
-   * faith here. Verification is a separate v2 gate.
+   * Platform probing is read-only. We inspect auth/project/env state before
+   * prompting so operators only see truly missing keys.
    */
   async #secretsGate(ctx: StageContext, plan: ConvoyPlan, lane: DeploymentLane): Promise<void> {
     const expected = new Set<string>(lane.secrets.expectedKeys);
@@ -1252,6 +1252,7 @@ export class CanaryStage extends BaseStage {
       mode: 'real',
       lane_id: lane.id,
       service_path: lane.servicePath,
+      display_name: lane.displayName,
       missing: filtered.map((key) => ({
         key,
         severity: classifySecretSeverity(key),
@@ -1262,6 +1263,10 @@ export class CanaryStage extends BaseStage {
       plan_id: plan.id,
       fly_app: flyAppName,
       target_cwd: targetCwd,
+      project_binding: connection.projectBinding,
+      connection_account: connection.account,
+      connection_env_keys: connection.envKeys,
+      connection_raw: connection.raw ?? null,
       secrets_path: secretsPath,
       already_set_path: alreadyPath,
       note:

@@ -1252,12 +1252,31 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
       report.checks.push({ name: 'real vercel', ok: true, detail: 'skipped (--no-real-fly)' });
     }
   } else {
-    // railway / cloudrun — not wired yet
     report.realFly = false;
+    const cwd = primaryLane(plan).servicePath === '.'
+      ? plan.target.localPath
+      : `${plan.target.localPath}/${primaryLane(plan).servicePath}`;
+    if (opts.realFly) {
+      const connection = await probePlatformConnection(platform, cwd);
+      const remedy = connection.recommendedRemedy;
+      const connectionOk = connection.cliAvailable && connection.authenticated && connection.projectLinked;
+      report.checks.push({
+        name: `${platform} connection`,
+        ok: connectionOk,
+        detail: connectionOk
+          ? `${platform} ready${connection.account ? ` as ${connection.account}` : ''}${connection.projectBinding ? ` — ${connection.projectBinding}` : ''}`
+          : [
+              !connection.cliAvailable ? 'CLI unavailable' : null,
+              !connection.authenticated ? 'not authenticated' : null,
+              !connection.projectLinked ? 'project/service not linked' : null,
+            ].filter(Boolean).join(' · '),
+        ...(remedy ? { remedy } : {}),
+      });
+    }
     report.checks.push({
       name: 'real deploy',
       ok: true,
-      detail: `skipped — plan chose ${platform}; only fly and vercel adapters are live today. Re-plan with --platform=fly, or pass --no-real-fly.`,
+      detail: `skipped — plan chose ${platform}; connection preflight is live, but the ${platform} deploy runner still replays scripted deploy events today.`,
     });
   }
 

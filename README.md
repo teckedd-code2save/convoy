@@ -298,7 +298,9 @@ All the mechanics are real by default. Pass `--demo` to short-circuit to a scrip
 | **Fly.io** — canary deploy via `flyctl`, observe loop, auto-rollback | **Real** | proven end-to-end in [`docs/rollback-proof.md`](./docs/rollback-proof.md) |
 | **Vercel** — preview deploy + promote via `vercel` CLI | **Real** | |
 | Vercel alias-based rollback on production domain | Best-effort, v2 | current path aliases prior preview URL; reliable production-alias rollback is v2 |
-| Railway / Cloud Run adapters | Declared, stubbed | v2 — interfaces defined; stages skip with a note |
+| Railway / Cloud Run connection probes | **Real** | read-only CLI/auth/project/service/env inventory preflight is live |
+| Railway / Cloud Run secret staging | **Real** | UI-backed stage_secrets approval can push via `railway variables set` / `gcloud run services update --update-env-vars` when binding context exists |
+| Railway / Cloud Run deploy runners | Declared, stubbed | v2 — deploy stages still replay scripted events with a note |
 
 Default for `ship` and `apply` is everything real except approvals, which pause by default. `--demo` takes all the real stages back to scripted so you can try it without any credentials.
 
@@ -325,7 +327,7 @@ vercel login
 Per target repo:
 
 - Must be a git repo with a `github.com` remote you have write access to (for real PRs).
-- Service secrets go in `<target>/.env.convoy-secrets` (gitignored). Convoy stages them via `fly secrets set` / `vercel env add` before deploy. Values never enter git.
+- Service secrets go in `<target>/.env.convoy-secrets` (gitignored). Convoy stages them via the target platform CLI before deploy (`fly secrets set`, `vercel env add`, `railway variables set`, `gcloud run services update --update-env-vars`). Values never enter git.
 - Convoy can auto-create the Fly app on first run (default). Override with `--fly-app=<name>`.
 
 Full real deploy, humans-in-the-loop:
@@ -343,6 +345,14 @@ npm run convoy -- ship https://github.com/you/your-repo --auto-approve
 ```
 
 For a monorepo workspace add `--workspace=apps/web`. For a credentials-free demo add `--demo`.
+
+## Verification
+
+```bash
+npm test
+npm run typecheck
+(cd web && npm run typecheck)
+```
 
 ---
 

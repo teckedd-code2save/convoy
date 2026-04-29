@@ -8,10 +8,12 @@ export function ApprovalActions({
   runId,
   approvalId,
   kind,
+  scopeLabel,
 }: {
   runId: string;
   approvalId: string;
   kind: string;
+  scopeLabel?: string | null;
 }) {
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
@@ -32,7 +34,7 @@ export function ApprovalActions({
         onClick={() => handle('approved')}
         className="px-4 py-2 rounded-md bg-success text-white text-sm font-medium hover:bg-success/90 disabled:opacity-60 disabled:cursor-not-allowed"
       >
-        {pending ? 'Deciding...' : `Approve ${kind.replace('_', ' ')}`}
+        {pending ? 'Deciding...' : `Approve ${kind.replace('_', ' ')}${scopeLabel ? ` · ${scopeLabel}` : ''}`}
       </button>
       <button
         type="button"

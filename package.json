@@ -13,6 +13,7 @@
     "node": ">=20"
   },
   "scripts": {
+    "test": "tsx --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "dev": "tsx watch src/index.ts",
     "convoy": "tsx --env-file-if-exists=.env src/cli.ts"

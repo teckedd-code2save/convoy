@@ -15,6 +15,12 @@ export const dynamic = 'force-dynamic';
 const STAGE_ORDER = ['scan', 'pick', 'rehearse', 'author', 'canary', 'promote', 'observe'];
 type Stage = typeof STAGE_ORDER[number];
 
+interface LaneScope {
+  laneId?: string | null;
+  servicePath?: string | null;
+  displayName?: string | null;
+}
+
 /**
  * Pick the stage that should be selected when the operator lands on the
  * page without an explicit `?stage=` choice. Priority: actively-running >
@@ -177,10 +183,14 @@ function StageNav({
   }
   // Pending approvals scoped to a specific stage so the row gets its own
   // ⏸ pulse, not just the footer block.
-  const pendingApprovalByStage = new Map<Stage, ApprovalRow>();
+  const pendingApprovalByStage = new Map<Stage, ApprovalRow[]>();
   for (const approval of pendingApprovals) {
     const stage = approvalToStage(approval.kind);
-    if (stage) pendingApprovalByStage.set(stage, approval);
+    if (stage) {
+      const existing = pendingApprovalByStage.get(stage) ?? [];
+      existing.push(approval);
+      pendingApprovalByStage.set(stage, existing);
+    }
   }
 
   return (
@@ -193,7 +203,8 @@ function StageNav({
         const duration = start && end ? formatDuration(end.toISOString(), start.toISOString()) : null;
         const eventCount = eventCountByStage.get(stage) ?? 0;
         const isActive = activeStage === stage;
-        const pendingApproval = pendingApprovalByStage.get(stage);
+        const stagePendingApprovals = pendingApprovalByStage.get(stage) ?? [];
+        const pendingApproval = stagePendingApprovals[0] ?? null;
         // computeStageStatus uses 'done' for the finished state — match it.
         const icon = state === 'done' ? '●' : state === 'failed' ? '✗' : state === 'skipped' ? '⤳' : state === 'running' ? '◐' : '○';
         const iconColor =
@@ -264,7 +275,9 @@ function StageNav({
                   </span>
                 ) : null}
                 {pendingApproval ? (
-                  <span className="text-warn font-mono">awaiting {pendingApproval.kind}</span>
+                  <span className="text-warn font-mono">
+                    awaiting {stagePendingApprovals.length > 1 ? `${stagePendingApprovals.length} approvals` : pendingApproval.kind}
+                  </span>
                 ) : null}
               </div>
             )}
@@ -285,6 +298,7 @@ function StageNav({
               >
                 <span className="w-1.5 h-1.5 rounded-full bg-warn animate-pulse" />
                 <span className="font-mono">{approval.kind}</span>
+                <span className="text-muted/70">{describeLaneScope({ laneId: approval.laneId, ...laneScopeFromSummary(approval.summary) })}</span>
               </div>
             ))}
           </div>
@@ -331,7 +345,8 @@ function StageDetail({
     running: 'border-accent/60 bg-accent/10 text-accent',
     idle: 'border-rule/40 bg-card text-muted',
   };
-  const stagePendingApproval = pendingApprovals.find((a) => approvalToStage(a.kind) === activeStage);
+  const stagePendingApprovals = pendingApprovals.filter((a) => approvalToStage(a.kind) === activeStage);
+  const stageLanes = collectStageLanes(stageEvents, stagePendingApprovals);
 
   return (
     <section className="min-w-0 space-y-6">
@@ -349,6 +364,13 @@ function StageDetail({
         </span>
         {duration ? (
           <span className="text-sm text-muted tabular-nums font-mono">{duration}</span>
+        ) : null}
+        {stageLanes.length > 0 ? (
+          <div className="flex flex-wrap items-center gap-2">
+            {stageLanes.map((scope) => (
+              <LaneScopePill key={`${scope.laneId ?? 'lane'}:${scope.servicePath ?? '.'}`} scope={scope} />
+            ))}
+          </div>
         ) : null}
       </header>
 
@@ -372,8 +394,12 @@ function StageDetail({
       />
 
       {/* Pending approval scoped to this stage gets surfaced here. */}
-      {stagePendingApproval ? (
-        <ApprovalCard runId={run.id} approval={stagePendingApproval} />
+      {stagePendingApprovals.length > 0 ? (
+        <div className="space-y-4">
+          {stagePendingApprovals.map((approval) => (
+            <ApprovalCard key={approval.id} runId={run.id} approval={approval} />
+          ))}
+        </div>
       ) : null}
 
       {/* Filtered timeline */}
@@ -1401,12 +1427,17 @@ function TimelineEvent({ event }: { event: EventRow }) {
   const compact = renderPayload(event.payload);
   const full = hasPayload ? JSON.stringify(event.payload, null, 2) : '';
   const isMedic = isMedicToolUse(event);
+  const payloadScope = laneScopeFromSummary(event.payload);
+  const scope = payloadScope.servicePath || payloadScope.displayName || event.laneId
+    ? { laneId: event.laneId, ...payloadScope }
+    : null;
 
   return (
     <details className="group">
       <summary className="cursor-pointer select-none list-none">
         <div className="flex items-baseline gap-2 flex-wrap">
           <span className="font-mono text-xs font-semibold">{event.stage}</span>
+          {scope ? <LaneScopePill scope={scope} subtle /> : null}
           {isMedic ? (
             <span className="text-xs font-semibold text-warn inline-flex items-center gap-1">
               <span>◇</span> medic
@@ -1679,15 +1710,16 @@ interface AuthoredFileSummary {
 
 function ApprovalCard({ runId, approval }: { runId: string; approval: ApprovalRow }) {
   const summary = (approval.summary ?? null) as Record<string, unknown> | null;
+  const scope = { laneId: approval.laneId, ...laneScopeFromSummary(summary) };
 
   if (approval.kind === 'open_pr' && summary) {
-    return <OpenPrApprovalCard runId={runId} approval={approval} summary={summary} />;
+    return <OpenPrApprovalCard runId={runId} approval={approval} summary={summary} scope={scope} />;
   }
   if (approval.kind === 'merge_pr' && summary) {
-    return <MergePrApprovalCard runId={runId} approval={approval} summary={summary} />;
+    return <MergePrApprovalCard runId={runId} approval={approval} summary={summary} scope={scope} />;
   }
   if (approval.kind === 'stage_secrets' && summary) {
-    return <StageSecretsApprovalCard runId={runId} approval={approval} summary={summary} />;
+    return <StageSecretsApprovalCard runId={runId} approval={approval} summary={summary} scope={scope} />;
   }
 
   return (
@@ -1698,13 +1730,14 @@ function ApprovalCard({ runId, approval }: { runId: string; approval: ApprovalRo
           {approval.kind.replace('_', ' ')}
         </span>
         <span className="font-mono text-xs text-muted">{approval.id.slice(0, 8)}</span>
+        <LaneScopePill scope={scope} subtle />
       </div>
       {summary ? (
         <pre className="text-xs font-mono bg-card rounded-md p-3 overflow-auto max-h-60 border border-rule">
           {JSON.stringify(summary, null, 2)}
         </pre>
       ) : null}
-      <ApprovalActions runId={runId} approvalId={approval.id} kind={approval.kind} />
+      <ApprovalActions runId={runId} approvalId={approval.id} kind={approval.kind} scopeLabel={describeLaneScope(scope)} />
     </div>
   );
 }
@@ -1713,10 +1746,12 @@ function OpenPrApprovalCard({
   runId,
   approval,
   summary,
+  scope,
 }: {
   runId: string;
   approval: ApprovalRow;
   summary: Record<string, unknown>;
+  scope: LaneScope;
 }) {
   const mode = (summary['mode'] as string | undefined) ?? 'real';
   const repo = typeof summary['repo'] === 'string' ? summary['repo'] : null;
@@ -1757,6 +1792,7 @@ function OpenPrApprovalCard({
         <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-rule text-muted">
           {mode === 'scripted' ? 'scripted preview' : 'real PR'}
         </span>
+        <LaneScopePill scope={scope} subtle />
         <span className="font-mono text-xs text-muted ml-auto">{approval.id.slice(0, 8)}</span>
       </div>
 
@@ -1788,7 +1824,7 @@ function OpenPrApprovalCard({
         </div>
       </div>
 
-      <ApprovalActions runId={runId} approvalId={approval.id} kind={approval.kind} />
+      <ApprovalActions runId={runId} approvalId={approval.id} kind={approval.kind} scopeLabel={describeLaneScope(scope)} />
     </div>
   );
 }
@@ -1848,16 +1884,27 @@ function StageSecretsApprovalCard({
   runId,
   approval,
   summary,
+  scope,
 }: {
   runId: string;
   approval: ApprovalRow;
   summary: Record<string, unknown>;
+  scope: LaneScope;
 }) {
   const note = typeof summary['note'] === 'string' ? summary['note'] : null;
   const platform = (summary['platform'] as 'fly' | 'vercel' | 'cloudrun' | 'railway' | undefined) ?? 'fly';
   const planId = typeof summary['plan_id'] === 'string' ? (summary['plan_id'] as string) : '';
   const flyApp = typeof summary['fly_app'] === 'string' ? (summary['fly_app'] as string) : null;
   const targetCwd = typeof summary['target_cwd'] === 'string' ? (summary['target_cwd'] as string) : '';
+  const projectBinding = typeof summary['project_binding'] === 'string' ? summary['project_binding'] : null;
+  const connectionAccount = typeof summary['connection_account'] === 'string' ? summary['connection_account'] : null;
+  const connectionRaw = summary['connection_raw'] && typeof summary['connection_raw'] === 'object'
+    ? (summary['connection_raw'] as Record<string, unknown>)
+    : null;
+  const railwayService = typeof connectionRaw?.['service'] === 'string' ? connectionRaw['service'] : null;
+  const railwayEnvironment = typeof connectionRaw?.['environment'] === 'string' ? connectionRaw['environment'] : null;
+  const cloudRunService = typeof connectionRaw?.['service'] === 'string' ? connectionRaw['service'] : null;
+  const cloudRunRegion = typeof connectionRaw?.['region'] === 'string' ? connectionRaw['region'] : null;
   const sources = Array.isArray(summary['sources']) ? (summary['sources'] as string[]) : [];
 
   const rawMissing = summary['missing'];
@@ -1885,9 +1932,15 @@ function StageSecretsApprovalCard({
         <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-rule text-muted">
           {platform}
         </span>
+        <LaneScopePill scope={scope} subtle />
         <span className="font-mono text-xs text-muted ml-auto">{approval.id.slice(0, 8)}</span>
       </div>
       {note ? <p className="text-sm text-muted leading-relaxed">{note}</p> : null}
+      {(projectBinding || connectionAccount) ? (
+        <p className="text-xs text-muted">
+          {connectionAccount ? `Connected as ${connectionAccount}` : 'Connected'}{projectBinding ? ` · targeting ${projectBinding}` : ''}.
+        </p>
+      ) : null}
       {sources.length > 0 ? (
         <p className="text-xs text-muted">
           Required keys derived from: {sources.join(', ')}.
@@ -1903,9 +1956,15 @@ function StageSecretsApprovalCard({
           platform={platform}
           flyApp={flyApp}
           targetCwd={targetCwd}
+          laneLabel={describeLaneScope(scope)}
+          projectBinding={projectBinding}
+          railwayService={railwayService}
+          railwayEnvironment={railwayEnvironment}
+          cloudRunService={cloudRunService}
+          cloudRunRegion={cloudRunRegion}
         />
       ) : (
-        <ApprovalActions runId={runId} approvalId={approval.id} kind={approval.kind} />
+        <ApprovalActions runId={runId} approvalId={approval.id} kind={approval.kind} scopeLabel={describeLaneScope(scope)} />
       )}
     </div>
   );
@@ -1915,10 +1974,12 @@ function MergePrApprovalCard({
   runId,
   approval,
   summary,
+  scope,
 }: {
   runId: string;
   approval: ApprovalRow;
   summary: Record<string, unknown>;
+  scope: LaneScope;
 }) {
   const mode = (summary['mode'] as string | undefined) ?? 'real';
   const prUrl = typeof summary['pr_url'] === 'string' ? summary['pr_url'] : null;
@@ -1958,6 +2019,7 @@ function MergePrApprovalCard({
         <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-rule text-muted">
           {mode === 'scripted' ? 'scripted preview' : 'real PR'}
         </span>
+        <LaneScopePill scope={scope} subtle />
         <span className="font-mono text-xs text-muted ml-auto">{approval.id.slice(0, 8)}</span>
       </div>
 
@@ -1995,9 +2057,57 @@ function MergePrApprovalCard({
         </div>
       </div>
 
-      <ApprovalActions runId={runId} approvalId={approval.id} kind={approval.kind} />
+      <ApprovalActions runId={runId} approvalId={approval.id} kind={approval.kind} scopeLabel={describeLaneScope(scope)} />
     </div>
   );
+}
+
+function laneScopeFromSummary(summary: unknown): Omit<LaneScope, 'laneId'> {
+  if (!summary || typeof summary !== 'object') return {};
+  const record = summary as Record<string, unknown>;
+  return {
+    servicePath: typeof record['service_path'] === 'string' ? record['service_path'] : null,
+    displayName: typeof record['display_name'] === 'string' ? record['display_name'] : null,
+  };
+}
+
+function describeLaneScope(scope: LaneScope): string {
+  const primary = scope.displayName ?? scope.laneId ?? null;
+  const path = scope.servicePath ?? null;
+  if (primary && path && path !== '.' && primary !== path) return `${primary} · ${path}`;
+  if (primary) return primary;
+  if (path === '.') return 'repo root';
+  return path ?? 'repo scope';
+}
+
+function LaneScopePill({ scope, subtle = false }: { scope: LaneScope; subtle?: boolean }) {
+  if (!scope.laneId && !scope.servicePath && !scope.displayName) return null;
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.16em] ${
+        subtle
+          ? 'border-rule/40 bg-card/60 text-muted'
+          : 'border-accent/30 bg-accent/10 text-accent'
+      }`}
+    >
+      {describeLaneScope(scope)}
+    </span>
+  );
+}
+
+function collectStageLanes(events: EventRow[], approvals: ApprovalRow[]): LaneScope[] {
+  const out = new Map<string, LaneScope>();
+  for (const event of events) {
+    const scope = { laneId: event.laneId, ...laneScopeFromSummary(event.payload) };
+    if (!scope.laneId && !scope.servicePath && !scope.displayName) continue;
+    out.set(`${scope.laneId ?? ''}:${scope.servicePath ?? ''}:${scope.displayName ?? ''}`, scope);
+  }
+  for (const approval of approvals) {
+    const scope = { laneId: approval.laneId, ...laneScopeFromSummary(approval.summary) };
+    if (!scope.laneId && !scope.servicePath && !scope.displayName) continue;
+    out.set(`${scope.laneId ?? ''}:${scope.servicePath ?? ''}:${scope.displayName ?? ''}`, scope);
+  }
+  return [...out.values()];
 }
 
 function AuthoredFileRow({ file }: { file: AuthoredFileSummary }) {

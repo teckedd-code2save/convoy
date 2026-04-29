@@ -28,8 +28,8 @@ flowchart TB
   subgraph Targets[Deployment targets]
     Fly["fly (real)<br/>flyctl deploy · alias rollback"]
     Vercel["vercel (real)<br/>preview → prod · alias rollback"]
-    Railway["railway<br/>(stubbed, v2)"]
-    CloudRun["cloudrun<br/>(stubbed, v2)"]
+    Railway["railway<br/>real connection probe · secret staging"]
+    CloudRun["cloudrun<br/>real connection probe · secret staging"]
   end
 
   CLI --> Orch
@@ -151,7 +151,7 @@ Run state — events, approvals, artifacts, decisions — is persisted in a sing
 ## Interfaces
 
 - **CLI** — primary operator surface. `convoy plan`, `convoy apply`, `convoy plans`, `convoy status`.
-- **Web viewer** — plan detail with drafted-file previews, runs list, live run timeline with polling refresh, approval buttons via server actions, medic diagnosis cards.
+- **Web viewer** — plan detail with drafted-file previews, runs list, live run timeline with polling refresh, lane-aware approval cards, and medic diagnosis cards.
 - **Claude Code plugin** — `/convoy ship`, `/convoy-status`, `/convoy-rollback` slash commands; subagents are documented as coordinated lane agents with shared memory, not isolated workers.
 - **MCP servers** — platform adapters (github, fly, railway, vercel, cloudrun) — declared in the plugin manifest; implementation tracked in Day 4+ work.
 - **Audit log** — `run_events` table. Every state change, every Opus reasoning artifact, every approval decision is recorded with a timestamp and is replayable for incident review.
