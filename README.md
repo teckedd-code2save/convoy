@@ -75,8 +75,9 @@ npm run convoy -- plan ../my-web-app --save --open
 # Boot the web viewer in another terminal (port 3737)
 (cd web && npm install && npm run dev)
 
-# Apply — the pipeline runs scan → pick → author → rehearse
-# → canary → promote → observe. The run URL prints as soon as it starts.
+# Apply — the pipeline runs coordinated lanes through
+# scan → pick → rehearse → author → canary → promote → observe.
+# The run URL prints as soon as it starts.
 npm run convoy -- apply <plan-id> --open
 ```
 
@@ -113,7 +114,8 @@ convoy-ship-here --demo
 - **It ships your code — it does not rewrite your code.** Convoy only authors deployment-surface files (Dockerfile, platform manifests, CI workflow, `.env.schema`). Everything in `src/`, `app/`, `lib/`, `tests/`, and your application dependencies is off-limits. Not soft-limits — hard-limits enforced by the provenance manifest and by the medic's system prompt.
 - **The medic is a real Claude agent loop**, not flavor text on CI output. See above.
 - **Plans are real artifacts.** Like `terraform plan`, you get an inspectable artifact — saved to `.convoy/plans/<id>.json`, rendered in the CLI and the web viewer — that describes exactly what `convoy apply` would do. Every run gets a shareable URL the CLI prints; you and the agent watch the same page.
-- **Every decision is grounded in the repo.** The scanner reads real files and emits structured evidence (12 ecosystems, monorepo-aware). The picker scores all four platforms live against that evidence. Scan and pick aren't theater — they run `scanRepository()` and `pickPlatform()` on the actual target, on every apply.
+- **Every decision is grounded in the repo.** The scanner reads real files and emits structured evidence (12 ecosystems, monorepo-aware, multi-lane). The picker scores all four platforms live against that evidence per lane. Scan and pick aren't theater — they run on the actual target, on every apply.
+- **Multi-project repos stay intact.** Convoy no longer collapses a monorepo to the first detected child. It builds coordinated `infra`, `backend`, `worker`, and `frontend` lanes, shares memory across them, and lets each lane choose the platform that fits its own evidence.
 - **Rehearse on a twin, not on your users.** The rehearse stage spawns the target as a subprocess with a **scrubbed environment by default** (PATH, HOME, NODE_ENV + your explicit `--env`/env-file — no ambient cloud credentials). Drives real load against configurable probe paths, scrapes metrics, feeds logs to the medic on breach, tears it down. Use `--trust-repo` to inherit your shell env on your own checkouts.
 - **Safety defaults match the story.** Approvals pause the pipeline by default. Ambient env isn't inherited by subprocess rehearsal. No hidden auto-merges.
 - **Rollback is pre-staged, not improvised.** Every stage has a named reverse. Fly.io rollback (`flyctl deploy --image <prior>`) is proven end-to-end — see [`docs/rollback-proof.md`](./docs/rollback-proof.md). Vercel / Railway / Cloud Run rollback paths are declared in the adapter interface.
@@ -124,16 +126,17 @@ convoy-ship-here --demo
 
 ```
 scan → pick → rehearse → author → canary → promote → observe
-              │                     │         │         │
-              └─ medic ─────────────┴─ rollback ────────┘
+  │      │
+  │      └─ per-lane platform fit + connection checks
+  └─ coordinated lanes: infra → backend/worker → frontend
 ```
 
 **Rehearse runs before author by design.** No PR opens and no repo state mutates until Convoy has proof the service boots and responds healthy. The operator approves opening the PR with rehearsal evidence on-screen, then approves merging it after reviewing the diff on GitHub. Previously author ran first; a downstream rehearsal failure could leave the repo merged-but-undeployed. We fixed that.
 
 | Stage | Responsibility |
 |---|---|
-| **scan** | Live `scanRepository()` on the target. Ecosystem, framework, data layer, topology, existing platform hints, package manager, build/start commands, health path. 12 ecosystems; monorepo-aware. |
-| **pick** | Live `pickPlatform()` scores all four supported platforms (Fly.io, Railway, Vercel, Cloud Run) against the scan evidence. Respects `--platform=X` and existing platform config (e.g. a committed `fly.toml`). |
+| **scan** | Live repo scan on the target. Builds a coordinated service graph with `infra`, `backend`, `worker`, and `frontend` lanes, each with its own ecosystem, topology, data layer, health path, secrets hints, and dependencies. |
+| **pick** | Scores all four supported platforms (Fly.io, Railway, Vercel, Cloud Run) per lane. Respects `--platform=X`, existing platform config, and lane-specific evidence instead of flattening the repo to one winner. |
 | **rehearse** | Spawns the target subprocess in an env-scrubbed shell. Real install, real build, real boot. The readiness probe accepts any HTTP response — a 404 on `/health` means the process is up; the synthetic load probe that follows is what actually measures health. Real log capture; feeds the medic on breach. |
 | **author** | Pauses for `open_pr` approval with rehearsal evidence on-screen. Then drafts only the files Convoy owns — Dockerfile (non-Vercel), platform manifest, `.env.schema`, CI workflow, provenance record. Opus-authored content when a key is set; ecosystem templates otherwise. Containment-checked: any path outside the repo root is rejected at the filesystem boundary. |
 | **canary** | Fly's health-gated canary strategy (one machine → rest) via `flyctl`. Halt on error-rate / p99 threshold breach. |
@@ -151,6 +154,7 @@ The CLI and the web viewer share one SQLite state file. That means:
 - **Every `apply` prints the run URL as soon as the run is created.** The agent and you are looking at the same page; approvals you click in the UI unpause the orchestrator within ~400ms.
 - **Every medic tool call streams as a run event.** The web UI renders them inline so you can replay the agent's investigation. The run page has a dedicated **Medic spotlight** — a magenta-glow card that animates while medic is investigating, so a single screenshot makes it obvious the Claude-driven medic is in the loop.
 - **The CLI is unmistakable in a Claude Code transcript.** Every Convoy run opens with a unicode-bordered banner and prefixes every line with a dim cyan rule, so when Convoy output mixes with other tools you can scan back and tell at a glance which block was Convoy.
+- **Approvals and diagnostics are lane-aware.** One run can carry multiple coordinated lanes, lane-specific approvals, and lane-specific medic handoff packets without splitting into unrelated runs.
 - **`--open`** on `plan --save` or `apply` auto-launches your default browser at the relevant URL. `convoy status` auto-spawns the web viewer if it's down so the timeline link the operator clicks is actually live.
 
 Override the base URL with `CONVOY_WEB_URL` if you're tunneling or remoting. The viewer runs on port 3737 by default.
@@ -169,8 +173,8 @@ convoy/
 │   │   ├── rehearsal-runner.ts  Env-scrubbed subprocess + probe + metrics
 │   │   └── github-runner.ts     gh / git wrappers for real PRs
 │   ├── planner/
-│   │   ├── scanner.ts      scanRepository() — the evidence source
-│   │   ├── picker.ts       pickPlatform() — the real scoring function
+│   │   ├── scanner.ts      scanServiceGraph() — coordinated lane detection
+│   │   ├── picker.ts       per-lane platform scoring
 │   │   └── enricher.ts     Opus 4.7 narrative + file content
 │   └── adapters/           fly/, vercel/, railway/, cloudrun/ — platform shells
 ├── plugin/                 Claude Code plugin (commands + subagents)
@@ -251,11 +255,11 @@ Environment:
 
 See [`docs/architecture.md`](./docs/architecture.md) for the full picture. In brief:
 
-- **Deterministic core** — SQLite state store (`runs`, `run_events`, `approvals`), typed event bus, orchestrator sequencing seven stage classes.
+- **Deterministic core** — SQLite state store (`runs`, `run_events`, `approvals`), typed event bus, orchestrator sequencing seven stage classes across coordinated lanes.
 - **AI surface** — Opus 4.7 enriches plans (summary, platform reason, ship narrative, authored file content) and runs the medic agent loop. Every AI pass is optional; the deterministic core runs without a key.
 - **Two UIs on one state** — the CLI writes runs/events to SQLite; the web viewer reads the same DB and writes approvals through a server action. The pipeline polls at 400ms so decisions land ~instantly.
 - **Approvals are scoped to `run_id`** — the server action requires the claimed run id matches the approval's `run_id` at the SQL level. Knowing an approval UUID alone is not enough.
-- **Platform adapter interface** — every platform implements `deploy`, `createEphemeral`, `destroyEphemeral`, `rollback`, `readLogs`, `healthCheck`. New platforms = new adapter; the orchestrator is platform-neutral.
+- **Platform adapter interface** — every platform implements `deploy`, `createEphemeral`, `destroyEphemeral`, `rollback`, `readLogs`, `healthCheck`, plus read-only connection probing for auth, project binding, and staged env visibility. New platforms = new adapter; the orchestrator is platform-neutral.
 
 ---
 

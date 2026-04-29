@@ -11,11 +11,11 @@ flowchart TB
   end
 
   subgraph Core[Convoy core]
-    Scanner["scanner<br/>ecosystem · deps · topology"]
-    Picker["picker<br/>existing config · override · scored"]
+    Scanner["scanner<br/>service graph · lanes · deps"]
+    Picker["picker<br/>per-lane fit · override · scored"]
     Author["author<br/>drafts only Convoy-owned files"]
     Enricher["enricher (Opus 4.7)<br/>summary · reason · narrative · Dockerfile"]
-    Orch["orchestrator<br/>stage runner · approvals · abort"]
+    Orch["orchestrator<br/>lane runner · shared memory · approvals"]
     Medic["medic (Opus 4.7)<br/>log diagnosis · classification"]
     Bus["event bus<br/>run · event · approval"]
   end
@@ -64,8 +64,8 @@ A Convoy run is a sequence of stages. Each stage produces evidence; the next sta
 ```mermaid
 flowchart LR
   scan --> pick
-  pick --> author
-  author --> rehearse
+  pick --> rehearse
+  rehearse --> author
   rehearse --> canary
   canary --> promote
   promote --> observe
@@ -78,8 +78,8 @@ flowchart LR
 
 | Stage | Responsibility | Gate |
 |---|---|---|
-| **scan** | Detect framework, runtime, topology, dependencies, deployment signals. | Signals complete |
-| **pick** | Score available platforms against signals; respect user override or existing platform config. | One platform chosen with stated reasoning |
+| **scan** | Detect framework, runtime, topology, dependencies, deployment signals, then group them into coordinated `infra`, `backend`, `worker`, and `frontend` lanes with fixed DAG dependencies. | Signals complete |
+| **pick** | Score available platforms per lane; respect user override or existing platform config. | Every lane has a platform choice with stated reasoning |
 | **author** | Draft missing deployment config (Dockerfile, platform manifest, CI) into a pull request. Never touches developer code. | Pull request opened and human-approved |
 | **rehearse** | Deploy to an ephemeral twin on the chosen platform. Run health checks, smoke tests, migration dry-run, synthetic load. | All checks green |
 | **canary** | Promote to a fraction of production traffic. Correlator watches golden signals versus baseline for the bake window. | Signals within policy |
@@ -90,17 +90,24 @@ The **medic** activates on any stage failure. It is a **Claude agent loop** (Opu
 
 The **rollback** path is pre-staged at every stage. Forward progress is never permitted without a named, measured reverse.
 
-## Subagents
+## Coordinated lane agents
 
 | Agent | Role |
 |---|---|
-| **scanner** | Parses repo into signals. Platform-neutral. |
-| **picker** | Scores platforms. Respects explicit user choice and existing platform config. |
+| **scanner** | Parses the repo into a service graph and lane dependencies. Platform-neutral. |
+| **picker** | Scores platforms per lane. Respects explicit user choice and existing platform config. |
 | **author** | Drafts deployment surface files in a pull request. Only owns files it creates. |
 | **deployer** | Delegates to the chosen platform adapter. |
 | **medic** | Claude agent loop. Four scoped tools; up to six turns. Emits structured diagnosis; pauses for developer fix on `owned=developer`. Implementation: `src/core/medic.ts`. |
 | **correlator** | Reads metrics during canary and observe stages. Decides go/no-go between promotion steps. |
 | **policy** | Evaluates rules — freeze windows, tier, required approvers, blast-radius budget. |
+
+Lane runtime model:
+
+- One run can contain multiple coordinated lanes.
+- Lanes share one event ledger and one shared-memory context.
+- Fixed v1 ordering: `infra -> backend/worker -> frontend`.
+- Lane-specific failures can pause the run without forcing unrelated lanes into separate runs.
 
 ## Adapter model
 
@@ -126,6 +133,7 @@ Each adapter implements:
 - `rollback(targetRelease)` — revert to a previous release.
 - `readLogs(deploymentId, since) → stream` — structured log stream for medic.
 - `healthCheck(deploymentId) → result` — synchronous readiness probe.
+- `probeConnection()` — read-only auth, project binding, env inventory, and rollback readiness.
 
 ## Provenance
 
@@ -138,13 +146,13 @@ If a developer edits a Convoy-authored file, its provenance flips permanently. C
 
 ## State
 
-Run state — events, approvals, artifacts, decisions — is persisted in a single SQLite database at `.convoy/state.db` for local runs, or a shared database for team deployments. The schema models `Run`, `RunEvent`, `Approval`, `Artifact`, `Decision`.
+Run state — events, approvals, artifacts, decisions — is persisted in a single SQLite database at `.convoy/state.db` for local runs, or a shared database for team deployments. `RunEvent` and `Approval` can now carry `laneId` so one run can expose multiple coordinated lanes without splitting state.
 
 ## Interfaces
 
 - **CLI** — primary operator surface. `convoy plan`, `convoy apply`, `convoy plans`, `convoy status`.
 - **Web viewer** — plan detail with drafted-file previews, runs list, live run timeline with polling refresh, approval buttons via server actions, medic diagnosis cards.
-- **Claude Code plugin** — `/convoy ship`, `/convoy-status`, `/convoy-rollback` slash commands; six subagents (scanner, picker, author, deployer, medic, correlator) defined as markdown files with tool scopes.
+- **Claude Code plugin** — `/convoy ship`, `/convoy-status`, `/convoy-rollback` slash commands; subagents are documented as coordinated lane agents with shared memory, not isolated workers.
 - **MCP servers** — platform adapters (github, fly, railway, vercel, cloudrun) — declared in the plugin manifest; implementation tracked in Day 4+ work.
 - **Audit log** — `run_events` table. Every state change, every Opus reasoning artifact, every approval decision is recorded with a timestamp and is replayable for incident review.
 
@@ -203,7 +211,8 @@ flowchart LR
   classDef alert fill:#b91c1c22,stroke:#b91c1c
 
   Scanner[scanner]:::agent --> Picker[picker]:::agent
-  Picker --> Author[author]:::agent
+  Picker --> Rehearse[rehearse lanes]:::agent
+  Rehearse --> Author[author]:::agent
   Author --> MergeGate{{merge_pr<br/>approval}}:::gate
   MergeGate --> Deployer[deployer]:::agent
   Deployer --> PromoteGate{{promote<br/>approval}}:::gate
@@ -214,4 +223,4 @@ flowchart LR
   Medic -. config-level .-> Deployer
 ```
 
-Agents hand work to each other through the orchestrator and the SQLite event bus. Medic and rollback are only invoked when real signals fire — no scripted branching.
+Agents hand work to each other through the orchestrator and the SQLite event bus. Lane agents share one run-memory context, so platform auth, secrets staging, medic diagnosis, and prior lane outcomes are visible across the run. Medic and rollback are only invoked when real signals fire — no scripted branching.

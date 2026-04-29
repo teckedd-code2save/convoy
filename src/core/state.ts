@@ -32,6 +32,7 @@ const SCHEMA = `
     run_id      TEXT NOT NULL REFERENCES runs(id),
     stage       TEXT NOT NULL,
     kind        TEXT NOT NULL,
+    lane_id     TEXT,
     payload     TEXT NOT NULL,
     created_at  TEXT NOT NULL
   );
@@ -42,6 +43,7 @@ const SCHEMA = `
     id          TEXT PRIMARY KEY,
     run_id      TEXT NOT NULL REFERENCES runs(id),
     kind        TEXT NOT NULL,
+    lane_id     TEXT,
     summary     TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'pending',
     decided_at  TEXT
@@ -68,6 +70,7 @@ interface RunEventRow {
   run_id: string;
   stage: string;
   kind: string;
+  lane_id: string | null;
   payload: string;
   created_at: string;
 }
@@ -76,6 +79,7 @@ interface ApprovalRow {
   id: string;
   run_id: string;
   kind: string;
+  lane_id: string | null;
   summary: string;
   status: string;
   decided_at: string | null;
@@ -85,7 +89,8 @@ function toRun(row: RunRow): Run {
   return {
     id: row.id,
     repoUrl: row.repo_url,
-    platform: row.platform as Platform | null,
+    platform: row.platform as Platform | 'multi' | null,
+    platformSummary: row.platform as Platform | 'multi' | null,
     status: row.status as RunStatus,
     startedAt: new Date(row.started_at),
     completedAt: row.completed_at ? new Date(row.completed_at) : null,
@@ -102,6 +107,7 @@ function toRunEvent(row: RunEventRow): RunEvent {
     runId: row.run_id,
     stage: row.stage as StageName,
     kind: row.kind as EventKind,
+    laneId: row.lane_id,
     payload: JSON.parse(row.payload) as unknown,
     createdAt: new Date(row.created_at),
   };
@@ -112,6 +118,7 @@ function toApproval(row: ApprovalRow): Approval {
     id: row.id,
     runId: row.run_id,
     kind: row.kind as ApprovalKind,
+    laneId: row.lane_id,
     summary: JSON.parse(row.summary) as unknown,
     status: row.status as ApprovalStatus,
     decidedAt: row.decided_at ? new Date(row.decided_at) : null,
@@ -120,7 +127,7 @@ function toApproval(row: ApprovalRow): Approval {
 
 export interface RunUpdates {
   status?: RunStatus;
-  platform?: Platform | null;
+  platform?: Platform | 'multi' | null;
   liveUrl?: string | null;
   completedAt?: Date | null;
   outcomeReason?: string | null;
@@ -152,6 +159,20 @@ export class RunStateStore {
     }
     if (!cols.includes('outcome_restored_version')) {
       this.#db.exec('ALTER TABLE runs ADD COLUMN outcome_restored_version INTEGER');
+    }
+    const eventCols = this.#db
+      .prepare<[], { name: string }>('PRAGMA table_info(run_events)')
+      .all()
+      .map((c) => c.name);
+    if (!eventCols.includes('lane_id')) {
+      this.#db.exec('ALTER TABLE run_events ADD COLUMN lane_id TEXT');
+    }
+    const approvalCols = this.#db
+      .prepare<[], { name: string }>('PRAGMA table_info(approvals)')
+      .all()
+      .map((c) => c.name);
+    if (!approvalCols.includes('lane_id')) {
+      this.#db.exec('ALTER TABLE approvals ADD COLUMN lane_id TEXT');
     }
   }
 
@@ -246,20 +267,22 @@ export class RunStateStore {
     stage: StageName,
     kind: EventKind,
     payload: unknown,
+    laneId?: string | null,
   ): RunEvent {
     const id = randomUUID();
     const now = new Date().toISOString();
     this.#db
       .prepare(
-        'INSERT INTO run_events (id, run_id, stage, kind, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO run_events (id, run_id, stage, kind, lane_id, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
       )
-      .run(id, runId, stage, kind, JSON.stringify(payload), now);
+      .run(id, runId, stage, kind, laneId ?? null, JSON.stringify(payload), now);
 
     return {
       id,
       runId,
       stage,
       kind,
+      ...(laneId !== undefined ? { laneId } : {}),
       payload,
       createdAt: new Date(now),
     };
@@ -274,13 +297,13 @@ export class RunStateStore {
     return rows.map(toRunEvent);
   }
 
-  requestApproval(runId: string, kind: ApprovalKind, summary: unknown): Approval {
+  requestApproval(runId: string, kind: ApprovalKind, summary: unknown, laneId?: string | null): Approval {
     const id = randomUUID();
     this.#db
       .prepare(
-        'INSERT INTO approvals (id, run_id, kind, summary, status) VALUES (?, ?, ?, ?, ?)',
+        'INSERT INTO approvals (id, run_id, kind, lane_id, summary, status) VALUES (?, ?, ?, ?, ?, ?)',
       )
-      .run(id, runId, kind, JSON.stringify(summary), 'pending' satisfies ApprovalStatus);
+      .run(id, runId, kind, laneId ?? null, JSON.stringify(summary), 'pending' satisfies ApprovalStatus);
 
     const approval = this.getApproval(id);
     if (!approval) throw new Error(`Approval ${id} missing after insert`);

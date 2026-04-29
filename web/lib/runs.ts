@@ -11,6 +11,7 @@ export interface RunRow {
   id: string;
   repoUrl: string;
   platform: string | null;
+  platformSummary?: string | null;
   status: string;
   startedAt: string;
   completedAt: string | null;
@@ -25,6 +26,7 @@ export interface EventRow {
   runId: string;
   stage: string;
   kind: string;
+  laneId?: string | null;
   payload: unknown;
   createdAt: string;
 }
@@ -33,6 +35,7 @@ export interface ApprovalRow {
   id: string;
   runId: string;
   kind: string;
+  laneId?: string | null;
   summary: unknown;
   status: string;
   decidedAt: string | null;
@@ -67,6 +70,7 @@ function toRunRow(r: RawRunRow): RunRow {
     id: r.id,
     repoUrl: r.repo_url,
     platform: r.platform,
+    platformSummary: r.platform,
     status: r.status,
     startedAt: r.started_at,
     completedAt: r.completed_at,
@@ -132,6 +136,7 @@ export function listEvents(runId: string): EventRow[] {
         run_id: string;
         stage: string;
         kind: string;
+        lane_id: string | null;
         payload: string;
         created_at: string;
       }>('SELECT * FROM run_events WHERE run_id = ? ORDER BY created_at ASC')
@@ -141,6 +146,7 @@ export function listEvents(runId: string): EventRow[] {
       runId: r.run_id,
       stage: r.stage,
       kind: r.kind,
+      laneId: r.lane_id,
       payload: safeParse(r.payload),
       createdAt: r.created_at,
     }));
@@ -158,6 +164,7 @@ export function listApprovals(runId: string): ApprovalRow[] {
         id: string;
         run_id: string;
         kind: string;
+        lane_id: string | null;
         summary: string;
         status: string;
         decided_at: string | null;
@@ -167,6 +174,7 @@ export function listApprovals(runId: string): ApprovalRow[] {
       id: r.id,
       runId: r.run_id,
       kind: r.kind,
+      laneId: r.lane_id,
       summary: safeParse(r.summary),
       status: r.status,
       decidedAt: r.decided_at,
@@ -198,6 +206,7 @@ export function decideApproval(
         id: string;
         run_id: string;
         kind: string;
+        lane_id: string | null;
         summary: string;
         status: string;
         decided_at: string | null;
@@ -208,6 +217,7 @@ export function decideApproval(
       id: row.id,
       runId: row.run_id,
       kind: row.kind,
+      laneId: row.lane_id,
       summary: safeParse(row.summary),
       status: row.status,
       decidedAt: row.decided_at,

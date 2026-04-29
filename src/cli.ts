@@ -11,7 +11,7 @@ import { stdin, stdout } from 'node:process';
 
 import { ConvoyBus, type ConvoyBusEvent } from './core/bus.js';
 import { Orchestrator } from './core/orchestrator.js';
-import { PlanStore, renderPlan, type ConvoyPlan } from './core/plan.js';
+import { PlanStore, aggregateAuthoredFiles, normalizePlan, primaryLane, renderPlan, type ConvoyPlan } from './core/plan.js';
 import {
   defaultStages,
   type OrchestratorOpts,
@@ -22,6 +22,7 @@ import {
 } from './core/stages.js';
 import { RunStateStore } from './core/state.js';
 import type { Platform, Run, RunEvent, StageName } from './core/types.js';
+import { probePlatformConnection } from './adapters/connections.js';
 import { buildPlan } from './planner/index.js';
 import { scanRepository } from './planner/scanner.js';
 import { resolveTarget } from './planner/target-resolver.js';
@@ -991,6 +992,7 @@ function appendEnvStagingChecks(
 }
 
 async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<PreflightReport> {
+  plan = normalizePlan(plan);
   const report: PreflightReport = {
     realAuthor: opts.realAuthor,
     realRehearsal: opts.realRehearsal,
@@ -1052,7 +1054,7 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
 
   // --- real author ---
   if (opts.realAuthor) {
-    if (plan.author.convoyAuthoredFiles.length === 0) {
+    if (aggregateAuthoredFiles(plan).length === 0) {
       report.realAuthor = false;
       report.checks.push({
         name: 'real author',
@@ -1150,7 +1152,7 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
 
   // --- real rehearsal ---
   if (opts.realRehearsal) {
-    if (!plan.rehearsal.startCommand) {
+      if (!primaryLane(plan).rehearsal.startCommand) {
       report.realRehearsal = false;
       // Surface detected sub-services as remediation — the common case is a
       // monorepo where the start command lives inside apps/* or packages/*.
@@ -1166,7 +1168,8 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
         remedy: workspaceHint,
       });
     } else {
-      const cwdHint = plan.target.workspace ? ` in \`${plan.target.workspace}/\`` : '';
+      const lane = primaryLane(plan);
+      const cwdHint = lane.servicePath !== '.' ? ` in \`${lane.servicePath}/\`` : '';
       const trusted = opts.trustRepo === true;
       const envHint = trusted
         ? '; parent env inherited (--trust-repo)'
@@ -1174,7 +1177,7 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
       report.checks.push({
         name: 'real rehearsal',
         ok: true,
-        detail: `will spawn \`${plan.rehearsal.startCommand}\`${cwdHint} on port ${plan.rehearsal.expectedPort ?? 8080}${envHint}`,
+        detail: `will spawn \`${lane.rehearsal.startCommand}\`${cwdHint} on port ${lane.rehearsal.expectedPort ?? 8080}${envHint}`,
       });
     }
   } else {
@@ -1217,25 +1220,31 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
     // "real deploy is on" signal and attempt vercel.
     report.realFly = false;
     if (opts.realFly) {
-      const { vercelAvailable, vercelAuthStatus } = await import('./adapters/vercel/runner.js');
-      const available = await vercelAvailable();
-      if (!available) {
+      const cwd = primaryLane(plan).servicePath === '.'
+        ? plan.target.localPath
+        : `${plan.target.localPath}/${primaryLane(plan).servicePath}`;
+      const connection = await probePlatformConnection('vercel', cwd);
+      if (!connection.cliAvailable) {
         report.hardFailures.push(
           `real vercel: vercel CLI not installed. Install: \`npm i -g vercel\`. Or pass --no-real-fly.`,
         );
         report.checks.push({ name: 'real vercel', ok: false, detail: 'vercel CLI not in PATH', remedy: 'npm i -g vercel' });
       } else {
-        const auth = await vercelAuthStatus();
-        if (!auth.ok) {
+        if (!connection.authenticated) {
           report.hardFailures.push(
             `real vercel: vercel CLI is not authenticated. Run \`vercel login\`. Or pass --no-real-fly.`,
           );
           report.checks.push({ name: 'real vercel', ok: false, detail: 'vercel CLI not authenticated', remedy: 'vercel login' });
+        } else if (!connection.projectLinked) {
+          report.hardFailures.push(
+            `real vercel: workspace is not linked to a Vercel project. Run \`vercel link\`. Or pass --no-real-fly.`,
+          );
+          report.checks.push({ name: 'real vercel', ok: false, detail: 'workspace not linked to Vercel', remedy: 'vercel link' });
         } else {
           report.checks.push({
             name: 'real vercel',
             ok: true,
-            detail: `vercel authed as ${auth.user ?? 'unknown'} — will deploy to Vercel`,
+            detail: `vercel authed as ${connection.account ?? 'unknown'} — linked to ${connection.projectBinding ?? 'project'} and ready to deploy`,
           });
         }
       }
@@ -1294,13 +1303,14 @@ function autoFlyAppName(plan: ConvoyPlan): string {
 async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
   checkConvoyEnv();
   const plans = new PlanStore(PLANS_DIR);
-  const plan = resolvePlan(plans, planId);
+  let plan = resolvePlan(plans, planId);
 
   if (!plan) {
     console.error(pc.red(`Plan not found: ${planId}`));
     console.error(pc.dim(`Looked in ${PLANS_DIR}. Run \`convoy plans\` to list saved plans.`));
     process.exit(2);
   }
+  plan = normalizePlan(plan);
 
   if (plan.deployability.verdict === 'not-cloud-deployable') {
     console.error(
@@ -1349,7 +1359,10 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
   if (plan.target.readmeTitle) {
     process.stdout.write(`${pc.dim(`  "${plan.target.readmeTitle}"`)}\n`);
   }
-  process.stdout.write(`${pc.dim(`  ${plan.author.convoyAuthoredFiles.length} file(s) to author · rehearse before production`)}\n`);
+  process.stdout.write(`${pc.dim(`  ${aggregateAuthoredFiles(plan).length} file(s) to author · rehearse before production`)}\n`);
+  if (plan.lanes.length > 1) {
+    process.stdout.write(`${pc.dim(`  lanes: ${plan.lanes.map((lane) => `${lane.role}:${lane.servicePath}->${lane.platformDecision.chosen}`).join(' · ')}`)}\n`);
+  }
   if (recurring) {
     process.stdout.write(
       `  ${pc.dim('Recurring mode — the app is already live. Convoy will respect existing config and only stage what you declare below.')}\n`,
@@ -1390,7 +1403,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
       stage: opts.injectFailure,
       kind: 'error-rate',
       repoPath: plan.target.localPath,
-      convoyAuthoredFiles: plan.author.convoyAuthoredFiles.map((f) => f.path),
+      convoyAuthoredFiles: aggregateAuthoredFiles(plan).map((f) => f.path),
       ...(opts.logs !== undefined && { logsPath: opts.logs }),
     };
   }
@@ -1408,7 +1421,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
       : 'squash';
     const realAuthor: RealAuthorOpt = {
       repoPath: plan.target.localPath,
-      authoredFiles: plan.author.convoyAuthoredFiles.map((f) => ({
+      authoredFiles: aggregateAuthoredFiles(plan).map((f) => ({
         path: f.path,
         contentPreview: f.contentPreview,
         summary: f.summary,
@@ -1456,7 +1469,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
       cwd: plan.target.localPath,
       strategy,
       createIfMissing: opts.flyCreateApp !== false,
-      convoyAuthoredFiles: plan.author.convoyAuthoredFiles.map((f) => f.path),
+      convoyAuthoredFiles: aggregateAuthoredFiles(plan).map((f) => f.path),
       thresholdErrorRatePct: 1.0,
       thresholdP99Ms: 1000,
       bakeWindowSeconds: opts.flyBakeWindow ?? 60,
@@ -1478,7 +1491,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
         : plan.target.localPath;
       const realVercel: RealVercelOpt = {
         cwd,
-        convoyAuthoredFiles: plan.author.convoyAuthoredFiles.map((f) => f.path),
+        convoyAuthoredFiles: aggregateAuthoredFiles(plan).map((f) => f.path),
         thresholdErrorRatePct: 1.0,
         thresholdP99Ms: 3000,
         bakeWindowSeconds: opts.flyBakeWindow ?? 60,
@@ -1524,8 +1537,12 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
 }
 
 function buildPrBody(plan: ConvoyPlan): string {
-  const files = plan.author.convoyAuthoredFiles
+  plan = normalizePlan(plan);
+  const files = aggregateAuthoredFiles(plan)
     .map((f) => `- \`${f.path}\` — ${f.summary}`)
+    .join('\n');
+  const laneSummary = plan.lanes
+    .map((lane) => `- \`${lane.servicePath}\` [${lane.role}] → ${lane.platformDecision.chosen}`)
     .join('\n');
   return `Generated by [Convoy](https://github.com/teckedd-code2save/convoy) from plan \`${plan.id.slice(0, 8)}\`.
 
@@ -1534,6 +1551,10 @@ function buildPrBody(plan: ConvoyPlan): string {
 This PR adds deployment-surface files only. **Application source code was not modified.**
 
 ${files}
+
+## Lanes
+
+${laneSummary}
 
 ## Pipeline that follows the merge
 
@@ -1554,7 +1575,9 @@ _Platform chosen: ${plan.platform.chosen} (${plan.platform.source})_
 }
 
 function buildRealRehearsalOpts(plan: ConvoyPlan, opts: ApplyOpts): RealRehearsalOpt | null {
-  const rehearsal = plan.rehearsal;
+  plan = normalizePlan(plan);
+  const lane = primaryLane(plan);
+  const rehearsal = lane.rehearsal;
   const startCommand = rehearsal.startCommand;
   if (!startCommand) return null;
 
@@ -1574,9 +1597,9 @@ function buildRealRehearsalOpts(plan: ConvoyPlan, opts: ApplyOpts): RealRehearsa
   const userProbePaths = opts.probePath && opts.probePath.length > 0 ? opts.probePath : null;
   const probePaths = userProbePaths ?? [healthPath];
 
-  const serviceCwd = plan.target.workspace
-    ? `${plan.target.localPath}/${plan.target.workspace}`
-    : plan.target.localPath;
+  const serviceCwd = lane.servicePath === '.'
+    ? plan.target.localPath
+    : `${plan.target.localPath}/${lane.servicePath}`;
 
   // Default to env-scrubbed rehearsal. --trust-repo opts into ambient env
   // inheritance (e.g. operator's own checkout where their shell env is
@@ -1591,7 +1614,7 @@ function buildRealRehearsalOpts(plan: ConvoyPlan, opts: ApplyOpts): RealRehearsa
     port,
     healthPath,
     metricsPath,
-    convoyAuthoredFiles: plan.author.convoyAuthoredFiles.map((f) => f.path),
+    convoyAuthoredFiles: aggregateAuthoredFiles(plan).map((f) => f.path),
     probeRequests: opts.probeRequests ?? 60,
     probeConcurrency: opts.probeConcurrency ?? 4,
     probePaths,
@@ -1606,7 +1629,11 @@ function buildRealRehearsalOpts(plan: ConvoyPlan, opts: ApplyOpts): RealRehearsa
 }
 
 function detectInstallCommand(plan: ConvoyPlan): string | null {
-  const path = plan.target.localPath;
+  plan = normalizePlan(plan);
+  const lane = primaryLane(plan);
+  const path = lane.servicePath === '.'
+    ? plan.target.localPath
+    : `${plan.target.localPath}/${lane.servicePath}`;
   if (existsSync(`${path}/pnpm-lock.yaml`)) return 'pnpm install --frozen-lockfile';
   if (existsSync(`${path}/yarn.lock`)) return 'yarn install --frozen-lockfile';
   if (existsSync(`${path}/bun.lockb`) || existsSync(`${path}/bun.lock`)) return 'bun install --frozen-lockfile';

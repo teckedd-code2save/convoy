@@ -81,6 +81,7 @@ function PlansCard({ plans, total }: { plans: PlanSummary[]; total: number }) {
                     <span className="font-medium truncate text-sm">{plan.target.name}</span>
                     <Tag>{plan.target.ecosystem}</Tag>
                     {plan.target.framework ? <Tag>{plan.target.framework}</Tag> : null}
+                    {plan.lanes && plan.lanes.length > 1 ? <Tag>{plan.lanes.length} lanes</Tag> : null}
                   </div>
                 </div>
                 <PlatformBadge plan={plan} />

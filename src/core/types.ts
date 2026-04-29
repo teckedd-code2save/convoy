@@ -1,4 +1,6 @@
 export type Platform = 'fly' | 'railway' | 'vercel' | 'cloudrun';
+export type PlatformSummary = Platform | 'multi';
+export type LaneRole = 'infra' | 'backend' | 'worker' | 'frontend';
 
 export type StageName =
   | 'scan'
@@ -51,7 +53,8 @@ export type FileProvenanceKind = 'convoy-authored' | 'developer-authored';
 export interface Run {
   id: string;
   repoUrl: string;
-  platform: Platform | null;
+  platform: PlatformSummary | null;
+  platformSummary: PlatformSummary | null;
   status: RunStatus;
   startedAt: Date;
   completedAt: Date | null;
@@ -66,6 +69,7 @@ export interface RunEvent {
   runId: string;
   stage: StageName;
   kind: EventKind;
+  laneId?: string | null;
   payload: unknown;
   createdAt: Date;
 }
@@ -74,9 +78,23 @@ export interface Approval {
   id: string;
   runId: string;
   kind: ApprovalKind;
+  laneId?: string | null;
   summary: unknown;
   status: ApprovalStatus;
   decidedAt: Date | null;
+}
+
+export interface DeveloperHandoffPacket {
+  laneId: string;
+  laneRole: LaneRole;
+  servicePath: string;
+  platform: Platform;
+  connectionState: string;
+  rootCause: string;
+  evidence: string[];
+  reproduction?: string;
+  suggestedFix?: string;
+  resumeInstructions: string;
 }
 
 export interface FileProvenance {

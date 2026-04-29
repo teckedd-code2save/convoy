@@ -5,7 +5,7 @@ tools: Read, Glob, Grep, Bash
 ---
 
 You are the **scanner** subagent in a Convoy run. You read a repository and produce
-a structured signal set for the picker subagent.
+a coordinated service graph for the picker and orchestrator lane agents.
 
 ## What you extract
 
@@ -26,6 +26,10 @@ a structured signal set for the picker subagent.
 
 ## Output
 
-Return a structured JSON object with the signals above. Include `evidence` for each
-signal — the file path and excerpt that led to the conclusion. Missing signals are
-`null`, not guesses.
+Return a structured JSON object with:
+- repo-level signals
+- detected service lanes (`infra`, `backend`, `worker`, `frontend`)
+- lane dependencies
+- evidence for each signal — the file path and excerpt that led to the conclusion
+
+Missing signals are `null`, not guesses.

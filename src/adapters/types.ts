@@ -44,6 +44,26 @@ export interface RollbackResult {
   durationMs: number;
 }
 
+export interface PlatformCapability {
+  cliAvailable: boolean;
+  authenticated: boolean;
+  projectLinked: boolean;
+  rollbackReady: boolean;
+}
+
+export interface ConnectionStatus {
+  platform: Platform;
+  cliAvailable: boolean;
+  authenticated: boolean;
+  projectLinked: boolean;
+  rollbackReady: boolean;
+  account?: string;
+  projectBinding?: string;
+  envKeys: string[];
+  recommendedRemedy?: string;
+  raw?: Record<string, unknown>;
+}
+
 /**
  * Every platform adapter implements this interface.
  * agent-core is platform-neutral; platform specifics live behind this seam.

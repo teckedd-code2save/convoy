@@ -1,6 +1,6 @@
 import type { PlanPlatformDecision, PlanPlatformCandidate } from '../core/plan.js';
 import type { Platform } from '../core/types.js';
-import type { ScanResult } from './scanner.js';
+import type { ScanResult, ServiceNode } from './scanner.js';
 
 const SUPPORTED: Platform[] = ['fly', 'railway', 'vercel', 'cloudrun'];
 
@@ -32,6 +32,13 @@ export function pickPlatform(
     source: 'scored',
     candidates,
   };
+}
+
+export function pickPlatformForLane(
+  node: ServiceNode,
+  override?: Platform,
+): PlanPlatformDecision {
+  return pickPlatform(node.scan, override);
 }
 
 function scoreAll(scan: ScanResult): PlanPlatformCandidate[] {

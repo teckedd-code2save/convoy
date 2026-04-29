@@ -179,7 +179,7 @@ If `CONVOY_HOME` is unset and `~/convoy` doesn't exist, ask the user for the pat
 
 1. **Ships your code, does not rewrite it.** Convoy only authors Dockerfile, platform manifest, `.env.schema`, CI workflow, `infra/` Terraform, and `.convoy/*`. Medic diagnoses code-level failures and pauses for the developer to fix — it never edits `src/`.
 2. **Every forward action has a pre-staged reverse.** Rollback paths are real.
-3. **No autonomous probing.** Convoy doesn't call `fly secrets list`, `vercel env ls`, etc. — operator declarations are the source of truth for platform state.
+3. **No destructive autonomous probing.** Convoy may read connection state (`fly secrets list`, `vercel env ls`, project binding, auth status) to verify deploy readiness, but it never mutates platform state without explicit approval.
 ```
 
 ## More

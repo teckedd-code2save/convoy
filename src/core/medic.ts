@@ -4,6 +4,8 @@ import { resolve } from 'node:path';
 
 import Anthropic from '@anthropic-ai/sdk';
 
+import type { DeveloperHandoffPacket, LaneRole, Platform } from './types.js';
+
 const MODEL = 'claude-opus-4-7';
 const MAX_TOKENS = 2000;
 // Agent loop cap: enough for ~3 evidence-gathering tool calls plus finalize.
@@ -68,6 +70,11 @@ function sanitizeProse(value: string): string {
 export interface DiagnosisInput {
   stage: string;
   phase: string;
+  laneId?: string;
+  laneRole?: LaneRole;
+  servicePath?: string;
+  platform?: Platform;
+  connectionState?: string;
   repoPath: string;
   convoyAuthoredFiles: string[];
   logs: string[];
@@ -91,6 +98,7 @@ export interface Diagnosis {
   reproduction?: string;
   suggestedFix?: DiagnosisFix;
   narrative: string;
+  handoff?: DeveloperHandoffPacket;
   source: 'ai' | 'skipped-no-key' | 'error';
   /**
    * Each tool the agent invoked during the loop, in order. Surfaced to the
@@ -194,21 +202,21 @@ export async function diagnose(
     }
 
     if (!finalDiagnosis) {
-      return {
+      return withHandoff({
         ...fallbackDiagnosis(input, 'error'),
         toolCalls: toolCallsRecord,
-      };
+      }, input);
     }
-    return {
+    return withHandoff({
       ...finalDiagnosis,
       source: 'ai',
       toolCalls: toolCallsRecord,
-    };
+    }, input);
   } catch {
-    return {
+    return withHandoff({
       ...fallbackDiagnosis(input, 'error'),
       toolCalls: toolCallsRecord,
-    };
+    }, input);
   }
 }
 
@@ -565,5 +573,29 @@ function fallbackDiagnosis(input: DiagnosisInput, source: 'skipped-no-key' | 'er
         ? `I don't have an API key wired up, so I can only surface the raw failure. Set ANTHROPIC_API_KEY to get a real diagnosis.`
         : `I hit an error while diagnosing. The raw failure context is preserved in the run events.`,
     source,
+  };
+}
+
+function withHandoff(diagnosis: Diagnosis, input: DiagnosisInput): Diagnosis {
+  const ownedByDeveloper =
+    diagnosis.suggestedFix?.owned === 'developer' || diagnosis.classification === 'code';
+  if (!ownedByDeveloper || !input.laneId || !input.servicePath || !input.platform) {
+    return diagnosis;
+  }
+  return {
+    ...diagnosis,
+    handoff: {
+      laneId: input.laneId,
+      laneRole: input.laneRole ?? 'backend',
+      servicePath: input.servicePath,
+      platform: input.platform,
+      connectionState: input.connectionState ?? 'unknown',
+      rootCause: diagnosis.rootCause,
+      evidence: diagnosis.location?.file ? [diagnosis.location.file] : [],
+      reproduction: diagnosis.reproduction,
+      suggestedFix: diagnosis.suggestedFix?.description,
+      resumeInstructions:
+        `Fix the developer-owned issue in ${input.servicePath}, then rerun \`convoy resume\` to continue the same multi-lane run.`,
+    },
   };
 }

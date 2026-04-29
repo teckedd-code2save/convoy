@@ -127,6 +127,63 @@ export interface ScanOptions {
   workspace?: string;
 }
 
+export interface PlatformHints {
+  existingPlatform: Platform | null;
+  hasDockerfile: boolean;
+  hasCi: boolean;
+  packageManager: PackageManager;
+}
+
+export interface AuthHints {
+  requiresProjectBinding: boolean;
+  candidateClis: string[];
+  configFiles: string[];
+}
+
+export interface SecretsHints {
+  expectedKeys: string[];
+  sources: string[];
+}
+
+export interface ServiceNode {
+  id: string;
+  name: string;
+  path: string;
+  role: 'infra' | 'backend' | 'worker' | 'frontend';
+  ecosystem: Ecosystem;
+  framework: string | null;
+  topology: ScanResult['topology'];
+  dataLayer: string[];
+  buildCommand: string | null;
+  startCommand: string | null;
+  testCommand: string | null;
+  healthPath: string | null;
+  port: number | null;
+  existingPlatform: Platform | null;
+  evidence: string[];
+  risks: ScanRisk[];
+  dependsOn: string[];
+  platformHints: PlatformHints;
+  authHints: AuthHints;
+  secretsHints: SecretsHints;
+  scan: ScanResult;
+}
+
+export interface ServiceGraph {
+  localPath: string;
+  scanRoot: string;
+  workspace: string | null;
+  isMonorepo: boolean;
+  monorepoTool: MonorepoTool;
+  readmeTitle: string | null;
+  readmeFirstPara: string | null;
+  topLevelDirs: string[];
+  topLevelFiles: string[];
+  evidence: string[];
+  risks: ScanRisk[];
+  nodes: ServiceNode[];
+}
+
 export function scanRepository(localPath: string, opts: ScanOptions = {}): ScanResult {
   if (!existsSync(localPath)) {
     throw new Error(`Path does not exist: ${localPath}`);
@@ -236,7 +293,7 @@ export function scanRepository(localPath: string, opts: ScanOptions = {}): ScanR
     risks.push({
       level: 'warn',
       message: `Multi-service repo detected: ${subServices.map((s) => s.path).join(', ')}. ` +
-        `This plan targets ${subServices[0]!.path}. Re-run with \`--workspace=<path>\` to plan a different service.`,
+        `Convoy will build coordinated lanes for each detected service. Re-run with \`--workspace=<path>\` to narrow to one lane.`,
     });
   }
 
@@ -281,6 +338,50 @@ export function scanRepository(localPath: string, opts: ScanOptions = {}): ScanR
     deployabilityReason,
     evidence,
     risks,
+  };
+}
+
+export function scanServiceGraph(localPath: string, opts: ScanOptions = {}): ServiceGraph {
+  const rootScan = scanRepository(localPath, opts);
+  const topLevelDirs = rootScan.topLevelDirs;
+  const nodePaths = new Set<string>();
+
+  if (opts.workspace) {
+    nodePaths.add(opts.workspace);
+  } else {
+    for (const service of rootScan.subServices) {
+      nodePaths.add(service.path);
+    }
+    if (topLevelDirs.includes('infra')) {
+      nodePaths.add('infra');
+    }
+    if (nodePaths.size === 0) {
+      nodePaths.add('.');
+    }
+  }
+
+  const nodes = [...nodePaths]
+    .map((servicePath) => buildServiceNode(localPath, servicePath, opts.workspace ?? null))
+    .filter((node): node is ServiceNode => node !== null);
+
+  const nodesById = new Map(nodes.map((node) => [node.id, node]));
+  for (const node of nodes) {
+    node.dependsOn = inferDependencies(node, nodesById);
+  }
+
+  return {
+    localPath,
+    scanRoot: rootScan.scanRoot,
+    workspace: opts.workspace ?? null,
+    isMonorepo: rootScan.isMonorepo || nodes.length > 1,
+    monorepoTool: rootScan.monorepoTool,
+    readmeTitle: rootScan.readmeTitle,
+    readmeFirstPara: rootScan.readmeFirstPara,
+    topLevelDirs: rootScan.topLevelDirs,
+    topLevelFiles: rootScan.topLevelFiles,
+    evidence: rootScan.evidence,
+    risks: rootScan.risks,
+    nodes,
   };
 }
 
@@ -915,7 +1016,7 @@ function determineDeployability(
     return {
       deployability: 'deployable-web-service',
       deployabilityReason:
-        'Detected a monorepo. Convoy will plan a deployment for the top-level service; pass --workspace=<pkg> in a later version to target a specific package.',
+        'Detected a monorepo. Convoy will plan coordinated deployment lanes across the detected services; pass --workspace=<pkg> to narrow to one service.',
     };
   }
   return {
@@ -962,7 +1063,7 @@ function collectRisks(
   if (isMonorepo) {
     risks.push({
       level: 'warn',
-      message: 'Monorepo detected. First-pass plan targets the root; explicit workspace targeting is a follow-up feature.',
+      message: 'Monorepo detected. Convoy will coordinate detected lanes from one run; use --workspace to narrow to one service when needed.',
     });
   }
   if (eco === 'unknown') {
@@ -975,4 +1076,150 @@ function collectRisks(
 
 export function repoName(localPath: string): string {
   return basename(localPath).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'convoy-app';
+}
+
+function buildServiceNode(
+  localPath: string,
+  servicePath: string,
+  workspace: string | null,
+): ServiceNode | null {
+  const scan = servicePath === '.'
+    ? scanRepository(localPath, workspace ? { workspace } : {})
+    : scanRepository(localPath, { workspace: servicePath });
+  const normalizedPath = servicePath === '.' ? '.' : servicePath.replace(/\\/g, '/');
+  const role = detectLaneRole(normalizedPath, scan);
+  const id = buildLaneId(normalizedPath, role);
+  const secretsHints = detectSecretsHints(localPath, normalizedPath, scan);
+
+  return {
+    id,
+    name: normalizedPath === '.' ? repoName(localPath) : basename(normalizedPath),
+    path: normalizedPath,
+    role,
+    ecosystem: scan.ecosystem,
+    framework: scan.framework,
+    topology: scan.topology,
+    dataLayer: scan.dataLayer,
+    buildCommand: scan.buildCommand,
+    startCommand: scan.startCommand,
+    testCommand: scan.testCommand,
+    healthPath: scan.healthPath,
+    port: scan.port,
+    existingPlatform: scan.existingPlatform,
+    evidence: scan.evidence,
+    risks: scan.risks,
+    dependsOn: [],
+    platformHints: {
+      existingPlatform: scan.existingPlatform,
+      hasDockerfile: scan.hasDockerfile,
+      hasCi: scan.hasCi,
+      packageManager: scan.packageManager,
+    },
+    authHints: detectAuthHints(scan),
+    secretsHints,
+    scan,
+  };
+}
+
+function buildLaneId(servicePath: string, role: ServiceNode['role']): string {
+  const base = servicePath === '.'
+    ? 'root'
+    : servicePath.toLowerCase().replace(/[^a-z0-9/.-]+/g, '-').replace(/[/.]+/g, '-');
+  return `${role}-${base.replace(/^-+|-+$/g, '') || 'root'}`;
+}
+
+function detectLaneRole(servicePath: string, scan: ScanResult): ServiceNode['role'] {
+  const lowerPath = servicePath.toLowerCase();
+  if (lowerPath === 'infra' || lowerPath.startsWith('infra/')) return 'infra';
+  if (scan.framework === 'next.js' || scan.framework === 'astro' || scan.framework === 'vite' || scan.topology === 'static') {
+    return 'frontend';
+  }
+  if (scan.topology === 'worker' || /\b(worker|queue|job)s?\b/.test(lowerPath)) {
+    return 'worker';
+  }
+  return 'backend';
+}
+
+function detectAuthHints(scan: ScanResult): AuthHints {
+  const configFiles: string[] = [];
+  const candidateClis = new Set<string>();
+  if (scan.existingPlatform === 'fly') {
+    candidateClis.add('flyctl');
+    configFiles.push('fly.toml');
+  }
+  if (scan.existingPlatform === 'vercel' || scan.framework === 'next.js') {
+    candidateClis.add('vercel');
+    configFiles.push('vercel.json', '.vercel/project.json');
+  }
+  if (scan.existingPlatform === 'railway') {
+    candidateClis.add('railway');
+    configFiles.push('railway.toml', 'railway.json');
+  }
+  if (scan.existingPlatform === 'cloudrun') {
+    candidateClis.add('gcloud');
+    configFiles.push('cloudbuild.yaml', 'cloudbuild.yml');
+  }
+  if (candidateClis.size === 0) {
+    candidateClis.add('gh');
+  }
+  return {
+    requiresProjectBinding: scan.existingPlatform === 'vercel' || scan.framework === 'next.js',
+    candidateClis: [...candidateClis],
+    configFiles: [...new Set(configFiles)],
+  };
+}
+
+function detectSecretsHints(
+  localPath: string,
+  servicePath: string,
+  scan: ScanResult,
+): SecretsHints {
+  const expected = new Set<string>();
+  const sources: string[] = [];
+  const serviceRoot = servicePath === '.' ? localPath : join(localPath, servicePath);
+  for (const candidate of ['.env.schema', '.env.example', '.env.local.example']) {
+    const raw = tryReadFile(serviceRoot, candidate) ?? tryReadFile(localPath, candidate);
+    if (!raw) continue;
+    const keys = extractEnvKeys(raw);
+    if (keys.length === 0) continue;
+    keys.forEach((key) => expected.add(key));
+    sources.push(candidate);
+  }
+  if (scan.dataLayer.some((layer) => layer.includes('postgres'))) expected.add('DATABASE_URL');
+  if (scan.dataLayer.includes('redis')) expected.add('REDIS_URL');
+  return {
+    expectedKeys: [...expected].sort(),
+    sources,
+  };
+}
+
+function extractEnvKeys(text: string): string[] {
+  const out: string[] = [];
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const idx = trimmed.indexOf('=');
+    if (idx <= 0) continue;
+    const key = trimmed.slice(0, idx).trim();
+    if (/^[A-Z_][A-Z0-9_]*$/i.test(key)) out.push(key);
+  }
+  return out;
+}
+
+function inferDependencies(
+  node: ServiceNode,
+  nodesById: Map<string, ServiceNode>,
+): string[] {
+  const deps = new Set<string>();
+  if (node.role === 'backend' || node.role === 'worker' || node.role === 'frontend') {
+    for (const other of nodesById.values()) {
+      if (other.role === 'infra') deps.add(other.id);
+    }
+  }
+  if (node.role === 'frontend') {
+    for (const other of nodesById.values()) {
+      if (other.role === 'backend' || other.role === 'worker') deps.add(other.id);
+    }
+  }
+  return [...deps];
 }

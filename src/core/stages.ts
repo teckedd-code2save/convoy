@@ -17,6 +17,7 @@ import {
   vercelListDeployments,
   vercelRollback,
 } from '../adapters/vercel/runner.js';
+import { probePlatformConnection } from '../adapters/connections.js';
 import type { ConvoyBus } from './bus.js';
 import {
   createPrFromAuthoredFiles,
@@ -31,7 +32,7 @@ import {
   type RepoSourceSnapshot,
 } from './github-runner.js';
 import { diagnose, type DiagnoseOptions } from './medic.js';
-import type { ConvoyPlan } from './plan.js';
+import { aggregateAuthoredFiles, normalizePlan, primaryLane, type ConvoyPlan, type DeploymentLane } from './plan.js';
 import { RehearsalRunner, type MetricsSnapshot } from './rehearsal-runner.js';
 import { pickPlatform } from '../planner/picker.js';
 import { scanRepository, type ScanResult } from '../planner/scanner.js';
@@ -262,8 +263,8 @@ abstract class BaseStage implements Stage {
   abstract readonly name: StageName;
   abstract run(ctx: StageContext): Promise<unknown>;
 
-  protected emit(ctx: StageContext, kind: EventKind, payload: unknown): RunEvent {
-    const event = ctx.store.appendEvent(ctx.run.id, this.name, kind, payload);
+  protected emit(ctx: StageContext, kind: EventKind, payload: unknown, laneId?: string | null): RunEvent {
+    const event = ctx.store.appendEvent(ctx.run.id, this.name, kind, payload, laneId);
     ctx.bus.emit({ type: 'event.appended', event });
     return event;
   }
@@ -294,10 +295,11 @@ abstract class BaseStage implements Stage {
     ctx: StageContext,
     kind: ApprovalKind,
     summary: unknown,
+    laneId?: string | null,
   ): Promise<Approval> {
-    const approval = ctx.store.requestApproval(ctx.run.id, kind, summary);
+    const approval = ctx.store.requestApproval(ctx.run.id, kind, summary, laneId);
     ctx.bus.emit({ type: 'approval.requested', approval });
-    this.emit(ctx, 'progress', { awaiting_approval: kind, approval_id: approval.id });
+    this.emit(ctx, 'progress', { awaiting_approval: kind, approval_id: approval.id }, laneId);
 
     // Default: pause at every approval gate (opt-out via --auto-approve / -y).
     // The previous default (auto-approve ON) contradicted the README's "humans
@@ -325,6 +327,11 @@ abstract class BaseStage implements Stage {
         return current;
       }
     }
+  }
+
+  protected lanes(ctx: StageContext): DeploymentLane[] {
+    const plan = ctx.opts.plan ? normalizePlan(ctx.opts.plan) : null;
+    return plan?.lanes ?? [];
   }
 }
 
@@ -362,28 +369,32 @@ export class ScanStage extends BaseStage {
   override async run(ctx: StageContext): Promise<unknown> {
     this.emit(ctx, 'started', { repo_url: ctx.run.repoUrl });
 
-    const plan = ctx.opts.plan;
+    const plan = ctx.opts.plan ? normalizePlan(ctx.opts.plan) : undefined;
     if (plan) {
       try {
-        const scanOpts = plan.target.workspace ? { workspace: plan.target.workspace } : {};
-        const scan = scanRepository(plan.target.localPath, scanOpts);
-        const signals = {
-          language: scan.language ?? scan.ecosystem,
-          runtime: scan.runtime,
-          framework: scan.framework,
-          topology: scan.topology,
-          data: scan.dataLayer,
-          hints: {
-            has_dockerfile: scan.hasDockerfile,
-            has_ci: scan.hasCi,
-            package_manager: scan.packageManager,
-            monorepo: scan.isMonorepo ? scan.monorepoTool : null,
-            existing_platform: scan.existingPlatform,
-          },
-          evidence: scan.evidence.slice(0, 6),
-        };
-        this.emit(ctx, 'finished', { signals });
-        return scan;
+        const laneScans: Record<string, ScanResult | null> = {};
+        for (const lane of plan.lanes) {
+          const scanOpts = lane.servicePath === '.' ? {} : { workspace: lane.servicePath };
+          const scan = scanRepository(plan.repo.localPath, scanOpts);
+          laneScans[lane.id] = scan;
+          const signals = {
+            language: scan.language ?? scan.ecosystem,
+            runtime: scan.runtime,
+            framework: scan.framework,
+            topology: scan.topology,
+            data: scan.dataLayer,
+            hints: {
+              has_dockerfile: scan.hasDockerfile,
+              has_ci: scan.hasCi,
+              package_manager: scan.packageManager,
+              monorepo: scan.isMonorepo ? scan.monorepoTool : null,
+              existing_platform: scan.existingPlatform,
+            },
+            evidence: scan.evidence.slice(0, 6),
+          };
+          this.emit(ctx, 'finished', { signals }, lane.id);
+        }
+        return laneScans;
       } catch (err) {
         // Target directory may have moved since the plan was saved. Fall back
         // to the plan's recorded target metadata rather than emitting fiction.
@@ -392,16 +403,20 @@ export class ScanStage extends BaseStage {
           note: `live scan unavailable: ${message}`,
           fallback: 'plan.target',
         });
-        const signals = {
-          language: plan.target.ecosystem,
-          runtime: null,
-          framework: plan.target.framework,
-          topology: plan.target.topology,
-          data: [] as string[],
-          hints: { source: 'plan-record' as const },
-        };
-        this.emit(ctx, 'finished', { signals });
-        return null;
+        const laneScans: Record<string, ScanResult | null> = {};
+        for (const lane of plan.lanes) {
+          const signals = {
+            language: lane.scan.ecosystem,
+            runtime: null,
+            framework: lane.scan.framework,
+            topology: lane.scan.topology,
+            data: lane.scan.dataLayer,
+            hints: { source: 'plan-record' as const },
+          };
+          this.emit(ctx, 'finished', { signals }, lane.id);
+          laneScans[lane.id] = null;
+        }
+        return laneScans;
       }
     }
 
@@ -419,41 +434,54 @@ export class PickStage extends BaseStage {
   override async run(ctx: StageContext): Promise<unknown> {
     this.emit(ctx, 'started', {});
 
-    const scan = (ctx.prior['scan'] as ScanResult | null | undefined) ?? null;
-    const plan = ctx.opts.plan;
+    const scans = (ctx.prior['scan'] as Record<string, ScanResult | null> | undefined) ?? {};
+    const plan = ctx.opts.plan ? normalizePlan(ctx.opts.plan) : undefined;
 
     // Prefer re-running pickPlatform against the live scan (that's the
     // honest "we just scored four platforms" demo). Fall back to the plan's
     // recorded decision if live scan failed. Last resort: platformOverride.
-    let decision;
-    if (scan) {
-      decision = pickPlatform(scan, ctx.opts.platformOverride);
-      if (plan && decision.chosen !== plan.platform.chosen) {
-        this.emit(ctx, 'progress', {
-          note: 'live pick diverged from plan',
-          plan_chose: plan.platform.chosen,
-          live_chose: decision.chosen,
-        });
+    const decisions: Record<string, unknown> = {};
+    let platformSummary: Platform | 'multi' | null = null;
+    if (plan) {
+      for (const lane of plan.lanes) {
+        const scan = scans[lane.id] ?? null;
+        let decision;
+        if (scan) {
+          decision = pickPlatform(scan, ctx.opts.platformOverride);
+          if (decision.chosen !== lane.platformDecision.chosen) {
+            this.emit(ctx, 'progress', {
+              note: 'live pick diverged from plan',
+              plan_chose: lane.platformDecision.chosen,
+              live_chose: decision.chosen,
+            }, lane.id);
+          }
+        } else {
+          decision = lane.platformDecision;
+        }
+        decisions[lane.id] = decision;
+        this.emit(ctx, 'decision', decision, lane.id);
+        this.emit(ctx, 'finished', decision, lane.id);
       }
-    } else if (plan) {
-      decision = plan.platform;
+      const chosen = [...new Set(plan.lanes.map((lane) => lane.platformDecision.chosen))];
+      platformSummary = chosen.length === 1 ? chosen[0]! : 'multi';
     } else {
       const chosen: Platform = ctx.opts.platformOverride ?? 'fly';
-      decision = {
+      const decision = {
         chosen,
         reason: `fallback: ${chosen}`,
         source: 'override' as const,
         candidates: [],
       };
+      decisions['default'] = decision;
+      this.emit(ctx, 'decision', decision);
+      this.emit(ctx, 'finished', decision);
+      platformSummary = chosen;
     }
 
-    ctx.store.updateRun(ctx.run.id, { platform: decision.chosen });
+    ctx.store.updateRun(ctx.run.id, { platform: platformSummary });
     const updated = ctx.store.getRun(ctx.run.id);
     if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
-
-    this.emit(ctx, 'decision', decision);
-    this.emit(ctx, 'finished', decision);
-    return decision;
+    return decisions;
   }
 }
 
@@ -780,69 +808,62 @@ export class RehearseStage extends BaseStage {
   readonly name = 'rehearse' as const;
 
   override async run(ctx: StageContext): Promise<unknown> {
+    const plan = ctx.opts.plan ? normalizePlan(ctx.opts.plan) : undefined;
     if (ctx.opts.realRehearsal) {
       return this.#runReal(ctx, ctx.opts.realRehearsal);
     }
 
     this.emit(ctx, 'started', { mode: 'scripted' });
-    this.emit(ctx, 'progress', { phase: 'ephemeral.creating', mode: 'scripted' });
-    await this.sleep(1200, ctx.signal);
-
-    // Scripted rehearsal does not spin up a real ephemeral service, so there
-    // is no URL to advertise. Previously we emitted
-    // https://convoy-rehearsal-<hash>.fly.dev which never existed.
-    this.emit(ctx, 'progress', { phase: 'ephemeral.ready', mode: 'scripted' });
-    await this.sleep(400, ctx.signal);
-
-    this.emit(ctx, 'progress', { phase: 'smoke_tests.passed', count: 8 });
-    await this.sleep(500, ctx.signal);
-
-    const inject = ctx.opts.injectFailure;
-    if (inject && inject.stage === 'rehearse') {
-      this.emit(ctx, 'progress', {
-        phase: 'synthetic_load.breach',
-        p99_ms: 494,
-        error_rate_pct: 6.67,
-        threshold_error_rate_pct: 1.0,
-      });
+    const lanes = plan?.lanes ?? [];
+    const outputs: Record<string, unknown> = {};
+    const targetLanes = lanes.length > 0 ? lanes : [{ id: 'default', servicePath: '.', role: 'backend', platformDecision: { chosen: 'fly' } }] as Array<Record<string, any>>;
+    for (const lane of targetLanes) {
+      this.emit(ctx, 'progress', { phase: 'ephemeral.creating', mode: 'scripted', service_path: lane.servicePath }, lane.id);
       await this.sleep(300, ctx.signal);
+      this.emit(ctx, 'progress', { phase: 'ephemeral.ready', mode: 'scripted' }, lane.id);
+      await this.sleep(150, ctx.signal);
+      this.emit(ctx, 'progress', { phase: 'smoke_tests.passed', count: 8 }, lane.id);
+      await this.sleep(150, ctx.signal);
 
-      const logs = await loadInjectedLogs(inject);
+      const inject = ctx.opts.injectFailure;
+      if (inject && inject.stage === 'rehearse') {
+        this.emit(ctx, 'progress', {
+          phase: 'synthetic_load.breach',
+          p99_ms: 494,
+          error_rate_pct: 6.67,
+          threshold_error_rate_pct: 1.0,
+        }, lane.id);
+        const logs = await loadInjectedLogs(inject);
+        this.emit(ctx, 'progress', { phase: 'medic.invoked' }, lane.id);
+        const diagnosis = await diagnose({
+          stage: 'rehearse',
+          phase: 'synthetic_load',
+          laneId: lane.id,
+          laneRole: lane.role,
+          servicePath: lane.servicePath,
+          platform: lane.platformDecision?.chosen ?? 'fly',
+          connectionState: 'scripted',
+          repoPath: inject.repoPath ?? '.',
+          convoyAuthoredFiles: inject.convoyAuthoredFiles ?? [],
+          logs,
+          metrics: { p99_ms: 494, p95_ms: 410, error_rate_pct: 6.67, count: 90 },
+          errorMessage: 'synthetic load breached error-rate tolerance (6.67% > 1%)',
+        }, this.medicTelemetry(ctx));
+        this.emit(ctx, 'diagnosis', diagnosis, lane.id);
+        throw new RehearsalBreachError(diagnosis);
+      }
 
-      this.emit(ctx, 'progress', { phase: 'medic.invoked' });
-
-      const diagnosis = await diagnose({
-        stage: 'rehearse',
-        phase: 'synthetic_load',
-        repoPath: inject.repoPath ?? '.',
-        convoyAuthoredFiles: inject.convoyAuthoredFiles ?? [],
-        logs,
-        metrics: { p99_ms: 494, p95_ms: 410, error_rate_pct: 6.67, count: 90 },
-        errorMessage: 'synthetic load breached error-rate tolerance (6.67% > 1%)',
-      }, this.medicTelemetry(ctx));
-
-      this.emit(ctx, 'diagnosis', diagnosis);
-      this.emit(ctx, 'progress', { phase: 'ephemeral.destroying' });
-      await this.sleep(300, ctx.signal);
-
-      throw new RehearsalBreachError(diagnosis);
+      const result = {
+        mode: 'scripted' as const,
+        healthy: true,
+        p99_ms: 142,
+        smoke_tests_passed: 8,
+        new_error_fingerprints: 0,
+      };
+      outputs[lane.id] = result;
+      this.emit(ctx, 'finished', result, lane.id);
     }
-
-    this.emit(ctx, 'progress', { phase: 'synthetic_load.passed', p99_ms: 142 });
-    await this.sleep(400, ctx.signal);
-
-    this.emit(ctx, 'progress', { phase: 'ephemeral.destroying' });
-    await this.sleep(300, ctx.signal);
-
-    const result = {
-      mode: 'scripted' as const,
-      healthy: true,
-      p99_ms: 142,
-      smoke_tests_passed: 8,
-      new_error_fingerprints: 0,
-    };
-    this.emit(ctx, 'finished', result);
-    return result;
+    return outputs;
   }
 
   async #runReal(ctx: StageContext, cfg: RealRehearsalOpt): Promise<unknown> {
@@ -967,7 +988,10 @@ export class CanaryStage extends BaseStage {
     // can be added later as a separate gate.
     const isRealDeploy = Boolean(ctx.opts.realFly || ctx.opts.realVercel);
     if (isRealDeploy && ctx.opts.plan) {
-      await this.#secretsGate(ctx, ctx.opts.plan);
+      const plan = normalizePlan(ctx.opts.plan);
+      for (const lane of plan.lanes) {
+        await this.#secretsGate(ctx, plan, lane);
+      }
     }
 
     if (ctx.opts.realFly) {
@@ -1090,6 +1114,23 @@ export class CanaryStage extends BaseStage {
   async #runRealVercel(ctx: StageContext, cfg: RealVercelOpt): Promise<unknown> {
     this.emit(ctx, 'started', { mode: 'real-vercel', cwd: cfg.cwd });
 
+    const connection = await probePlatformConnection('vercel', cfg.cwd);
+    if (!connection.cliAvailable) {
+      throw new Error(connection.recommendedRemedy ?? 'vercel CLI is not available');
+    }
+    if (!connection.authenticated) {
+      throw new Error(connection.recommendedRemedy ?? 'vercel CLI is not authenticated');
+    }
+    if (!connection.projectLinked) {
+      throw new Error(connection.recommendedRemedy ?? 'workspace is not linked to a Vercel project');
+    }
+    this.emit(ctx, 'progress', {
+      phase: 'vercel.connected',
+      account: connection.account,
+      project_binding: connection.projectBinding,
+      env_keys: connection.envKeys,
+    });
+
     await this.awaitApproval(ctx, 'promote', {
       note: 'Convoy-authored PR merged. Deploy to Vercel as a preview?',
       cwd: cfg.cwd,
@@ -1156,25 +1197,31 @@ export class CanaryStage extends BaseStage {
    * No platform probing — `--already-set` claims are still trusted on
    * faith here. Verification is a separate v2 gate.
    */
-  async #secretsGate(ctx: StageContext, plan: ConvoyPlan): Promise<void> {
-    const { keys: expected, sources } = computeExpectedKeysFromPlan(plan);
+  async #secretsGate(ctx: StageContext, plan: ConvoyPlan, lane: DeploymentLane): Promise<void> {
+    const expected = new Set<string>(lane.secrets.expectedKeys);
+    const sources = lane.secrets.sources;
     if (expected.size === 0) return;
 
-    const targetCwd = plan.target.workspace
-      ? `${plan.target.localPath}/${plan.target.workspace}`
-      : plan.target.localPath;
-    const secretsPath = `${plan.target.localPath}/.env.convoy-secrets`;
-    const alreadyPath = `${plan.target.localPath}/.env.convoy-already-set`;
+    const targetCwd = lane.servicePath === '.'
+      ? plan.repo.localPath
+      : `${plan.repo.localPath}/${lane.servicePath}`;
+    const secretsPath = `${plan.repo.localPath}/.env.convoy-secrets`;
+    const alreadyPath = `${plan.repo.localPath}/.env.convoy-already-set`;
 
     const fileSecrets = readEnvKeyOnly(secretsPath);
     const fileAlready = readEnvKeyOnly(alreadyPath);
     const cliAlready = ctx.opts.alreadySetKeys ?? [];
 
     const staged = new Set<string>([...fileSecrets, ...fileAlready, ...cliAlready]);
-    const missing = [...expected].filter((k) => !staged.has(k));
+    const connection = await probePlatformConnection(lane.platformDecision.chosen, targetCwd, {
+      appName: ctx.opts.realFly?.appName,
+      expectedSecrets: lane.secrets.expectedKeys,
+    });
+    const connectionKeys = new Set(connection.envKeys);
+    const missing = [...expected].filter((k) => !staged.has(k) && !connectionKeys.has(k));
 
     // Filter platform-managed keys we never expect operators to stage.
-    const filtered = missing.filter((k) => !isPlatformManagedKey(k, plan.platform.chosen));
+    const filtered = missing.filter((k) => !isPlatformManagedKey(k, lane.platformDecision.chosen));
 
     if (filtered.length === 0) {
       this.emit(ctx, 'progress', {
@@ -1182,11 +1229,12 @@ export class CanaryStage extends BaseStage {
         sources,
         expected_count: expected.size,
         staged_count: expected.size - missing.length,
-      });
+        connection_env_count: connection.envKeys.length,
+      }, lane.id);
       return;
     }
 
-    const platform = plan.platform.chosen;
+    const platform = lane.platformDecision.chosen;
     const flyAppName = platform === 'fly'
       ? (ctx.opts.realFly?.appName ?? null)
       : null;
@@ -1197,10 +1245,13 @@ export class CanaryStage extends BaseStage {
       sources,
       platform,
       note: 'pausing for stage_secrets approval — paste values in the UI or self-declare and Convoy will push to the platform before the deploy command runs',
-    });
+      connection_state: connection.authenticated ? 'connected' : 'disconnected',
+    }, lane.id);
 
     await this.awaitApproval(ctx, 'stage_secrets', {
       mode: 'real',
+      lane_id: lane.id,
+      service_path: lane.servicePath,
       missing: filtered.map((key) => ({
         key,
         severity: classifySecretSeverity(key),
@@ -1215,9 +1266,9 @@ export class CanaryStage extends BaseStage {
       already_set_path: alreadyPath,
       note:
         'These required env vars aren\'t staged yet. Paste each value below to push it to the platform now, mark it as already set if you set it elsewhere, or skip with explicit acknowledgment.',
-    });
+    }, lane.id);
 
-    this.emit(ctx, 'progress', { phase: 'secrets.gate.cleared', missing: filtered });
+    this.emit(ctx, 'progress', { phase: 'secrets.gate.cleared', missing: filtered }, lane.id);
   }
 }
 

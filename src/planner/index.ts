@@ -3,10 +3,13 @@ import { basename } from 'node:path';
 
 import type {
   ConvoyPlan,
+  DeploymentLane,
   PlanApproval,
   PlanDeployabilitySection,
   PlanEstimate,
+  PlanLaneDependency,
   PlanPlatformDecision,
+  PlatformConnectionRequirement,
   PlanPromotionSection,
   PlanRehearsalSection,
   PlanRollbackSection,
@@ -18,8 +21,8 @@ import type { Platform } from '../core/types.js';
 
 import { draftAuthorSection } from './author.js';
 import { enrichPlan, type EnrichmentOptions } from './enricher.js';
-import { pickPlatform } from './picker.js';
-import { scanRepository, repoName, type ScanResult } from './scanner.js';
+import { pickPlatform, pickPlatformForLane } from './picker.js';
+import { scanRepository, scanServiceGraph, repoName, type ScanResult, type ServiceNode } from './scanner.js';
 import { resolveTarget, type ResolveOptions, type TargetResolution } from './target-resolver.js';
 
 export interface BuildPlanOptions {
@@ -41,18 +44,24 @@ export async function buildPlan(
   opts: BuildPlanOptions = {},
 ): Promise<BuildPlanResult> {
   const scan = scanRepository(localPath, opts.workspace ? { workspace: opts.workspace } : {});
+  const graph = scanServiceGraph(localPath, opts.workspace ? { workspace: opts.workspace } : {});
 
   const deployability = toPlanDeployability(scan);
   const platform = resolvePlatform(scan, opts.platformOverride, deployability);
-  const author =
-    deployability.verdict === 'not-cloud-deployable'
-      ? { convoyAuthoredFiles: [] }
-      : draftAuthorSection(scan, platform.chosen);
+  const lanes = deployability.verdict === 'not-cloud-deployable'
+    ? [] as DeploymentLane[]
+    : graph.nodes.map((node) => buildLane(node, opts.platformOverride));
+  const dependencies = buildDependencies(lanes);
+  const connectionRequirements = buildConnectionRequirements(lanes);
+  const author = {
+    convoyAuthoredFiles: dedupeAuthoredFiles(lanes.flatMap((lane) => lane.author.convoyAuthoredFiles)),
+  };
 
-  const rehearsal = defaultRehearsal(scan, platform.chosen);
-  const promotion = defaultPromotion();
-  const rollback = defaultRollback(platform.chosen);
-  const approvals = defaultApprovals();
+  const primaryLane = lanes[0];
+  const rehearsal = primaryLane?.rehearsal ?? defaultRehearsal(scan, platform.chosen);
+  const promotion = primaryLane?.promotion ?? defaultPromotion();
+  const rollback = primaryLane?.rollback ?? defaultRollback(platform.chosen);
+  const approvals = primaryLane?.approvals ?? defaultApprovals();
   const estimate = defaultEstimate();
   const risks = toPlanRisks(scan);
   const summary = buildSummary(scan, platform, deployability);
@@ -74,8 +83,22 @@ export async function buildPlan(
   };
 
   const baseline: ConvoyPlan = {
+    version: 2,
     id: randomUUID(),
     createdAt: new Date().toISOString(),
+    repo: {
+      repoUrl: opts.repoUrl ?? null,
+      localPath,
+      branch: opts.branch ?? null,
+      sha: opts.sha ?? null,
+      mode: 'first-deploy',
+      name: repoName(localPath) || basename(localPath),
+      readmeTitle: scan.readmeTitle,
+      readmeExcerpt: scan.readmeFirstPara,
+    },
+    lanes,
+    dependencies,
+    connectionRequirements,
     target,
     summary,
     deployability,
@@ -97,6 +120,102 @@ export async function buildPlan(
 
   const enriched = await enrichPlan(scan, baseline, opts.ai ?? {});
   return { plan: enriched.plan, enrichmentSource: enriched.source };
+}
+
+function buildLane(node: ServiceNode, override?: Platform): DeploymentLane {
+  const platformDecision = pickPlatformForLane(node, override);
+  const author = draftAuthorSection(node.scan, platformDecision.chosen);
+  const rehearsal = defaultRehearsal(node.scan, platformDecision.chosen);
+  const promotion = defaultPromotion();
+  const rollback = defaultRollback(platformDecision.chosen);
+  const approvals = defaultApprovals();
+  return {
+    id: node.id,
+    role: node.role,
+    servicePath: node.path,
+    displayName: node.name,
+    scan: {
+      ecosystem: node.ecosystem,
+      framework: node.framework,
+      topology: node.topology,
+      dataLayer: node.dataLayer,
+      startCommand: node.startCommand,
+      buildCommand: node.buildCommand,
+      testCommand: node.testCommand,
+      healthPath: node.healthPath,
+      port: node.port,
+      evidence: node.evidence,
+      risks: node.risks.map((risk) => ({ level: risk.level, message: risk.message })),
+    },
+    platformDecision,
+    author,
+    rehearsal,
+    promotion,
+    rollback,
+    approvals,
+    secrets: {
+      expectedKeys: node.secretsHints.expectedKeys,
+      sources: node.secretsHints.sources,
+    },
+    statusNarrative: [
+      `I'll scan ${node.path} as a ${node.role} lane.`,
+      `I'll fit ${node.path} to ${platformDecision.chosen} based on its own evidence, not the repo's first detected child.`,
+    ],
+  };
+}
+
+function buildDependencies(lanes: DeploymentLane[]): PlanLaneDependency[] {
+  const out: PlanLaneDependency[] = [];
+  const byId = new Map(lanes.map((lane) => [lane.id, lane]));
+  for (const lane of lanes) {
+    const deps = inferLaneDependencies(lane, byId);
+    for (const dep of deps) {
+      out.push({
+        from: dep.id,
+        to: lane.id,
+        reason: dependencyReason(dep.role, lane.role),
+      });
+    }
+  }
+  return out;
+}
+
+function inferLaneDependencies(
+  lane: DeploymentLane,
+  byId: Map<string, DeploymentLane>,
+): DeploymentLane[] {
+  const deps: DeploymentLane[] = [];
+  for (const other of byId.values()) {
+    if (other.id === lane.id) continue;
+    if (lane.role === 'frontend' && (other.role === 'backend' || other.role === 'worker' || other.role === 'infra')) {
+      deps.push(other);
+    } else if ((lane.role === 'backend' || lane.role === 'worker') && other.role === 'infra') {
+      deps.push(other);
+    }
+  }
+  return deps;
+}
+
+function dependencyReason(from: DeploymentLane['role'], to: DeploymentLane['role']): string {
+  if (from === 'infra') return 'shared platform/account/env prerequisites must be ready first';
+  if (to === 'frontend') return 'frontend rollout depends on upstream services being deployed first';
+  return 'fixed lane DAG';
+}
+
+function buildConnectionRequirements(lanes: DeploymentLane[]): PlatformConnectionRequirement[] {
+  return lanes.map((lane) => ({
+    laneId: lane.id,
+    platform: lane.platformDecision.chosen,
+    servicePath: lane.servicePath,
+    requiresAuth: true,
+    requiresProjectBinding: lane.platformDecision.chosen === 'vercel',
+    expectedSecrets: lane.secrets.expectedKeys,
+  }));
+}
+
+function dedupeAuthoredFiles(files: ReturnType<typeof draftAuthorSection>['convoyAuthoredFiles']) {
+  const byPath = new Map(files.map((file) => [file.path, file]));
+  return [...byPath.values()];
 }
 
 function toPlanDeployability(scan: ScanResult): PlanDeployabilitySection {

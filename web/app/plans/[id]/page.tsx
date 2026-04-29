@@ -35,6 +35,7 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
         <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
           <Tag>{plan.target.ecosystem}</Tag>
           {plan.target.framework ? <Tag>{plan.target.framework}</Tag> : null}
+          {plan.lanes && plan.lanes.length > 1 ? <Tag>{plan.lanes.length} lanes</Tag> : null}
           <span>·</span>
           <span>{plan.target.repoUrl ?? plan.target.localPath}</span>
         </div>
@@ -44,6 +45,7 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
       </header>
 
       <Summary plan={plan} notDeployable={notDeployable} />
+      {plan.lanes && plan.lanes.length > 0 ? <LaneSection plan={plan} /> : null}
 
       {runs.length > 0 ? <RunsForPlan runs={runs} /> : null}
 
@@ -74,6 +76,40 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
         </div>
       )}
     </article>
+  );
+}
+
+function LaneSection({ plan }: { plan: PlanSummary }) {
+  const lanes = plan.lanes ?? [];
+  if (lanes.length === 0) return null;
+  return (
+    <section className="space-y-4">
+      <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">Lanes</h2>
+      <div className="grid gap-3 md:grid-cols-2">
+        {lanes.map((lane) => (
+          <div key={lane.id} className="border border-rule rounded-lg bg-card px-4 py-3 space-y-2">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-medium">{lane.displayName}</span>
+              <Tag>{lane.role}</Tag>
+              <Tag>{lane.platformDecision.chosen}</Tag>
+            </div>
+            <div className="text-xs text-muted">{lane.servicePath}</div>
+            <div className="text-sm text-muted">
+              {lane.scan.ecosystem}
+              {lane.scan.framework ? ` · ${lane.scan.framework}` : ''}
+              {lane.scan.topology ? ` · ${lane.scan.topology}` : ''}
+            </div>
+          </div>
+        ))}
+      </div>
+      {plan.dependencies && plan.dependencies.length > 0 ? (
+        <div className="text-sm text-muted space-y-1">
+          {plan.dependencies.map((dep) => (
+            <div key={`${dep.from}-${dep.to}`}>{dep.from} → {dep.to} · {dep.reason}</div>
+          ))}
+        </div>
+      ) : null}
+    </section>
   );
 }
 

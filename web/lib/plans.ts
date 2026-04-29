@@ -22,8 +22,55 @@ export interface PlanShipStep {
 }
 
 export interface PlanSummary {
+  version?: number;
   id: string;
   createdAt: string;
+  repo?: {
+    name: string;
+    repoUrl: string | null;
+    localPath: string;
+    readmeTitle: string | null;
+  };
+  lanes?: Array<{
+    id: string;
+    role: string;
+    servicePath: string;
+    displayName: string;
+    scan: {
+      ecosystem: string;
+      framework: string | null;
+      topology: string;
+      dataLayer: string[];
+    };
+    platformDecision: {
+      chosen: string;
+      source: string;
+      reason: string;
+      candidates: PlanPlatformCandidate[];
+    };
+    author: {
+      convoyAuthoredFiles: PlanAuthoredFile[];
+    };
+    rehearsal: {
+      targetDescriptor: string;
+      buildCommand: string | null;
+      startCommand: string | null;
+      expectedPort: number | null;
+      validations: string[];
+      healthPath?: string | null;
+      metricsPath?: string | null;
+    };
+    rollback: {
+      strategy: string;
+      target: string;
+      estimatedSeconds: number;
+    };
+    secrets: {
+      expectedKeys: string[];
+      sources: string[];
+    };
+  }>;
+  dependencies?: Array<{ from: string; to: string; reason: string }>;
   target: {
     name: string;
     ecosystem: string;
@@ -73,6 +120,10 @@ export interface PlanSummary {
     opusSpendUsdMin: number;
     opusSpendUsdMax: number;
   };
+}
+
+export function primaryLane(plan: PlanSummary) {
+  return plan.lanes?.[0] ?? null;
 }
 
 const PLANS_DIR = resolve(
