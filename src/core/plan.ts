@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 
@@ -198,6 +199,20 @@ export interface DeploymentLane {
   statusNarrative: string[];
 }
 
+export interface LoadedPlanRecord {
+  id: string;
+  path: string;
+  plan: ConvoyPlan;
+  integrity: 'verified' | 'legacy-unverified';
+  savedAt: string | null;
+}
+
+export type PlanIdMatch =
+  | { kind: 'exact'; id: string }
+  | { kind: 'prefix'; id: string }
+  | { kind: 'ambiguous'; ids: string[] }
+  | { kind: 'none' };
+
 export class PlanStore {
   readonly #dir: string;
 
@@ -208,35 +223,99 @@ export class PlanStore {
 
   save(plan: ConvoyPlan): string {
     const path = join(this.#dir, `${plan.id}.json`);
+    const normalized = normalizePlan(plan);
+    const envelope: StoredPlanEnvelope = {
+      format: 'convoy-plan-v1',
+      savedAt: new Date().toISOString(),
+      sha256: digestPlan(normalized),
+      plan: normalized,
+    };
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, `${JSON.stringify(plan, null, 2)}\n`, 'utf8');
+    writeFileSync(path, `${JSON.stringify(envelope, null, 2)}\n`, 'utf8');
     return path;
   }
 
   load(id: string): ConvoyPlan | null {
     try {
-      const raw = readFileSync(join(this.#dir, `${id}.json`), 'utf8');
-      return normalizePlan(JSON.parse(raw) as ConvoyPlan | LegacyConvoyPlan);
+      return this.inspect(id)?.plan ?? null;
     } catch {
       return null;
     }
   }
 
+  inspect(id: string): LoadedPlanRecord | null {
+    const path = join(this.#dir, `${id}.json`);
+    try {
+      const raw = readFileSync(path, 'utf8');
+      const parsed = JSON.parse(raw) as ConvoyPlan | LegacyConvoyPlan | StoredPlanEnvelope;
+
+      if (isStoredPlanEnvelope(parsed)) {
+        const expected = digestPlan(parsed.plan);
+        if (parsed.sha256 !== expected) {
+          throw new Error(
+            `Saved plan ${id} failed integrity check. Re-run \`convoy plan <target> --save\` before applying it.`,
+          );
+        }
+        return {
+          id,
+          path,
+          plan: normalizePlan(parsed.plan),
+          integrity: 'verified',
+          savedAt: parsed.savedAt,
+        };
+      }
+
+      return {
+        id,
+        path,
+        plan: normalizePlan(parsed),
+        integrity: 'legacy-unverified',
+        savedAt: null,
+      };
+    } catch (err) {
+      if (isMissingFileError(err)) return null;
+      throw err;
+    }
+  }
+
   listRecent(limit = 10): string[] {
+    return this.listAll()
+      .slice(0, limit);
+  }
+
+  listAll(): string[] {
     try {
       return readdirSync(this.#dir)
         .filter((name) => name.endsWith('.json'))
         .sort((a, b) => b.localeCompare(a))
-        .slice(0, limit)
         .map((name) => name.replace(/\.json$/, ''));
     } catch {
       return [];
     }
   }
+
+  match(idOrPrefix: string, limit = 10): PlanIdMatch {
+    const ids = this.listAll();
+    if (ids.includes(idOrPrefix)) {
+      return { kind: 'exact', id: idOrPrefix };
+    }
+
+    const matches = ids.filter((id) => id.startsWith(idOrPrefix));
+    if (matches.length === 0) return { kind: 'none' };
+    if (matches.length === 1 && matches[0]) return { kind: 'prefix', id: matches[0] };
+    return { kind: 'ambiguous', ids: matches.slice(0, limit) };
+  }
 }
 
 interface LegacyConvoyPlan extends Omit<ConvoyPlan, 'version' | 'repo' | 'lanes' | 'dependencies' | 'connectionRequirements'> {
   version?: number;
+}
+
+interface StoredPlanEnvelope {
+  format: 'convoy-plan-v1';
+  savedAt: string;
+  sha256: string;
+  plan: ConvoyPlan | LegacyConvoyPlan;
 }
 
 export function normalizePlan(input: ConvoyPlan | LegacyConvoyPlan): ConvoyPlan {
@@ -311,6 +390,40 @@ export function normalizePlan(input: ConvoyPlan | LegacyConvoyPlan): ConvoyPlan 
     evidence: legacy.evidence,
     shipNarrative: legacy.shipNarrative,
   };
+}
+
+function digestPlan(plan: ConvoyPlan | LegacyConvoyPlan): string {
+  const normalized = normalizePlan(plan);
+  return createHash('sha256').update(stableStringify(normalized)).digest('hex');
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(sortJson(value));
+}
+
+function sortJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((entry) => sortJson(entry));
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entry]) => [key, sortJson(entry)] as const);
+    return Object.fromEntries(entries);
+  }
+  return value;
+}
+
+function isStoredPlanEnvelope(value: unknown): value is StoredPlanEnvelope {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<StoredPlanEnvelope>;
+  return candidate.format === 'convoy-plan-v1'
+    && typeof candidate.sha256 === 'string'
+    && typeof candidate.savedAt === 'string'
+    && typeof candidate.plan === 'object'
+    && candidate.plan !== null;
+}
+
+function isMissingFileError(err: unknown): boolean {
+  return Boolean(err && typeof err === 'object' && 'code' in err && (err as { code?: string }).code === 'ENOENT');
 }
 
 export function primaryLane(plan: ConvoyPlan): DeploymentLane {

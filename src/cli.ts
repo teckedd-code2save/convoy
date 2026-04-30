@@ -1361,14 +1361,15 @@ function autoFlyAppName(plan: ConvoyPlan): string {
 async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
   checkConvoyEnv();
   const plans = new PlanStore(PLANS_DIR);
-  let plan = resolvePlan(plans, planId);
+  const resolvedPlan = resolvePlan(plans, planId);
+  if ('error' in resolvedPlan) printPlanResolutionFailure(resolvedPlan);
+  let plan = normalizePlan(resolvedPlan.plan);
 
-  if (!plan) {
-    console.error(pc.red(`Plan not found: ${planId}`));
-    console.error(pc.dim(`Looked in ${PLANS_DIR}. Run \`convoy plans\` to list saved plans.`));
-    process.exit(2);
+  if (resolvedPlan.integrity === 'legacy-unverified') {
+    process.stdout.write(
+      `${pc.yellow('!')} ${pc.dim(`plan ${resolvedPlan.resolvedId.slice(0, 8)} predates integrity envelopes; proceeding without tamper verification`)}` + '\n',
+    );
   }
-  plan = normalizePlan(plan);
 
   if (plan.deployability.verdict === 'not-cloud-deployable') {
     console.error(
@@ -1716,16 +1717,68 @@ function parseEnvFile(path: string): Record<string, string> {
   return out;
 }
 
-function resolvePlan(plans: PlanStore, idOrPrefix: string): ConvoyPlan | null {
-  const exact = plans.load(idOrPrefix);
-  if (exact) return exact;
-  for (const id of plans.listRecent(50)) {
-    if (id.startsWith(idOrPrefix)) {
-      const match = plans.load(id);
-      if (match) return match;
-    }
+function resolvePlan(
+  plans: PlanStore,
+  idOrPrefix: string,
+): { plan: ConvoyPlan; integrity: 'verified' | 'legacy-unverified'; resolvedId: string } | {
+  error: 'not_found' | 'ambiguous' | 'invalid';
+  detail: string;
+  matches?: string[];
+} {
+  const match = plans.match(idOrPrefix);
+  if (match.kind === 'none') {
+    return {
+      error: 'not_found',
+      detail: `Plan not found: ${idOrPrefix}`,
+    };
   }
-  return null;
+  if (match.kind === 'ambiguous') {
+    return {
+      error: 'ambiguous',
+      detail: `Plan prefix "${idOrPrefix}" matched multiple saved plans.`,
+      matches: match.ids,
+    };
+  }
+
+  try {
+    const loaded = plans.inspect(match.id);
+    if (!loaded) {
+      return {
+        error: 'not_found',
+        detail: `Plan not found: ${idOrPrefix}`,
+      };
+    }
+    return {
+      plan: loaded.plan,
+      integrity: loaded.integrity,
+      resolvedId: match.id,
+    };
+  } catch (err) {
+    return {
+      error: 'invalid',
+      detail: err instanceof Error ? err.message : String(err),
+      matches: [match.id],
+    };
+  }
+}
+
+function printPlanResolutionFailure(
+  result: ReturnType<typeof resolvePlan>,
+): never {
+  if (!('error' in result)) {
+    process.exit(2);
+  }
+
+  console.error(pc.red(result.detail));
+  if (result.error === 'ambiguous' && result.matches && result.matches.length > 0) {
+    console.error(pc.dim(`Matches: ${result.matches.join(', ')}`));
+    console.error(pc.dim('Use a longer prefix or the full plan id from `convoy plans`.'));
+  } else if (result.error === 'invalid') {
+    console.error(pc.dim('The saved plan is stale or tampered. Re-run `convoy plan <target> --save` before applying it.'));
+  } else {
+    console.error(pc.dim(`Looked in ${PLANS_DIR}. Run \`convoy plans\` to list saved plans.`));
+  }
+  process.exit(2);
 }
 
 function attachPlanReference(store: RunStateStore, runId: string, planId: string): void {
@@ -1748,11 +1801,14 @@ function attachPlanReference(store: RunStateStore, runId: string, planId: string
  */
 async function runStageSecrets(planId: string): Promise<void> {
   const plans = new PlanStore(PLANS_DIR);
-  const plan = resolvePlan(plans, planId);
-  if (!plan) {
-    console.error(pc.red(`Plan not found: ${planId}`));
-    console.error(pc.dim(`Looked in ${PLANS_DIR}. Run \`convoy plans\` to list saved plans.`));
-    process.exit(2);
+  const resolvedPlan = resolvePlan(plans, planId);
+  if ('error' in resolvedPlan) printPlanResolutionFailure(resolvedPlan);
+  const plan = resolvedPlan.plan;
+
+  if (resolvedPlan.integrity === 'legacy-unverified') {
+    process.stdout.write(
+      `${pc.yellow('!')} ${pc.dim(`plan ${resolvedPlan.resolvedId.slice(0, 8)} predates integrity envelopes; proceeding without tamper verification`)}` + '\n',
+    );
   }
 
   const { keys: expected, sources } = computeExpectedKeys(plan);

@@ -16,10 +16,13 @@ coverage/
 .idea/
 *.swp
 .convoy/state.db
+.convoy/state.db-shm
+.convoy/state.db-wal
 .convoy/state.db-journal
 .convoy/clones/
 .convoy/cache/
 .convoy/plans/
+.convoy/web-server.log
 
 # Local replay artifacts — regenerate via `convoy replay <runId>`
 demo-output/
