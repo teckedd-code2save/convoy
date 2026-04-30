@@ -92,6 +92,8 @@ export function createPlatformConnectionProbe(overrides: Partial<ProbeDependenci
         return probeRailwayConnection(cwd, opts, deps);
       case 'cloudrun':
         return probeCloudRunConnection(cwd, opts, deps);
+      case 'vps':
+        return probeVpsConnection(cwd, opts, deps);
     }
   };
 }
@@ -129,6 +131,11 @@ function summarizeMissingSecrets(platform: Platform, missing: string[]): Pick<Co
       return {
         summary: `Missing on Fly: ${list}.`,
         remedy: 'Set them with `flyctl secrets set ... --stage` or stage them through Convoy before deploy.',
+      };
+    case 'vps':
+      return {
+        summary: `Missing for VPS deploy: ${list}.`,
+        remedy: 'Stage them through Convoy (`convoy stage-secrets <plan>`); they ship to the box at deploy time.',
       };
   }
 }
@@ -813,3 +820,86 @@ function tryReadFile(base: string, relPath: string): string | null {
     return null;
   }
 }
+
+/**
+ * VPS connection probe. Unlike platforms with a CLI of their own, VPS
+ * deploys reach the box over SSH — so the only locally-checkable
+ * preconditions are: is the `ssh` binary present, and is a host configured?
+ * Host info comes from CONVOY_VPS_HOST in the env (or the apply-time flag,
+ * passed via opts.appName as a misuse-safe stand-in until a typed VPS
+ * options shape lands). Without a host we report "not configured" — that's
+ * a soft signal, not a hard failure: the operator might be staging
+ * preflight before they've decided on a host.
+ *
+ * No remote SSH probing happens here — that runs at apply time inside the
+ * VPS runner, with the operator's explicit opt-in via --real-vps. Per
+ * memory/feedback_no_autonomous_probing.md, we don't reach out without consent.
+ */
+async function probeVpsConnection(
+  cwd: string,
+  opts: ProbeOptions,
+  deps: ProbeDependencies,
+): Promise<ConnectionStatus> {
+  const expectedSecrets = normalizeExpectedSecrets(opts.expectedSecrets);
+  const sshCheck = await deps.runCommand('ssh', ['-V'], { cwd, timeoutMs: 3000 });
+  // ssh -V writes its version banner to stderr and exits 0. We treat any
+  // exit (with non-empty output) as "ssh present"; only ENOENT-style
+  // failures should mark the cli check as failing.
+  const cliAvailable = sshCheck.ok || (sshCheck.stderr + sshCheck.stdout).toLowerCase().includes('openssh');
+
+  const host = process.env['CONVOY_VPS_HOST'] ?? opts.appName ?? null;
+
+  const checks: ConnectionCheck[] = [];
+  if (!cliAvailable) {
+    checks.push({
+      area: 'cli',
+      ok: false,
+      required: true,
+      summary: 'OpenSSH client (`ssh`) is not installed locally.',
+      remedy: 'Install OpenSSH (most distros: `apt install openssh-client`; macOS ships it).',
+    });
+  } else {
+    checks.push({
+      area: 'cli',
+      ok: true,
+      required: true,
+      summary: 'ssh client present.',
+    });
+  }
+  checks.push({
+    area: 'auth',
+    ok: cliAvailable,
+    required: true,
+    summary: cliAvailable
+      ? 'SSH auth is verified at deploy time, not preflight (no autonomous probing).'
+      : 'Cannot verify SSH auth without ssh installed.',
+  });
+  checks.push({
+    area: 'project_binding',
+    ok: host !== null,
+    required: true,
+    summary: host !== null
+      ? `Will deploy to ${host}.`
+      : 'No VPS host configured.',
+    remedy: host === null
+      ? 'Pass `--vps-host=user@host` at apply time (or set CONVOY_VPS_HOST in your shell).'
+      : undefined,
+  });
+  checks.push(buildSecretsCheck('vps', expectedSecrets, []));
+
+  return {
+    platform: 'vps',
+    cliAvailable,
+    authenticated: cliAvailable,
+    projectLinked: host !== null,
+    rollbackReady: cliAvailable && host !== null,
+    ...(host !== null ? { projectBinding: host } : {}),
+    envKeys: [],
+    expectedSecrets,
+    missingExpectedSecrets: expectedSecrets,
+    secretsReady: expectedSecrets.length === 0,
+    checks,
+    ...(recommendedRemedyFromChecks(checks) ? { recommendedRemedy: recommendedRemedyFromChecks(checks)! } : {}),
+  };
+}
+

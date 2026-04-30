@@ -30,7 +30,7 @@ import { resolveTarget } from './planner/target-resolver.js';
 
 const STATE_PATH = process.env['CONVOY_STATE_PATH'] ?? '.convoy/state.db';
 const PLANS_DIR = process.env['CONVOY_PLANS_DIR'] ?? '.convoy/plans';
-const SUPPORTED_PLATFORMS: readonly Platform[] = ['fly', 'railway', 'vercel', 'cloudrun'];
+const SUPPORTED_PLATFORMS: readonly Platform[] = ['fly', 'railway', 'vercel', 'cloudrun', 'vps'];
 const WEB_BASE = (process.env['CONVOY_WEB_URL'] ?? 'http://localhost:3737').replace(/\/$/, '');
 
 interface StatusDiagnosisPayload {
@@ -747,12 +747,47 @@ interface PreflightCheck {
   remedy?: string;
 }
 
+/**
+ * One thing the operator must change before apply can proceed.
+ *
+ * Modeled as a structured record (not a string) for two reasons:
+ *  1. The web viewer renders blockers as cards with copy-able remedies and
+ *     "did this" buttons — that needs typed fields, not free text. Today the
+ *     CLI just prints them; tomorrow's PR persists them as run_events and
+ *     the viewer drives them.
+ *  2. Each fix carries enough metadata that we know whether Convoy can apply
+ *     it itself (autoFixable + a copyable command), or whether it requires
+ *     the operator (e.g. interactive `vercel link`).
+ *
+ * The rule (per principles.md, "evidence over assertion"): nothing is a
+ * blocker unless it actually blocks *this* deploy on *this* platform. A key
+ * the platform manages itself isn't "missing" — it's not the operator's job.
+ */
+type BlockerFixKind = 'shell' | 'flag' | 'edit-file' | 'interactive' | 'manual';
+
+interface BlockerFix {
+  kind: BlockerFixKind;
+  label: string;
+  command?: string;
+  flag?: string;
+  autoFixable: boolean;
+}
+
+interface PreflightBlocker {
+  id: string;
+  title: string;
+  detail: string;
+  severity: 'hard' | 'soft';
+  fixes: BlockerFix[];
+  docsUrl?: string;
+}
+
 interface PreflightReport {
   realAuthor: boolean;
   realRehearsal: boolean;
   realFly: boolean;
   checks: PreflightCheck[];
-  hardFailures: string[];
+  blockers: PreflightBlocker[];
   sourceSnapshot?: { headSha: string; branchName?: string };
   /**
    * Captured at preflight when --real-author is on and the target's working
@@ -948,7 +983,17 @@ function appendEnvStagingChecks(
   opts: ApplyOpts,
   report: PreflightReport,
 ): void {
-  const { keys: expected, sources } = computeExpectedKeys(plan);
+  const { keys: expectedRaw, sources } = computeExpectedKeys(plan);
+  if (expectedRaw.size === 0) return;
+
+  // Strip keys the platform injects itself (e.g. PORT on Vercel/Cloud Run/Fly).
+  // The operator can't stage these and shouldn't see them as missing — the
+  // false PORT blocker came from a stale .env.schema flowing into here
+  // unfiltered. The lane-level check already filters; mirror that here.
+  const platform = plan.platform.chosen;
+  const expected = new Set(
+    [...expectedRaw].filter((k) => !isPlatformManagedKeyForPreflight(k, platform)),
+  );
   if (expected.size === 0) return;
 
   const { staged, secretsPath } = computeStagedKeys(plan, opts);
@@ -1094,9 +1139,36 @@ async function appendLaneConnectionChecks(
     });
 
     if (!ok && isPrimary && (platform === 'fly' || platform === 'vercel')) {
-      report.hardFailures.push(
-        `${name}: ${missingBits.join(' · ')}. ${remedyForLaneConnection(connection.checks, missingSecrets, plan, secretsPath) ?? 'Resolve the lane readiness issues and rerun apply.'}`,
-      );
+      const remedy = remedyForLaneConnection(connection.checks, missingSecrets, plan, secretsPath);
+      const fixes: BlockerFix[] = [];
+      // Surface each failing check's command as its own fix card so the
+      // viewer can offer one-click copy per remedy instead of a single
+      // bullet-soup string.
+      for (const check of connection.checks) {
+        if (!check.ok && check.command) {
+          fixes.push({
+            kind: 'shell',
+            label: check.remedy ?? `Run ${check.command}`,
+            command: check.command,
+            autoFixable: false,
+          });
+        }
+      }
+      if (missingSecrets.length > 0) {
+        fixes.push({
+          kind: 'interactive',
+          label: `Stage missing secrets (${missingSecrets.join(', ')})`,
+          command: `convoy stage-secrets ${plan.id.slice(0, 8)}`,
+          autoFixable: false,
+        });
+      }
+      report.blockers.push({
+        id: `lane.${platform}.not-ready`,
+        title: `${name} not ready`,
+        detail: `${missingBits.join(' · ')}${remedy ? ` — ${remedy}` : ''}`,
+        severity: 'hard',
+        fixes,
+      });
     }
   }
 }
@@ -1108,7 +1180,7 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
     realRehearsal: opts.realRehearsal,
     realFly: opts.realFly,
     checks: [],
-    hardFailures: [],
+    blockers: [],
   };
 
   if (opts.demo) {
@@ -1180,10 +1252,26 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
       const repo = await detect(plan.target.localPath);
       if (!repo) {
         report.realAuthor = false;
-        report.hardFailures.push(
-          `real author: target at ${plan.target.localPath} is not a git repo with a github.com remote. ` +
-            `If it's a fresh clone, make sure --real-author is desired, or pass --no-real-author.`,
-        );
+        report.blockers.push({
+          id: 'real-author.no-github-remote',
+          title: 'Target is not a git repo with a github.com remote',
+          detail: `${plan.target.localPath} has no .git with a github.com origin — Convoy can't open a PR.`,
+          severity: 'hard',
+          fixes: [
+            {
+              kind: 'shell',
+              label: 'Initialize a repo and push it to GitHub',
+              command: `gh repo create --source=${plan.target.localPath} --push`,
+              autoFixable: false,
+            },
+            {
+              kind: 'flag',
+              label: 'Skip real PR authoring for this run',
+              flag: '--no-real-author',
+              autoFixable: true,
+            },
+          ],
+        });
         report.checks.push({
           name: 'real author',
           ok: false,
@@ -1194,9 +1282,26 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
         const auth = await authStatus();
         if (!auth.ok) {
           report.realAuthor = false;
-          report.hardFailures.push(
-            `real author: gh is not authenticated (${auth.error ?? 'unknown'}). Run \`gh auth login\` or pass --no-real-author.`,
-          );
+          report.blockers.push({
+            id: 'real-author.gh-not-authed',
+            title: 'gh CLI is not authenticated',
+            detail: `gh auth status failed: ${auth.error ?? 'unknown'}.`,
+            severity: 'hard',
+            fixes: [
+              {
+                kind: 'interactive',
+                label: 'Authenticate gh',
+                command: 'gh auth login',
+                autoFixable: false,
+              },
+              {
+                kind: 'flag',
+                label: 'Skip real PR authoring for this run',
+                flag: '--no-real-author',
+                autoFixable: true,
+              },
+            ],
+          });
           report.checks.push({
             name: 'real author',
             ok: false,
@@ -1270,7 +1375,34 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
       const workspaceHint = subPaths.length > 0
         ? `This looks like a monorepo. Try --workspace=${subPaths[0]}${subPaths.length > 1 ? ` (other services: ${subPaths.slice(1).join(', ')})` : ''}.`
         : 'Add a \`start\` script to the target, or pass --no-real-rehearsal.';
-      report.hardFailures.push(`real rehearsal: no start command detected. ${workspaceHint}`);
+      const fixes: BlockerFix[] = [];
+      if (subPaths.length > 0) {
+        fixes.push({
+          kind: 'flag',
+          label: `Treat ${subPaths[0]} as the service root`,
+          flag: `--workspace=${subPaths[0]}`,
+          autoFixable: true,
+        });
+      } else {
+        fixes.push({
+          kind: 'edit-file',
+          label: 'Add a "start" script to package.json',
+          autoFixable: false,
+        });
+      }
+      fixes.push({
+        kind: 'flag',
+        label: 'Skip real rehearsal for this run',
+        flag: '--no-real-rehearsal',
+        autoFixable: true,
+      });
+      report.blockers.push({
+        id: 'real-rehearsal.no-start-command',
+        title: 'No start command detected',
+        detail: `Convoy needs a start command to spawn the target locally. ${workspaceHint}`,
+        severity: 'hard',
+        fixes,
+      });
       report.checks.push({
         name: 'real rehearsal',
         ok: false,
@@ -1332,6 +1464,31 @@ function renderPreflight(report: PreflightReport): void {
     }
   }
   process.stdout.write('\n');
+}
+
+/**
+ * Stop-the-line view for hard blockers. Each blocker is shown with its
+ * ordered fix list — copy-paste-able commands first, opt-out flags last.
+ * The point is that the operator should always see at least one path
+ * forward; "things are broken, figure it out" is not acceptable output.
+ */
+function renderBlockers(blockers: PreflightBlocker[]): void {
+  const noun = blockers.length === 1 ? 'blocker' : 'blockers';
+  process.stdout.write(`${pc.red(pc.bold(`${blockers.length} ${noun} — apply paused`))}\n\n`);
+  for (let i = 0; i < blockers.length; i += 1) {
+    const b = blockers[i]!;
+    process.stdout.write(`  ${pc.red(`${i + 1}.`)} ${pc.bold(b.title)}\n`);
+    process.stdout.write(`     ${pc.dim(b.detail)}\n`);
+    if (b.fixes.length > 0) {
+      process.stdout.write(`     ${pc.dim('fix:')}\n`);
+      for (const f of b.fixes) {
+        const lead = f.command ?? f.flag ?? '';
+        const tail = lead ? `  ${pc.cyan(lead)}` : '';
+        process.stdout.write(`       • ${f.label}${tail}\n`);
+      }
+    }
+    process.stdout.write('\n');
+  }
 }
 
 /**
@@ -1440,10 +1597,15 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
   // prereq is missing and the user didn't opt out, fail with a clear remedy.
   const preflight = await preflightApply(plan, opts);
   renderPreflight(preflight);
-  if (preflight.hardFailures.length > 0) {
-    for (const f of preflight.hardFailures) {
-      console.error(pc.red(`✗ ${f}`));
-    }
+  // Persist blockers regardless of outcome — the viewer reads from this.
+  // An empty list is a valid state ("we ran preflight, nothing's blocking").
+  store.recordPreflightBlockers(
+    plan.id,
+    preflight.blockers.map((b) => ({ blockerId: b.id, payload: b })),
+  );
+  const hardBlockers = preflight.blockers.filter((b) => b.severity === 'hard');
+  if (hardBlockers.length > 0) {
+    renderBlockers(hardBlockers);
     process.exit(2);
   }
 
@@ -1799,6 +1961,63 @@ function attachPlanReference(store: RunStateStore, runId: string, planId: string
  * No platform queries. The operator is the source of truth for what's on
  * the platform.
  */
+/**
+ * Run preflight without applying. Persists blockers so the viewer can
+ * pick them up, but never exits non-zero on hard blockers — the whole
+ * point is to inspect state without committing to a deploy. The CLI
+ * caller can flip --json for tooling.
+ */
+async function runPreflight(planId: string, opts: PreflightOpts): Promise<void> {
+  checkConvoyEnv();
+  const plans = new PlanStore(PLANS_DIR);
+  const resolvedPlan = resolvePlan(plans, planId);
+  if ('error' in resolvedPlan) printPlanResolutionFailure(resolvedPlan);
+  const plan = normalizePlan(resolvedPlan.plan);
+
+  // Reuse the apply preflight so checks stay aligned. The opts shape is
+  // the same — we just default the real-* flags and never apply.
+  const applyOpts: ApplyOpts = {
+    realAuthor: opts.realAuthor === true,
+    realRehearsal: opts.realRehearsal === true,
+    realFly: opts.realFly === true,
+    autoApprove: false,
+    autoMerge: false,
+    demo: false,
+    ...(opts.alreadySet !== undefined && { alreadySet: opts.alreadySet }),
+  };
+
+  const report = await preflightApply(plan, applyOpts);
+  const store = new RunStateStore(STATE_PATH);
+  try {
+    store.recordPreflightBlockers(
+      plan.id,
+      report.blockers.map((b) => ({ blockerId: b.id, payload: b })),
+    );
+  } finally {
+    store.close();
+  }
+
+  if (opts.json === true) {
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    return;
+  }
+
+  renderPreflight(report);
+  if (report.blockers.length > 0) {
+    renderBlockers(report.blockers);
+  } else {
+    process.stdout.write(`${pc.green('✓')} ${pc.dim('No blockers — apply would proceed.')}\n`);
+  }
+}
+
+interface PreflightOpts {
+  realAuthor?: boolean;
+  realRehearsal?: boolean;
+  realFly?: boolean;
+  alreadySet?: string[];
+  json?: boolean;
+}
+
 async function runStageSecrets(planId: string): Promise<void> {
   const plans = new PlanStore(PLANS_DIR);
   const resolvedPlan = resolvePlan(plans, planId);
@@ -3336,6 +3555,24 @@ program
   .description('List recent saved plans.')
   .action(() => {
     runListPlans();
+  });
+
+program
+  .command('preflight <planId>')
+  .description(
+    'Run preflight without applying. Persists blockers so the web viewer can render them. Exits 0 even when blocked.',
+  )
+  .option('--real-author', 'preflight real PR author (gh + git remote checks)')
+  .option('--real-rehearsal', 'preflight real local rehearsal (start command + workspace)')
+  .option('--real-fly', 'preflight real platform deploy (CLI/auth/binding)')
+  .option(
+    '--already-set <keys>',
+    'comma-separated env var names declared as already set on the deploy target',
+    (value: string) => value.split(',').map((k) => k.trim()).filter((k) => k.length > 0),
+  )
+  .option('--json', 'emit the full preflight report as JSON')
+  .action(async (planId: string, options: PreflightOpts) => {
+    await runPreflight(planId, options);
   });
 
 program

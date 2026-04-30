@@ -2,7 +2,7 @@ import type { PlanPlatformDecision, PlanPlatformCandidate } from '../core/plan.j
 import type { Platform } from '../core/types.js';
 import type { ScanResult, ServiceNode } from './scanner.js';
 
-const SUPPORTED: Platform[] = ['fly', 'railway', 'vercel', 'cloudrun'];
+const SUPPORTED: Platform[] = ['fly', 'railway', 'vercel', 'cloudrun', 'vps'];
 
 export function pickPlatform(
   scan: ScanResult,
@@ -121,6 +121,35 @@ function scoreOne(platform: Platform, scan: ScanResult): PlanPlatformCandidate {
       // GCP onboarding overhead
       score -= 5;
       reasons.push('extra GCP setup cost');
+      break;
+
+    case 'vps':
+      // VPS is the "I own the box" path. We never *recommend* it over a
+      // managed PaaS unless the operator opts in (CONVOY_VPS_HOST set), or
+      // the repo is already container-shaped enough that VPS is a clean fit
+      // (Dockerfile present, no Next.js Vercel preference). The point isn't
+      // to outscore Fly — it's to be available when an operator says
+      // --platform=vps explicitly without surprising anyone with autopick.
+      if (process.env['CONVOY_VPS_HOST']) {
+        score += 30;
+        reasons.push('CONVOY_VPS_HOST set (operator opted in)');
+      } else {
+        // Without explicit opt-in, stay below the managed PaaSes by default.
+        score -= 10;
+        reasons.push('opt-in only (set CONVOY_VPS_HOST or pass --platform=vps)');
+      }
+      if (scan.hasDockerfile) {
+        score += 10;
+        reasons.push('repo already ships a Dockerfile');
+      }
+      if (isStatic) {
+        score -= 30;
+        reasons.push('static sites belong on a CDN, not a VPS');
+      }
+      if (scan.framework === 'next.js' && !hasWorker) {
+        score -= 10;
+        reasons.push('Next.js fits Vercel better unless you need a box');
+      }
       break;
   }
 

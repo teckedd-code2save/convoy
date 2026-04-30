@@ -6,9 +6,10 @@ import {
   readRecurringPref,
 } from '@/lib/plan-env';
 import { getPlan, type PlanAuthoredFile, type PlanSummary } from '@/lib/plans';
-import { listRunsForPlan, type RunRow } from '@/lib/runs';
+import { listOpenBlockers, listRunsForPlan, type BlockerRow, type RunRow } from '@/lib/runs';
 
 import { ConfigPanel, type PanelRow } from './config-panel';
+import { BlockersSection } from './blockers-section';
 
 const SUPPORTED_PLATFORMS = ['fly', 'railway', 'vercel', 'cloudrun'];
 
@@ -21,6 +22,7 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
 
   const notDeployable = plan.deployability.verdict === 'not-cloud-deployable';
   const runs = listRunsForPlan(plan.id);
+  const blockers = listOpenBlockers(plan.id);
 
   return (
     <article className="space-y-10">
@@ -43,6 +45,10 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
           <p className="text-muted italic">&quot;{plan.target.readmeTitle}&quot;</p>
         ) : null}
       </header>
+
+      {blockers.length > 0 ? (
+        <BlockersSection planId={plan.id} blockers={blockers} />
+      ) : null}
 
       <Summary plan={plan} notDeployable={notDeployable} />
       {plan.lanes && plan.lanes.length > 0 ? <LaneSection plan={plan} /> : null}

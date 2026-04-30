@@ -1,4 +1,4 @@
-export type Platform = 'fly' | 'railway' | 'vercel' | 'cloudrun';
+export type Platform = 'fly' | 'railway' | 'vercel' | 'cloudrun' | 'vps';
 export type PlatformSummary = Platform | 'multi';
 export type LaneRole = 'infra' | 'backend' | 'worker' | 'frontend';
 

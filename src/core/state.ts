@@ -50,6 +50,20 @@ const SCHEMA = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_approvals_run_id ON approvals(run_id);
+
+  CREATE TABLE IF NOT EXISTS preflight_blockers (
+    id          TEXT PRIMARY KEY,
+    plan_id     TEXT NOT NULL,
+    run_id      TEXT,
+    blocker_id  TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'open',
+    created_at  TEXT NOT NULL,
+    resolved_at TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_preflight_blockers_plan_id
+    ON preflight_blockers(plan_id);
 `;
 
 interface RunRow {
@@ -83,6 +97,50 @@ interface ApprovalRow {
   summary: string;
   status: string;
   decided_at: string | null;
+}
+
+/**
+ * Persisted shape of one preflight blocker. The payload field carries the
+ * full PreflightBlocker JSON (id, title, fixes[], etc.) so the viewer can
+ * render it without the CLI being in the loop. Status starts 'open'; the
+ * operator can mark 'acknowledged' to suppress display until the next
+ * preflight run mutates state — preflight itself is the source of truth.
+ */
+interface PreflightBlockerRow {
+  id: string;
+  plan_id: string;
+  run_id: string | null;
+  blocker_id: string;
+  payload: string;
+  status: string;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+export type PreflightBlockerStatus = 'open' | 'acknowledged' | 'resolved';
+
+export interface PersistedBlocker {
+  id: string;
+  planId: string;
+  runId: string | null;
+  blockerId: string;
+  payload: unknown;
+  status: PreflightBlockerStatus;
+  createdAt: Date;
+  resolvedAt: Date | null;
+}
+
+function toPersistedBlocker(row: PreflightBlockerRow): PersistedBlocker {
+  return {
+    id: row.id,
+    planId: row.plan_id,
+    runId: row.run_id,
+    blockerId: row.blocker_id,
+    payload: JSON.parse(row.payload) as unknown,
+    status: row.status as PreflightBlockerStatus,
+    createdAt: new Date(row.created_at),
+    resolvedAt: row.resolved_at ? new Date(row.resolved_at) : null,
+  };
 }
 
 function toRun(row: RunRow): Run {
@@ -338,6 +396,68 @@ export class RunStateStore {
       )
       .all(runId, 'pending');
     return rows.map(toApproval);
+  }
+
+  /**
+   * Replace the open blocker set for a plan. Each preflight invocation is
+   * authoritative — old open rows for this plan get marked 'resolved'
+   * (preflight believes they're cleared) and the current blockers get
+   * inserted as fresh 'open' rows. Acknowledged rows are left alone so
+   * we don't lose audit trail of operator actions, but they no longer
+   * reflect current state once the new rows land.
+   */
+  recordPreflightBlockers(
+    planId: string,
+    blockers: { blockerId: string; payload: unknown }[],
+    runId?: string | null,
+  ): PersistedBlocker[] {
+    const now = new Date().toISOString();
+    const tx = this.#db.transaction(() => {
+      this.#db
+        .prepare(
+          `UPDATE preflight_blockers
+           SET status = 'resolved', resolved_at = ?
+           WHERE plan_id = ? AND status = 'open'`,
+        )
+        .run(now, planId);
+
+      const insert = this.#db.prepare(
+        `INSERT INTO preflight_blockers
+         (id, plan_id, run_id, blocker_id, payload, status, created_at)
+         VALUES (?, ?, ?, ?, ?, 'open', ?)`,
+      );
+      for (const b of blockers) {
+        insert.run(randomUUID(), planId, runId ?? null, b.blockerId, JSON.stringify(b.payload), now);
+      }
+    });
+    tx();
+    return this.listOpenBlockersByPlan(planId);
+  }
+
+  listOpenBlockersByPlan(planId: string): PersistedBlocker[] {
+    const rows = this.#db
+      .prepare<[string], PreflightBlockerRow>(
+        `SELECT * FROM preflight_blockers
+         WHERE plan_id = ? AND status = 'open'
+         ORDER BY created_at DESC`,
+      )
+      .all(planId);
+    return rows.map(toPersistedBlocker);
+  }
+
+  acknowledgeBlocker(id: string): PersistedBlocker | null {
+    const now = new Date().toISOString();
+    this.#db
+      .prepare(
+        `UPDATE preflight_blockers
+         SET status = 'acknowledged', resolved_at = ?
+         WHERE id = ? AND status = 'open'`,
+      )
+      .run(now, id);
+    const row = this.#db
+      .prepare<[string], PreflightBlockerRow>('SELECT * FROM preflight_blockers WHERE id = ?')
+      .get(id);
+    return row ? toPersistedBlocker(row) : null;
   }
 
   close(): void {

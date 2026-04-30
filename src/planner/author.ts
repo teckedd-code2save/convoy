@@ -12,10 +12,9 @@ import { repoName, type ScanResult } from './scanner.js';
  */
 export function draftAuthorSection(scan: ScanResult, platform: Platform): PlanAuthorSection {
   const files: PlanAuthoredFile[] = [];
+  const profile = authoringProfile(platform);
 
-  // Vercel builds natively from source. A Dockerfile there is confusing noise.
-  const containerBased = platform !== 'vercel';
-  if (containerBased && !scan.hasDockerfile) {
+  if (profile.needsDockerfile && !scan.hasDockerfile) {
     files.push(draftDockerfile(scan, platform));
     // A Dockerfile without a .dockerignore means `COPY . .` pulls
     // node_modules, .next, .git, .env*, build caches, IDE state — everything.
@@ -28,15 +27,91 @@ export function draftAuthorSection(scan: ScanResult, platform: Platform): PlanAu
     }
   }
 
-  if (platform === 'fly' && scan.existingPlatform !== 'fly') files.push(draftFlyToml(scan));
-  if (platform === 'railway' && scan.existingPlatform !== 'railway') files.push(draftRailwayToml(scan));
-  if (platform === 'vercel' && scan.existingPlatform !== 'vercel') files.push(draftVercelJson(scan));
-  if (platform === 'cloudrun' && scan.existingPlatform !== 'cloudrun') files.push(draftCloudBuild(scan));
+  if (scan.existingPlatform !== platform) {
+    const platformConfig = profile.platformConfigFile?.(scan);
+    if (platformConfig) files.push(platformConfig);
+  }
+  // Extra files some platforms need beyond their main config (e.g. VPS
+  // ships a deploy.sh + optional nginx snippet alongside the Dockerfile).
+  if (profile.extraFiles) {
+    for (const f of profile.extraFiles(scan)) files.push(f);
+  }
 
-  files.push(draftEnvSchema(scan));
-  files.push(draftConvoyManifest(files));
+  const envSchema = draftEnvSchema(scan, platform);
+  if (envSchema) files.push(envSchema);
+  if (files.length > 0) files.push(draftConvoyManifest(files));
 
   return { convoyAuthoredFiles: files };
+}
+
+/**
+ * Per-platform authoring contract. The point of this seam is that "what
+ * does Convoy author for this platform?" lives in one record per platform
+ * instead of growing if/else branches across draftAuthorSection. Adding a
+ * new platform is one entry, not one diff per file type.
+ *
+ * Properties:
+ *   - needsDockerfile: true if the platform deploys a container image and
+ *     therefore needs the repo to ship a Dockerfile (Vercel auto-detects;
+ *     it doesn't).
+ *   - managesPort: true if the platform injects $PORT at runtime (Fly /
+ *     Vercel / Cloud Run / Railway). Drives both .env.schema authoring
+ *     and preflight expectation filtering — never demand from the operator
+ *     a value the platform sets itself.
+ *   - platformConfigFile: the single platform-specific config file, if any
+ *     (fly.toml / railway.toml / vercel.json / cloudbuild.yaml).
+ *   - extraFiles: anything beyond the standard set. Used by VPS for the
+ *     deploy script. Keep small — most platforms have none.
+ */
+interface AuthoringProfile {
+  needsDockerfile: boolean;
+  managesPort: boolean;
+  platformConfigFile?: (scan: ScanResult) => PlanAuthoredFile | null;
+  extraFiles?: (scan: ScanResult) => PlanAuthoredFile[];
+}
+
+function authoringProfile(platform: Platform): AuthoringProfile {
+  switch (platform) {
+    case 'fly':
+      return {
+        needsDockerfile: true,
+        managesPort: true,
+        platformConfigFile: draftFlyToml,
+      };
+    case 'railway':
+      return {
+        needsDockerfile: true,
+        managesPort: true,
+        platformConfigFile: draftRailwayToml,
+      };
+    case 'vercel':
+      // Vercel builds natively from source. A Dockerfile there is confusing noise.
+      return {
+        needsDockerfile: false,
+        managesPort: true,
+        platformConfigFile: draftVercelJson,
+      };
+    case 'cloudrun':
+      return {
+        needsDockerfile: true,
+        managesPort: true,
+        platformConfigFile: draftCloudBuild,
+      };
+    case 'vps':
+      // VPS deploys are container-based (Convoy runs `docker run` over SSH);
+      // PORT is the operator's choice — they pick what their Docker run
+      // binds and what nginx (if managed) routes to. So we *do* declare PORT
+      // in .env.schema for VPS, unlike the managed PaaSes.
+      return {
+        needsDockerfile: true,
+        managesPort: false,
+        extraFiles: draftVpsFiles,
+      };
+  }
+}
+
+function platformManagesPort(platform: Platform): boolean {
+  return authoringProfile(platform).managesPort;
 }
 
 function draftDockerfile(scan: ScanResult, platform: Platform): PlanAuthoredFile {
@@ -395,14 +470,148 @@ function draftCloudBuild(scan: ScanResult): PlanAuthoredFile {
   };
 }
 
-function draftEnvSchema(scan: ScanResult): PlanAuthoredFile {
-  const vars: string[] = [`PORT=${scan.port ?? 8080}`];
+/**
+ * Files Convoy authors specifically for VPS deploys. The deploy script is
+ * the centerpiece — it's idempotent, runs over SSH, and codifies the
+ * blue/green slot swap. The optional nginx snippet is only emitted when
+ * the operator opts into Convoy-managed nginx; without that opt-in the
+ * operator's existing nginx config is left untouched (per the user's
+ * direction: "if they have their nginx setup and its fine, dont touch").
+ */
+function draftVpsFiles(scan: ScanResult): PlanAuthoredFile[] {
+  const port = scan.port ?? 8080;
+  const health = scan.healthPath ?? '/health';
+  const startCmd = scan.startCommand ?? 'npm start';
+
+  // The deploy script is intentionally readable shell — the operator can
+  // audit it before granting SSH access. It expects three env vars:
+  //   $CONVOY_RELEASE   — short id for this release (slot dir name)
+  //   $CONVOY_SLOT      — 'blue' or 'green' (the idle slot to deploy into)
+  //   $CONVOY_DEPLOY_ROOT — base dir on the box (e.g. /srv/myapp)
+  // It does not touch nginx; the slot swap is a separate runner step.
+  const deployScript = `#!/usr/bin/env bash
+set -euo pipefail
+
+# Convoy VPS deploy script. Runs on the remote box over SSH at apply time.
+# Idempotent. Reads source from \${CONVOY_DEPLOY_ROOT}/source (rsync'd by
+# the runner before this script is invoked).
+
+: "\${CONVOY_RELEASE:?missing}"
+: "\${CONVOY_SLOT:?missing}"
+: "\${CONVOY_DEPLOY_ROOT:?missing}"
+
+cd "\${CONVOY_DEPLOY_ROOT}/source"
+
+IMAGE="convoy-app:\${CONVOY_RELEASE}"
+CONTAINER="convoy-\${CONVOY_SLOT}-\${CONVOY_RELEASE}"
+
+# Build on the box — cheapest delivery (only the source diff transfers
+# via rsync; subsequent layers reuse the local Docker cache).
+docker build -t "\${IMAGE}" .
+
+# Stop any prior container in this slot, then start the new one.
+docker rm -f "convoy-\${CONVOY_SLOT}-prev" >/dev/null 2>&1 || true
+docker rename "convoy-\${CONVOY_SLOT}-current" "convoy-\${CONVOY_SLOT}-prev" >/dev/null 2>&1 || true
+
+# Slot port mapping: blue=18081, green=18082 (internal only; nginx routes).
+SLOT_PORT="$( [ "\${CONVOY_SLOT}" = "blue" ] && echo 18081 || echo 18082 )"
+
+docker run -d \\
+  --name "\${CONTAINER}" \\
+  --restart unless-stopped \\
+  -p "127.0.0.1:\${SLOT_PORT}:${port}" \\
+  --env-file "\${CONVOY_DEPLOY_ROOT}/env" \\
+  "\${IMAGE}"
+
+docker rename "\${CONTAINER}" "convoy-\${CONVOY_SLOT}-current"
+
+# Health check before signaling success — Convoy waits on this output.
+for i in $(seq 1 30); do
+  if curl -fsS "http://127.0.0.1:\${SLOT_PORT}${health}" >/dev/null; then
+    echo "convoy.health.ok slot=\${CONVOY_SLOT} release=\${CONVOY_RELEASE}"
+    exit 0
+  fi
+  sleep 1
+done
+echo "convoy.health.fail slot=\${CONVOY_SLOT} release=\${CONVOY_RELEASE}" >&2
+exit 1
+`;
+
+  // Optional Compose hint — emitted when the scanner finds a compose file.
+  // We don't author one if absent because Compose is workload-specific and
+  // a wrong one would be worse than none. Just leave a short README pointer.
+  const readme = `# Convoy VPS deploy
+
+Convoy ships your container to your box over SSH. To deploy:
+
+    convoy apply <plan-id> --real-vps --vps-host=user@host --vps-deploy-root=/srv/${repoName(scan.localPath)}
+
+By default Convoy:
+  - Rsyncs the source tree to \`<deploy-root>/source\` (only the diff transfers)
+  - Builds the image on the box (cheapest — no registry, no full image upload)
+  - Runs blue/green: idle slot first, health-checks, then traffic swap
+  - Keeps the previous slot running until observe passes (one-step rollback)
+
+Convoy does not touch your nginx config unless you pass \`--vps-manage-nginx\`.
+With that flag, Convoy writes \`/etc/nginx/conf.d/convoy-<app>.conf\` and
+reloads nginx after each promote — atomic upstream swap, no proxy bounce.
+
+Without it, Convoy assumes your nginx already routes to \`127.0.0.1:18081\`
+(blue slot) and \`127.0.0.1:18082\` (green slot); you wire the upstream
+weighting yourself.
+
+The deploy script (\`.convoy/vps-deploy.sh\`) is auditable shell — read it
+before granting Convoy SSH access.
+
+Logs and metrics: Convoy streams \`docker logs\` for the active slot during
+observe, and reads \`${health}\` for health.
+`;
+
+  return [
+    {
+      path: '.convoy/vps-deploy.sh',
+      lines: deployScript.split('\n').length,
+      summary: `idempotent deploy script — blue/green on slot ports 18081/18082`,
+      contentPreview: deployScript,
+    },
+    {
+      path: '.convoy/vps-README.md',
+      lines: readme.split('\n').length,
+      summary: 'how Convoy ships to your box (auditable, opt-in nginx)',
+      contentPreview: readme,
+    },
+  ];
+}
+
+/**
+ * Build the operator-facing env contract. Two rules:
+ *
+ *  1. PORT is included only when the deployment target genuinely needs the
+ *     operator to set it. On Fly/Vercel/Cloud Run/Railway the platform injects
+ *     PORT itself; surfacing it in .env.schema produces a false blocker at
+ *     preflight ("Missing env var PORT") for a value the operator can't and
+ *     shouldn't set. Static sites and pure workers don't bind a port at all.
+ *  2. If no vars are needed, return null and skip authoring the file. An
+ *     empty .env.schema is noise that nudges the operator toward staging
+ *     things they don't need to stage.
+ */
+function draftEnvSchema(scan: ScanResult, platform: Platform): PlanAuthoredFile | null {
+  const vars: string[] = [];
+
+  const portBinds = scan.topology !== 'static' && scan.topology !== 'worker';
+  if (portBinds && !platformManagesPort(platform)) {
+    vars.push(`PORT=${scan.port ?? 8080}`);
+  }
+
   for (const data of scan.dataLayer) {
     if (data.includes('postgres') || data.includes('mysql')) vars.push('DATABASE_URL=');
     if (data.includes('redis')) vars.push('REDIS_URL=');
     if (data.includes('mongo')) vars.push('MONGODB_URL=');
     if (data.includes('elasticsearch')) vars.push('ELASTICSEARCH_URL=');
   }
+
+  if (vars.length === 0) return null;
+
   const content = `# Convoy drafted this schema from scanner evidence.
 # Values are provided at deploy time — nothing sensitive is written here.
 ${vars.join('\n')}
@@ -410,7 +619,7 @@ ${vars.join('\n')}
   return {
     path: '.env.schema',
     lines: content.split('\n').length,
-    summary: `${vars.length} required variables`,
+    summary: `${vars.length} required variable${vars.length === 1 ? '' : 's'}`,
     contentPreview: content,
   };
 }

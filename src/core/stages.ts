@@ -81,6 +81,32 @@ export interface OrchestratorOpts {
   realAuthor?: RealAuthorOpt;
   realFly?: RealFlyOpt;
   realVercel?: RealVercelOpt;
+  realVps?: RealVpsOpt;
+}
+
+/**
+ * VPS deploy configuration — what CanaryStage needs to ship a release to a
+ * box over SSH. Cheaper than --real-fly to set up: no platform account, no
+ * CLI install, just SSH access and a deploy root the operator owns.
+ *
+ * The runner (src/adapters/vps/runner.ts) does the actual rsync + docker
+ * build + slot swap; this struct is the contract the CLI hands the
+ * orchestrator. healthPath / bakeWindowSeconds match the Fly/Vercel shape
+ * so observe-stage code can be shared.
+ */
+export interface RealVpsOpt {
+  host: string;
+  cwd: string;
+  deployRoot: string;
+  sshPort?: number;
+  identityFile?: string;
+  appName: string;
+  manageNginx?: boolean;
+  healthPath?: string;
+  bakeWindowSeconds?: number;
+  thresholdErrorRatePct?: number;
+  thresholdP99Ms?: number;
+  convoyAuthoredFiles?: string[];
 }
 
 export interface RealAuthorOpt {
@@ -986,7 +1012,7 @@ export class CanaryStage extends BaseStage {
     // Unlike the first revision, this gate now probes the platform
     // connection read-only so the operator sees the exact missing lane
     // prerequisite before the deploy command fails late.
-    const isRealDeploy = Boolean(ctx.opts.realFly || ctx.opts.realVercel);
+    const isRealDeploy = Boolean(ctx.opts.realFly || ctx.opts.realVercel || ctx.opts.realVps);
     if (isRealDeploy && ctx.opts.plan) {
       const plan = normalizePlan(ctx.opts.plan);
       for (const lane of plan.lanes) {
@@ -999,6 +1025,9 @@ export class CanaryStage extends BaseStage {
     }
     if (ctx.opts.realVercel) {
       return this.#runRealVercel(ctx, ctx.opts.realVercel);
+    }
+    if (ctx.opts.realVps) {
+      return this.#runRealVps(ctx, ctx.opts.realVps);
     }
 
     this.emit(ctx, 'started', {});
@@ -1179,6 +1208,120 @@ export class CanaryStage extends BaseStage {
       healthy: true,
       preview_url: previewUrl,
       ...(previousProd?.url && { previous_production_url: previousProd.url }),
+    };
+    this.emit(ctx, 'finished', result);
+    return result;
+  }
+
+  /**
+   * VPS canary path: rsync source → run deploy script over SSH → wait for
+   * the health probe baked into the script. The deploy script (authored by
+   * Convoy at planning time) handles the blue/green slot logic; this stage
+   * just kicks it off and surfaces its output.
+   *
+   * Pre-staged reverse: the previous slot's container is renamed to
+   * `convoy-<slot>-prev` by the deploy script before the new one starts —
+   * so a rollback is one nginx swap (or one active-slot file rewrite when
+   * nginx is operator-managed) away.
+   */
+  async #runRealVps(ctx: StageContext, cfg: RealVpsOpt): Promise<unknown> {
+    this.emit(ctx, 'started', { mode: 'real-vps', host: cfg.host, app: cfg.appName });
+
+    const target = {
+      host: cfg.host,
+      deployRoot: cfg.deployRoot,
+      ...(cfg.sshPort !== undefined && { port: cfg.sshPort }),
+      ...(cfg.identityFile !== undefined && { identityFile: cfg.identityFile }),
+    };
+
+    const sshOk = await sshAvailable();
+    if (!sshOk) {
+      throw new Error('OpenSSH client (`ssh`) is not installed. On macOS it ships by default; on Debian/Ubuntu run `apt install openssh-client`.');
+    }
+    const rsyncOk = await rsyncAvailable();
+    if (!rsyncOk) {
+      throw new Error('`rsync` is not installed locally. Convoy uses rsync as the cheapest delivery mechanism (only the diff transfers).');
+    }
+
+    const remote = await probeRemote(target);
+    if (!remote.reachable) {
+      throw new Error(`Cannot reach ${cfg.host} over SSH: ${remote.rawError ?? 'connection refused'}`);
+    }
+    if (!remote.hasDocker) {
+      throw new Error(`Docker is not installed on ${cfg.host}. Run \`convoy vps bootstrap ${cfg.host}\` to install it (idempotent), or install Docker manually.`);
+    }
+    if (cfg.manageNginx && !remote.hasNginx) {
+      throw new Error(`--vps-manage-nginx was set but nginx isn't installed on ${cfg.host}. Either install it or drop --vps-manage-nginx and route traffic yourself.`);
+    }
+    this.emit(ctx, 'progress', {
+      phase: 'vps.connected',
+      user: remote.user,
+      docker: remote.hasDocker,
+      nginx: remote.hasNginx,
+      disk_free_gb: remote.diskFreeGb,
+    });
+
+    await this.awaitApproval(ctx, 'promote', {
+      note: `Rehearsal clean. Deploy to ${cfg.host} (slot=blue/green, nginx=${cfg.manageNginx ? 'managed' : 'operator-owned'})?`,
+      host: cfg.host,
+      deploy_root: cfg.deployRoot,
+    });
+
+    if (!remote.deployRootExists) {
+      this.emit(ctx, 'progress', { phase: 'vps.provisioning', deploy_root: cfg.deployRoot });
+      const provision = await ensureDeployRoot(target);
+      if (!provision.ok) {
+        throw new Error(`Failed to provision ${cfg.deployRoot}: ${provision.stderr.trim().slice(0, 240)}`);
+      }
+    }
+
+    const activeSlot = await readActiveSlot(target);
+    const idleSlot: 'blue' | 'green' = activeSlot === 'blue' ? 'green' : 'blue';
+    this.emit(ctx, 'progress', {
+      phase: 'vps.slot_chosen',
+      active: activeSlot,
+      idle: idleSlot,
+    });
+
+    this.emit(ctx, 'progress', { phase: 'vps.rsync', cwd: cfg.cwd });
+    const rsync = await rsyncSource(target, cfg.cwd, 'source', {
+      onLog: (line) => {
+        if (/error|failed/i.test(line)) this.emit(ctx, 'log', { line });
+      },
+    });
+    if (!rsync.ok) {
+      throw new Error(`rsync to ${cfg.host} failed: ${rsync.stderr.trim().slice(0, 240)}`);
+    }
+
+    const release = `r${Date.now().toString(36)}`;
+    this.emit(ctx, 'progress', { phase: 'vps.deploying', release, slot: idleSlot });
+    const deploy = await executeDeploy(target, release, idleSlot, {
+      onLog: (line) => {
+        if (line.includes('convoy.health.ok') || line.includes('convoy.health.fail') || /error|failed/i.test(line)) {
+          this.emit(ctx, 'log', { line });
+        }
+      },
+      timeoutMs: 10 * 60 * 1000,
+    });
+    if (!deploy.ok) {
+      const diagnosis = await diagnose({
+        stage: 'canary',
+        phase: 'vps_deploy',
+        repoPath: cfg.cwd,
+        convoyAuthoredFiles: cfg.convoyAuthoredFiles ?? [],
+        logs: (deploy.stdout + '\n' + deploy.stderr).split(/\r?\n/).slice(-200),
+        errorMessage: `vps deploy failed on slot ${idleSlot}: ${deploy.stderr.trim().slice(0, 240)}`,
+      }, this.medicTelemetry(ctx));
+      this.emit(ctx, 'diagnosis', diagnosis);
+      throw new Error(`VPS deploy failed: ${deploy.stderr.trim().slice(0, 240)}`);
+    }
+
+    const result = {
+      healthy: true,
+      host: cfg.host,
+      release,
+      idle_slot: idleSlot,
+      previous_slot: activeSlot,
     };
     this.emit(ctx, 'finished', result);
     return result;

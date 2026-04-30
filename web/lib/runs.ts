@@ -231,6 +231,86 @@ export function runsLocation(): string {
   return STATE_PATH;
 }
 
+export interface BlockerFix {
+  kind: 'shell' | 'flag' | 'edit-file' | 'interactive' | 'manual';
+  label: string;
+  command?: string;
+  flag?: string;
+  autoFixable: boolean;
+}
+
+export interface BlockerRow {
+  id: string;
+  planId: string;
+  blockerId: string;
+  status: string;
+  createdAt: string;
+  payload: {
+    id: string;
+    title: string;
+    detail: string;
+    severity: 'hard' | 'soft';
+    fixes: BlockerFix[];
+    docsUrl?: string;
+  };
+}
+
+/**
+ * Read currently-open preflight blockers for a plan. Each preflight run
+ * replaces the open set, so this always returns the most recent verdict —
+ * older versions are marked 'resolved' by recordPreflightBlockers.
+ */
+export function listOpenBlockers(planId: string): BlockerRow[] {
+  const db = openDb();
+  if (!db) return [];
+  try {
+    const rows = db
+      .prepare<[string], {
+        id: string;
+        plan_id: string;
+        run_id: string | null;
+        blocker_id: string;
+        payload: string;
+        status: string;
+        created_at: string;
+      }>(
+        `SELECT * FROM preflight_blockers
+         WHERE plan_id = ? AND status = 'open'
+         ORDER BY created_at DESC`,
+      )
+      .all(planId);
+    return rows.map((r) => ({
+      id: r.id,
+      planId: r.plan_id,
+      blockerId: r.blocker_id,
+      status: r.status,
+      createdAt: r.created_at,
+      payload: safeParse(r.payload) as BlockerRow['payload'],
+    }));
+  } catch {
+    // Table may not exist yet on a DB that predates this migration.
+    return [];
+  }
+}
+
+export function acknowledgeBlocker(planId: string, blockerRowId: string): boolean {
+  const db = openDb();
+  if (!db) return false;
+  try {
+    const now = new Date().toISOString();
+    const result = db
+      .prepare(
+        `UPDATE preflight_blockers
+         SET status = 'acknowledged', resolved_at = ?
+         WHERE id = ? AND plan_id = ? AND status = 'open'`,
+      )
+      .run(now, blockerRowId, planId);
+    return result.changes > 0;
+  } finally {
+    db.close();
+  }
+}
+
 function safeParse(raw: string): unknown {
   try {
     return JSON.parse(raw);

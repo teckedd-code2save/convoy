@@ -18,7 +18,11 @@ import {
   writeRecurringPref,
 } from '@/lib/plan-env';
 import { getPlan } from '@/lib/plans';
-import { decideApproval as decide, listEvents } from '@/lib/runs';
+import {
+  acknowledgeBlocker as acknowledge,
+  decideApproval as decide,
+  listEvents,
+} from '@/lib/runs';
 
 const MEDIC_MODEL = 'claude-opus-4-7';
 const CHAT_MAX_TOKENS = 900;
@@ -672,6 +676,58 @@ export async function importEnvVars(
     unknownKeys: skipped,
     invalidKeys: invalid,
   };
+}
+
+/**
+ * Mark a blocker as acknowledged. The next preflight invocation re-emits
+ * the authoritative state — this is purely a "I've handled this, get it
+ * out of my way until I re-run" signal. We never resolve a blocker by
+ * fiat; resolution comes from preflight not finding it on the next pass.
+ */
+export async function acknowledgeBlocker(
+  planId: string,
+  blockerRowId: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId' };
+  if (!blockerRowId || typeof blockerRowId !== 'string') {
+    return { ok: false, reason: 'invalid blockerRowId' };
+  }
+  const ok = acknowledge(planId, blockerRowId);
+  if (!ok) return { ok: false, reason: 'blocker not found or already resolved' };
+  revalidatePath(`/plans/${planId}`);
+  return { ok: true };
+}
+
+/**
+ * Re-run preflight against the current plan state. Shells out to the CLI
+ * exactly like changePlanPlatform — keeps web isolated from preflight
+ * internals and ensures the source of truth is one code path.
+ */
+export async function rerunPreflight(
+  planId: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId' };
+  const plan = getPlan(planId);
+  if (!plan) return { ok: false, reason: 'plan not found' };
+
+  const convoyHome = resolve(process.cwd(), '..');
+  const args = ['run', 'convoy', '--silent', '--', 'preflight', planId];
+
+  const exitCode = await new Promise<number>((resolveExit) => {
+    const proc = spawn('npm', args, {
+      cwd: convoyHome,
+      env: { ...process.env },
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    proc.on('close', (code) => resolveExit(code ?? 1));
+    proc.on('error', () => resolveExit(1));
+  });
+
+  if (exitCode !== 0) {
+    return { ok: false, reason: `preflight exited ${exitCode}` };
+  }
+  revalidatePath(`/plans/${planId}`);
+  return { ok: true };
 }
 
 export async function setRecurring(
