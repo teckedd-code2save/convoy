@@ -334,17 +334,37 @@ restartPolicyType = "on_failure"
 }
 
 function draftVercelJson(scan: ScanResult): PlanAuthoredFile {
-  const content = `{
-  "framework": "${scan.framework === 'next.js' ? 'nextjs' : 'auto'}",
+  const framework = vercelFrameworkSlug(scan.framework);
+  const content = framework
+    ? `{
+  "framework": "${framework}",
+  "regions": ["iad1"]
+}
+`
+    : `{
   "regions": ["iad1"]
 }
 `;
   return {
     path: 'vercel.json',
     lines: content.split('\n').length,
-    summary: `framework=${scan.framework ?? 'auto'} · regions=iad1`,
+    summary: `framework=${framework ?? 'auto-detect'} · regions=iad1`,
     contentPreview: content,
   };
+}
+
+function vercelFrameworkSlug(framework: string | null): string | null {
+  switch (framework) {
+    case 'next.js':
+      return 'nextjs';
+    case 'vite':
+    case 'astro':
+    case 'remix':
+    case 'sveltekit':
+      return framework;
+    default:
+      return null;
+  }
 }
 
 function draftCloudBuild(scan: ScanResult): PlanAuthoredFile {

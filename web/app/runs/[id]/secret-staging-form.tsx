@@ -36,6 +36,7 @@ export function SecretStagingForm({
   platform,
   flyApp,
   targetCwd,
+  expectedKeys,
   laneLabel,
   projectBinding,
   railwayService,
@@ -50,6 +51,7 @@ export function SecretStagingForm({
   platform: Platform;
   flyApp: string | null;
   targetCwd: string;
+  expectedKeys?: string[];
   laneLabel?: string | null;
   projectBinding?: string | null;
   railwayService?: string | null;
@@ -100,6 +102,7 @@ export function SecretStagingForm({
         platform,
         flyApp,
         targetCwd,
+        expectedKeys,
         projectBinding,
         railwayService,
         railwayEnvironment,
@@ -114,6 +117,7 @@ export function SecretStagingForm({
   }
 
   const submitted = results !== null;
+  const isRecheckOnly = missing.length === 0;
   const counts = useMemo(() => {
     if (!results) return null;
     const c = { staged: 0, declared: 0, skipped: 0, errors: 0 };
@@ -132,6 +136,11 @@ export function SecretStagingForm({
         <p className="text-xs text-muted">
           {laneLabel ? `${laneLabel}` : 'lane'}{projectBinding ? ` · ${projectBinding}` : ''}.
         </p>
+      ) : null}
+      {isRecheckOnly ? (
+        <div className="rounded-lg border border-rule/40 bg-card/60 px-4 py-3 text-sm text-muted">
+          No new secret values are required in this step. Convoy will re-check the lane connection and continue once auth and project binding are ready.
+        </div>
       ) : null}
       <ul className="space-y-3">
         {missing.map((m) => {
@@ -274,19 +283,25 @@ export function SecretStagingForm({
             onClick={handleSubmit}
             className="px-4 py-2 rounded-md bg-accent text-paper text-sm font-medium hover:bg-accent/90 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {pending ? 'Staging…' : 'Stage and continue'}
+            {pending ? 'Checking…' : isRecheckOnly ? 'Re-check and continue' : 'Stage and continue'}
           </button>
           <span className="text-xs text-muted">
-            Convoy writes pasted values to <code>.env.convoy-secrets</code> AND pushes them to {platform} before the deploy starts.
+            {isRecheckOnly
+              ? 'Convoy will probe the lane again and only unblock when the connection is actually ready.'
+              : <>Convoy writes pasted values to <code>.env.convoy-secrets</code> AND pushes them to {platform} before the deploy starts.</>}
           </span>
+        </div>
+      ) : topError ? (
+        <div className="text-sm text-warn">
+          Lane still blocked. Fix the issue above, then submit again.
         </div>
       ) : counts && counts.errors === 0 ? (
         <div className="text-sm text-success">
-          ✓ All keys resolved. Convoy is continuing the run.
+          ✓ Lane ready. Convoy is continuing the run.
         </div>
       ) : (
         <div className="text-sm text-warn">
-          Approval submitted with errors above. Convoy is continuing the run; the deploy will fail loudly if a critical key wasn&apos;t pushed.
+          Lane still blocked. Review the errors above, then submit again.
         </div>
       )}
     </div>

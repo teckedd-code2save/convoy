@@ -90,6 +90,7 @@ case "$shell_name" in
     HELPER_BLOCK=$(cat <<EOF
 $HELPERS_START
 function convoy
+  set invocation_cwd "\$PWD"
   if test -z "\$CONVOY_HOME"
     echo "CONVOY_HOME is not set" 1>&2
     return 1
@@ -97,7 +98,7 @@ function convoy
 
   begin
     cd "\$CONVOY_HOME"; or return 1
-    npm run convoy -- \$argv
+    env CONVOY_INVOCATION_CWD="\$invocation_cwd" npm run convoy -- \$argv
   end
 end
 
@@ -113,8 +114,9 @@ EOF
 $HELPERS_START
 convoy() {
   (
+    local invocation_cwd="\$PWD"
     cd "\$CONVOY_HOME" || return 1
-    npm run convoy -- "\$@"
+    CONVOY_INVOCATION_CWD="\$invocation_cwd" npm run convoy -- "\$@"
   )
 }
 

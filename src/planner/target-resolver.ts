@@ -16,6 +16,7 @@ export interface ResolveOptions {
   cacheDir?: string;
   branch?: string;
   fetch?: boolean;
+  localBaseDir?: string;
   onProgress?: (phase: string, detail?: string) => void;
 }
 
@@ -41,10 +42,11 @@ export async function resolveTarget(
 
   const raw = input.trim();
   const progress = opts.onProgress ?? (() => {});
+  const localBaseDir = resolve(opts.localBaseDir ?? process.cwd());
 
   // Local path takes priority — if it exists on disk and is a directory, use it.
-  if (isLocalDir(raw)) {
-    return { localPath: resolve(raw), source: 'local', repoUrl: null };
+  if (isLocalDir(raw, localBaseDir)) {
+    return { localPath: resolve(localBaseDir, raw), source: 'local', repoUrl: null };
   }
 
   const parsed = parseGithubTarget(raw);
@@ -124,9 +126,10 @@ export async function resolveTarget(
   return resolved;
 }
 
-function isLocalDir(input: string): boolean {
+function isLocalDir(input: string, baseDir: string): boolean {
   try {
-    return existsSync(input) && statSync(input).isDirectory();
+    const localPath = resolve(baseDir, input);
+    return existsSync(localPath) && statSync(localPath).isDirectory();
   } catch {
     return false;
   }

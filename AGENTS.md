@@ -103,6 +103,6 @@ Conventional prefixes: `feat(scope):`, `fix(scope):`, `refactor(scope):`, `docs:
 Co-Authored-By: Codex Opus 4.7 (1M context) <noreply@anthropic.com>
 ```
 
-## Hackathon constraint
+## Hackathon note
 
-Built during the **Built with Opus 4.7** Codex hackathon, Apr 21–26, 2026. All commits must land during that window on the `main` branch of `teckedd-code2save/convoy`. Commits before the hackathon start are not permitted; carrying in pre-written code is not permitted.
+Convoy was originally built during the **Built with Opus 4.7** Codex hackathon, Apr 21–26, 2026. That event window is now over, so the hackathon-only commit timing restrictions no longer apply. Keep normal repo discipline instead: make intentional commits, use the conventional prefixes above, and preserve clear commit bodies that explain why the change exists.

@@ -23,6 +23,7 @@ import {
 import { RunStateStore } from './core/state.js';
 import type { Platform, Run, RunEvent, StageName } from './core/types.js';
 import { probePlatformConnection } from './adapters/connections.js';
+import type { ConnectionCheck, ConnectionStatus } from './adapters/types.js';
 import { buildPlan } from './planner/index.js';
 import { scanRepository } from './planner/scanner.js';
 import { resolveTarget } from './planner/target-resolver.js';
@@ -288,6 +289,11 @@ function convoyWebDir(): string {
   return moduleUrl.pathname;
 }
 
+function targetInvocationDir(): string {
+  const fromEnv = process.env['CONVOY_INVOCATION_CWD'];
+  return fromEnv && fromEnv.trim().length > 0 ? resolve(fromEnv) : process.cwd();
+}
+
 const SYMBOL = {
   run: '◆',
   stage: '▸',
@@ -522,6 +528,7 @@ async function runShip(
   const thinking = startThinking();
   try {
     const resolved = await resolveTarget(target, {
+      localBaseDir: targetInvocationDir(),
       onProgress: (phase, detail) => {
         thinking.stop();
         const line = detail ? `  ${pc.dim(phase)} ${detail}` : `  ${pc.dim(phase)}`;
@@ -607,6 +614,7 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
   const thinking = opts.json ? null : startThinking();
   try {
     const resolved = await resolveTarget(path, {
+      localBaseDir: targetInvocationDir(),
       onProgress: (phase, detail) => {
         if (!opts.json) {
           thinking?.stop();
@@ -991,6 +999,108 @@ function appendEnvStagingChecks(
   });
 }
 
+function isPlatformManagedKeyForPreflight(key: string, platform: Platform): boolean {
+  if (platform === 'vercel') {
+    return key.startsWith('VERCEL_') || key.startsWith('NEXT_PUBLIC_VERCEL_');
+  }
+  if (platform === 'fly') {
+    return key.startsWith('FLY_') || key === 'PORT';
+  }
+  if (platform === 'cloudrun') {
+    return key === 'PORT' || key === 'K_SERVICE' || key === 'K_REVISION' || key === 'K_CONFIGURATION';
+  }
+  return false;
+}
+
+function summarizeBlockingChecks(checks: ConnectionCheck[]): string[] {
+  return checks.filter((check) => check.required && !check.ok).map((check) => check.summary);
+}
+
+function remedyForLaneConnection(
+  checks: ConnectionCheck[],
+  missingSecrets: string[],
+  plan: ConvoyPlan,
+  secretsPath: string,
+): string | undefined {
+  const parts = checks
+    .filter((check) => !check.ok && check.remedy)
+    .map((check) => check.command ? `${check.remedy} (${check.command})` : check.remedy!);
+  if (missingSecrets.length > 0) {
+    parts.push(
+      `${pc.bold(`convoy stage-secrets ${plan.id.slice(0, 8)}`)} or append to ${secretsPath} to stage ${missingSecrets.join(', ')}`,
+    );
+  }
+  return parts.length > 0 ? [...new Set(parts)].join(' · ') : undefined;
+}
+
+async function appendLaneConnectionChecks(
+  plan: ConvoyPlan,
+  opts: ApplyOpts,
+  report: PreflightReport,
+): Promise<void> {
+  const primary = primaryLane(plan);
+  const { staged, secretsPath } = computeStagedKeys(plan, opts);
+
+  for (const lane of plan.lanes) {
+    const platform = lane.platformDecision.chosen;
+    const cwd = lane.servicePath === '.'
+      ? plan.target.localPath
+      : `${plan.target.localPath}/${lane.servicePath}`;
+    const probeOpts =
+      platform === 'fly'
+        ? { appName: opts.flyApp ?? autoFlyAppName(plan), expectedSecrets: lane.secrets.expectedKeys }
+        : { expectedSecrets: lane.secrets.expectedKeys };
+    const connection = await probePlatformConnection(platform, cwd, probeOpts);
+    const missingSecrets = lane.secrets.expectedKeys.filter((key) => (
+      !staged.has(key)
+      && !connection.envKeys.includes(key)
+      && !isPlatformManagedKeyForPreflight(key, platform)
+    ));
+    const blocking = summarizeBlockingChecks(connection.checks);
+    const ok = blocking.length === 0 && missingSecrets.length === 0;
+
+    const readyBits: string[] = [];
+    if (connection.account) readyBits.push(`auth ${connection.account}`);
+    else if (connection.authenticated) readyBits.push('auth ready');
+    if (connection.projectBinding) readyBits.push(`binding ${connection.projectBinding}`);
+    else if (connection.projectLinked) readyBits.push('binding ready');
+    readyBits.push(
+      lane.secrets.expectedKeys.length === 0
+        ? 'no expected secrets'
+        : missingSecrets.length === 0
+          ? `secrets ready (${connection.envKeys.length} on platform${staged.size > 0 ? ', local staging present' : ''})`
+          : `missing secrets ${missingSecrets.join(', ')}`,
+    );
+
+    const missingBits = blocking.length > 0 ? blocking : [];
+    if (missingSecrets.length > 0) missingBits.push(`Convoy still needs ${missingSecrets.join(', ')}`);
+
+    const isPrimary = lane.id === primary.id;
+    const name = isPrimary && platform === 'fly'
+      ? 'real fly'
+      : isPrimary && platform === 'vercel'
+        ? 'real vercel'
+        : `${lane.displayName} → ${platform}`;
+
+    report.checks.push({
+      name,
+      ok,
+      detail: ok
+        ? readyBits.join(' · ')
+        : missingBits.join(' · '),
+      ...(remedyForLaneConnection(connection.checks, missingSecrets, plan, secretsPath)
+        ? { remedy: remedyForLaneConnection(connection.checks, missingSecrets, plan, secretsPath) }
+        : {}),
+    });
+
+    if (!ok && isPrimary && (platform === 'fly' || platform === 'vercel')) {
+      report.hardFailures.push(
+        `${name}: ${missingBits.join(' · ')}. ${remedyForLaneConnection(connection.checks, missingSecrets, plan, secretsPath) ?? 'Resolve the lane readiness issues and rerun apply.'}`,
+      );
+    }
+  }
+}
+
 async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<PreflightReport> {
   plan = normalizePlan(plan);
   const report: PreflightReport = {
@@ -1186,98 +1296,27 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
 
   // --- real deploy (platform-specific) ---
   const platform = plan.platform.chosen;
+  if (opts.realFly) {
+    await appendLaneConnectionChecks(plan, opts, report);
+  }
   if (platform === 'fly') {
-    if (opts.realFly) {
-      const { flyctlAvailable, flyAuthStatus } = await import('./adapters/fly/runner.js');
-      const available = await flyctlAvailable();
-      if (!available) {
-        report.realFly = false;
-        report.hardFailures.push(
-          `real fly: flyctl not installed. Install: \`curl -L https://fly.io/install.sh | sh\`. Or pass --no-real-fly.`,
-        );
-        report.checks.push({ name: 'real fly', ok: false, detail: 'flyctl not in PATH', remedy: 'brew install flyctl' });
-      } else {
-        const auth = await flyAuthStatus();
-        if (!auth.ok) {
-          report.realFly = false;
-          report.hardFailures.push(
-            `real fly: flyctl is not authenticated. Run \`fly auth login\`. Or pass --no-real-fly.`,
-          );
-          report.checks.push({ name: 'real fly', ok: false, detail: 'flyctl not authenticated', remedy: 'fly auth login' });
-        } else {
-          report.checks.push({
-            name: 'real fly',
-            ok: true,
-            detail: `flyctl authed as ${auth.user ?? 'unknown'} — will deploy to Fly`,
-          });
-        }
-      }
-    } else {
+    if (!opts.realFly) {
       report.checks.push({ name: 'real fly', ok: true, detail: 'skipped (--no-real-fly)' });
     }
   } else if (platform === 'vercel') {
-    // For vercel targets, the "realFly" flag is irrelevant; use realFly as the
-    // "real deploy is on" signal and attempt vercel.
     report.realFly = false;
-    if (opts.realFly) {
-      const cwd = primaryLane(plan).servicePath === '.'
-        ? plan.target.localPath
-        : `${plan.target.localPath}/${primaryLane(plan).servicePath}`;
-      const connection = await probePlatformConnection('vercel', cwd);
-      if (!connection.cliAvailable) {
-        report.hardFailures.push(
-          `real vercel: vercel CLI not installed. Install: \`npm i -g vercel\`. Or pass --no-real-fly.`,
-        );
-        report.checks.push({ name: 'real vercel', ok: false, detail: 'vercel CLI not in PATH', remedy: 'npm i -g vercel' });
-      } else {
-        if (!connection.authenticated) {
-          report.hardFailures.push(
-            `real vercel: vercel CLI is not authenticated. Run \`vercel login\`. Or pass --no-real-fly.`,
-          );
-          report.checks.push({ name: 'real vercel', ok: false, detail: 'vercel CLI not authenticated', remedy: 'vercel login' });
-        } else if (!connection.projectLinked) {
-          report.hardFailures.push(
-            `real vercel: workspace is not linked to a Vercel project. Run \`vercel link\`. Or pass --no-real-fly.`,
-          );
-          report.checks.push({ name: 'real vercel', ok: false, detail: 'workspace not linked to Vercel', remedy: 'vercel link' });
-        } else {
-          report.checks.push({
-            name: 'real vercel',
-            ok: true,
-            detail: `vercel authed as ${connection.account ?? 'unknown'} — linked to ${connection.projectBinding ?? 'project'} and ready to deploy`,
-          });
-        }
-      }
-    } else {
+    if (!opts.realFly) {
       report.checks.push({ name: 'real vercel', ok: true, detail: 'skipped (--no-real-fly)' });
     }
   } else {
     report.realFly = false;
-    const cwd = primaryLane(plan).servicePath === '.'
-      ? plan.target.localPath
-      : `${plan.target.localPath}/${primaryLane(plan).servicePath}`;
     if (opts.realFly) {
-      const connection = await probePlatformConnection(platform, cwd);
-      const remedy = connection.recommendedRemedy;
-      const connectionOk = connection.cliAvailable && connection.authenticated && connection.projectLinked;
       report.checks.push({
-        name: `${platform} connection`,
-        ok: connectionOk,
-        detail: connectionOk
-          ? `${platform} ready${connection.account ? ` as ${connection.account}` : ''}${connection.projectBinding ? ` — ${connection.projectBinding}` : ''}`
-          : [
-              !connection.cliAvailable ? 'CLI unavailable' : null,
-              !connection.authenticated ? 'not authenticated' : null,
-              !connection.projectLinked ? 'project/service not linked' : null,
-            ].filter(Boolean).join(' · '),
-        ...(remedy ? { remedy } : {}),
+        name: 'real deploy',
+        ok: true,
+        detail: `skipped — plan chose ${platform}; connection preflight is live lane-by-lane, but the ${platform} deploy runner still replays scripted deploy events today.`,
       });
     }
-    report.checks.push({
-      name: 'real deploy',
-      ok: true,
-      detail: `skipped — plan chose ${platform}; connection preflight is live, but the ${platform} deploy runner still replays scripted deploy events today.`,
-    });
   }
 
   return report;

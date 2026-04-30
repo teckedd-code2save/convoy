@@ -30,6 +30,10 @@ test('all platform probes report missing CLI state consistently', async () => {
     assert.equal(status.projectLinked, false);
     assert.equal(status.rollbackReady, false);
     assert.equal(status.envKeys.length, 0);
+    assert.equal(status.expectedSecrets.length, 0);
+    assert.equal(status.missingExpectedSecrets.length, 0);
+    assert.equal(status.secretsReady, true);
+    assert.ok(status.checks.length >= 4);
     assert.equal(typeof status.recommendedRemedy, 'string');
   }
 });
@@ -62,13 +66,18 @@ test('railway probe parses linked project, environment, service, and env keys', 
     },
   });
 
-  const status = await probe('railway', '/tmp');
+  const status = await probe('railway', '/tmp', { expectedSecrets: ['DATABASE_URL', 'REDIS_URL', 'JWT_SECRET'] });
 
   assert.equal(status.cliAvailable, true);
   assert.equal(status.authenticated, true);
   assert.equal(status.projectLinked, true);
   assert.equal(status.projectBinding, 'platform/production/api');
   assert.deepEqual(status.envKeys, ['DATABASE_URL', 'REDIS_URL']);
+  assert.deepEqual(status.expectedSecrets, ['DATABASE_URL', 'JWT_SECRET', 'REDIS_URL']);
+  assert.deepEqual(status.missingExpectedSecrets, ['JWT_SECRET']);
+  assert.equal(status.secretsReady, false);
+  assert.equal(status.checks.find((check) => check.area === 'project_binding')?.ok, true);
+  assert.deepEqual(status.checks.find((check) => check.area === 'secrets')?.missing, ['JWT_SECRET']);
   assert.deepEqual(status.raw, {
     project: 'platform',
     environment: 'production',
@@ -120,13 +129,17 @@ test('cloudrun probe infers service binding and env keys from cloudbuild and gcl
       },
     });
 
-    const status = await probe('cloudrun', dir);
+    const status = await probe('cloudrun', dir, { expectedSecrets: ['DATABASE_URL', 'NEXT_PUBLIC_API_URL', 'STRIPE_SECRET_KEY'] });
 
     assert.equal(status.cliAvailable, true);
     assert.equal(status.authenticated, true);
     assert.equal(status.projectLinked, true);
     assert.equal(status.projectBinding, 'demo-project/api-service (us-central1)');
     assert.deepEqual(status.envKeys, ['DATABASE_URL', 'NEXT_PUBLIC_API_URL']);
+    assert.deepEqual(status.missingExpectedSecrets, ['STRIPE_SECRET_KEY']);
+    assert.equal(status.secretsReady, false);
+    assert.equal(status.checks.find((check) => check.area === 'auth')?.ok, true);
+    assert.deepEqual(status.checks.find((check) => check.area === 'secrets')?.missing, ['STRIPE_SECRET_KEY']);
     assert.deepEqual(status.raw, {
       project: 'demo-project',
       service: 'api-service',

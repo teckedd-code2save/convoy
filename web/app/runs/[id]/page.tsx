@@ -981,6 +981,8 @@ function NextActionCard({
         { label: 'GitHub', command: 'gh auth login' },
         { label: 'Fly', command: 'fly auth login' },
         { label: 'Vercel', command: 'vercel login' },
+        { label: 'Railway', command: 'railway login' },
+        { label: 'Cloud Run', command: 'gcloud auth login' },
         { label: 'Then', command: 'convoy resume' },
       ],
     };
@@ -1906,6 +1908,36 @@ function StageSecretsApprovalCard({
   const cloudRunService = typeof connectionRaw?.['service'] === 'string' ? connectionRaw['service'] : null;
   const cloudRunRegion = typeof connectionRaw?.['region'] === 'string' ? connectionRaw['region'] : null;
   const sources = Array.isArray(summary['sources']) ? (summary['sources'] as string[]) : [];
+  const expectedKeys = Array.isArray(summary['expected_keys'])
+    ? (summary['expected_keys'] as unknown[]).filter((key): key is string => typeof key === 'string')
+    : [];
+  const rawChecks = Array.isArray(summary['connection_checks']) ? summary['connection_checks'] : [];
+  const connectionChecks: Array<{
+    area: string;
+    ok: boolean;
+    required: boolean;
+    summary: string;
+    remedy?: string;
+    command?: string;
+    missing?: string[];
+  }> = rawChecks
+    .map((check) => {
+      if (!check || typeof check !== 'object') return null;
+      const obj = check as Record<string, unknown>;
+      return {
+        area: typeof obj['area'] === 'string' ? obj['area'] : 'unknown',
+        ok: obj['ok'] === true,
+        required: obj['required'] !== false,
+        summary: typeof obj['summary'] === 'string' ? obj['summary'] : 'unknown readiness check',
+        ...(typeof obj['remedy'] === 'string' ? { remedy: obj['remedy'] } : {}),
+        ...(typeof obj['command'] === 'string' ? { command: obj['command'] } : {}),
+        ...(Array.isArray(obj['missing'])
+          ? { missing: (obj['missing'] as unknown[]).filter((key): key is string => typeof key === 'string') }
+          : {}),
+      };
+    })
+    .filter((check): check is NonNullable<typeof check> => check !== null);
+  const blockingChecks = connectionChecks.filter((check) => check.required && !check.ok);
 
   const rawMissing = summary['missing'];
   const missing: { key: string; severity: 'critical' | 'standard'; purpose: string }[] = Array.isArray(rawMissing)
@@ -1941,13 +1973,54 @@ function StageSecretsApprovalCard({
           {connectionAccount ? `Connected as ${connectionAccount}` : 'Connected'}{projectBinding ? ` · targeting ${projectBinding}` : ''}.
         </p>
       ) : null}
+      {connectionChecks.length > 0 ? (
+        <div className="rounded-lg border border-rule/50 bg-card/70 p-4 space-y-3">
+          <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted">
+            <span>Lane readiness</span>
+            {blockingChecks.length > 0 ? (
+              <span className="text-warn">· {blockingChecks.length} blocker{blockingChecks.length === 1 ? '' : 's'}</span>
+            ) : (
+              <span className="text-success">· ready for deploy</span>
+            )}
+          </div>
+          <div className="space-y-2">
+            {connectionChecks.map((check) => (
+              <div key={`${check.area}-${check.summary}`} className="rounded-md border border-rule/40 px-3 py-2">
+                <div className="flex items-start gap-3">
+                  <span className={`mt-0.5 inline-block h-2 w-2 rounded-full ${check.ok ? 'bg-success' : check.required ? 'bg-warn' : 'bg-muted'}`} />
+                  <div className="flex-1 space-y-1">
+                    <div className="text-sm text-ink">{check.summary}</div>
+                    {(check.remedy || check.command || (check.missing && check.missing.length > 0)) ? (
+                      <div className="text-xs text-muted space-y-1">
+                        {check.missing && check.missing.length > 0 ? (
+                          <div>Missing: <code>{check.missing.join(', ')}</code></div>
+                        ) : null}
+                        {check.remedy ? <div>{check.remedy}</div> : null}
+                        {check.command ? <div><code>{check.command}</code></div> : null}
+                      </div>
+                    ) : null}
+                  </div>
+                  <span className={`text-[10px] uppercase tracking-wider font-medium ${check.ok ? 'text-success' : check.required ? 'text-warn' : 'text-muted'}`}>
+                    {check.ok ? 'ready' : check.required ? 'blocked' : 'advisory'}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
       {sources.length > 0 ? (
         <p className="text-xs text-muted">
           Required keys derived from: {sources.join(', ')}.
         </p>
       ) : null}
+      {blockingChecks.length > 0 ? (
+        <div className="rounded-md border border-warn/40 bg-warn/10 px-4 py-3 text-sm text-warn">
+          Fix the lane blockers above, then re-check here. Convoy will keep this gate pending until auth, binding, and required secrets are actually ready.
+        </div>
+      ) : null}
 
-      {planId && missing.length > 0 ? (
+      {planId ? (
         <SecretStagingForm
           runId={runId}
           approvalId={approval.id}
@@ -1956,6 +2029,7 @@ function StageSecretsApprovalCard({
           platform={platform}
           flyApp={flyApp}
           targetCwd={targetCwd}
+          expectedKeys={expectedKeys}
           laneLabel={describeLaneScope(scope)}
           projectBinding={projectBinding}
           railwayService={railwayService}

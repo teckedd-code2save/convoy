@@ -101,11 +101,11 @@ If you ran `./scripts/install`, you also get raw shell helpers:
 
 ```bash
 convoy status
-convoy ship /absolute/path/to/repo
+convoy ship .
 convoy-ship-here --demo
 ```
 
-`convoy-ship-here` uses the current repo's absolute path, which is the safest way to ship a local checkout.
+The installed `convoy` helper preserves the directory you launched it from, so `convoy ship .` targets your current repo even though the CLI itself runs from `CONVOY_HOME`. `convoy-ship-here` remains the explicit absolute-path variant.
 
 ---
 
@@ -239,7 +239,7 @@ If you installed the shell helpers, the same commands work without `npm run`:
 ```bash
 convoy plan <path-or-url>
 convoy apply <plan-id>
-convoy ship /absolute/path/to/repo
+convoy ship .
 convoy-ship-here
 ```
 

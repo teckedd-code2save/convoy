@@ -977,15 +977,15 @@ export class CanaryStage extends BaseStage {
   override async run(ctx: StageContext): Promise<unknown> {
     // Secrets gate — fires only when we're about to do a real platform
     // deploy. Computes expected vs staged keys; if any required keys are
-    // missing AND the operator hasn't self-declared them, request a
+    // missing, OR if auth/project binding is missing, request a
     // stage_secrets approval and pause. The approval form (web UI) lets
     // the operator paste values inline; the server action writes them to
     // .env.convoy-secrets AND pushes them to the platform via the
     // platform CLI, so the deploy that follows actually has them.
     //
-    // No probing of platform state — operator's declarations (file or
-    // --already-set) are trusted as the source of truth. Verification
-    // can be added later as a separate gate.
+    // Unlike the first revision, this gate now probes the platform
+    // connection read-only so the operator sees the exact missing lane
+    // prerequisite before the deploy command fails late.
     const isRealDeploy = Boolean(ctx.opts.realFly || ctx.opts.realVercel);
     if (isRealDeploy && ctx.opts.plan) {
       const plan = normalizePlan(ctx.opts.plan);
@@ -1219,11 +1219,12 @@ export class CanaryStage extends BaseStage {
     });
     const connectionKeys = new Set(connection.envKeys);
     const missing = [...expected].filter((k) => !staged.has(k) && !connectionKeys.has(k));
+    const blockingChecks = connection.checks.filter((check) => check.required && !check.ok);
 
     // Filter platform-managed keys we never expect operators to stage.
     const filtered = missing.filter((k) => !isPlatformManagedKey(k, lane.platformDecision.chosen));
 
-    if (filtered.length === 0) {
+    if (filtered.length === 0 && blockingChecks.length === 0) {
       this.emit(ctx, 'progress', {
         phase: 'secrets.staged',
         sources,
@@ -1244,8 +1245,11 @@ export class CanaryStage extends BaseStage {
       missing: filtered,
       sources,
       platform,
-      note: 'pausing for stage_secrets approval — paste values in the UI or self-declare and Convoy will push to the platform before the deploy command runs',
-      connection_state: connection.authenticated ? 'connected' : 'disconnected',
+      note: blockingChecks.length > 0
+        ? 'pausing for lane readiness — fix auth/project binding below, then re-check from the run UI before deploy'
+        : 'pausing for stage_secrets approval — paste values in the UI or self-declare and Convoy will push to the platform before the deploy command runs',
+      connection_state: blockingChecks.length > 0 ? 'blocked' : 'ready_for_secrets',
+      connection_checks: connection.checks,
     }, lane.id);
 
     await this.awaitApproval(ctx, 'stage_secrets', {
@@ -1263,14 +1267,19 @@ export class CanaryStage extends BaseStage {
       plan_id: plan.id,
       fly_app: flyAppName,
       target_cwd: targetCwd,
+      expected_keys: [...expected],
+      missing_expected_keys: filtered,
+      blocking_connection_checks: blockingChecks,
+      connection_checks: connection.checks,
       project_binding: connection.projectBinding,
       connection_account: connection.account,
       connection_env_keys: connection.envKeys,
       connection_raw: connection.raw ?? null,
       secrets_path: secretsPath,
       already_set_path: alreadyPath,
-      note:
-        'These required env vars aren\'t staged yet. Paste each value below to push it to the platform now, mark it as already set if you set it elsewhere, or skip with explicit acknowledgment.',
+      note: blockingChecks.length > 0
+        ? 'This lane is not ready yet. Fix the auth or project-binding gaps below, then re-check. If secrets are also missing, you can still stage them here once the lane connection is ready.'
+        : 'These required env vars aren\'t staged yet. Paste each value below to push it to the platform now, mark it as already set if you set it elsewhere, or skip with explicit acknowledgment.',
     }, lane.id);
 
     this.emit(ctx, 'progress', { phase: 'secrets.gate.cleared', missing: filtered }, lane.id);

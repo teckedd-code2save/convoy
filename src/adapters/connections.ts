@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { Platform } from '../core/types.js';
-import type { ConnectionStatus } from './types.js';
+import type { ConnectionCheck, ConnectionStatus } from './types.js';
 import { flyAppExists, flyAuthStatus, flyctlAvailable } from './fly/runner.js';
 import { vercelAuthStatus, vercelAvailable, vercelProjectInfo } from './vercel/runner.js';
 
@@ -98,13 +98,101 @@ export function createPlatformConnectionProbe(overrides: Partial<ProbeDependenci
 
 export const probePlatformConnection = createPlatformConnectionProbe();
 
+function normalizeExpectedSecrets(expectedSecrets: string[] | undefined): string[] {
+  return [...new Set((expectedSecrets ?? []).filter((key) => key.length > 0))].sort();
+}
+
+function summarizeMissingSecrets(platform: Platform, missing: string[]): Pick<ConnectionCheck, 'summary' | 'remedy'> {
+  if (missing.length === 0) {
+    return {
+      summary: `${platform} already has every expected secret Convoy looked for.`,
+    };
+  }
+  const list = missing.join(', ');
+  switch (platform) {
+    case 'vercel':
+      return {
+        summary: `Missing on Vercel: ${list}.`,
+        remedy: 'Set them in Vercel or stage them through Convoy before the preview deploy runs.',
+      };
+    case 'railway':
+      return {
+        summary: `Missing on Railway: ${list}.`,
+        remedy: 'Set them on the linked Railway service/environment or stage them through Convoy before deploy.',
+      };
+    case 'cloudrun':
+      return {
+        summary: `Missing on Cloud Run: ${list}.`,
+        remedy: 'Set them on the bound Cloud Run service or stage them through Convoy before deploy.',
+      };
+    case 'fly':
+      return {
+        summary: `Missing on Fly: ${list}.`,
+        remedy: 'Set them with `flyctl secrets set ... --stage` or stage them through Convoy before deploy.',
+      };
+  }
+}
+
+function buildSecretsCheck(platform: Platform, expectedSecrets: string[], envKeys: string[]): ConnectionCheck {
+  const missing = expectedSecrets.filter((key) => !envKeys.includes(key));
+  const summary = summarizeMissingSecrets(platform, missing);
+  return {
+    area: 'secrets',
+    ok: missing.length === 0,
+    required: false,
+    summary:
+      expectedSecrets.length === 0
+        ? `No expected secrets declared for this ${platform} lane.`
+        : `${envKeys.length}/${expectedSecrets.length} expected secret${expectedSecrets.length === 1 ? '' : 's'} visible on ${platform}. ${summary.summary}`,
+    ...(summary.remedy ? { remedy: summary.remedy } : {}),
+    ...(missing.length > 0 ? { missing } : {}),
+  };
+}
+
+function recommendedRemedyFromChecks(checks: ConnectionCheck[]): string | undefined {
+  return checks.find((check) => check.required && !check.ok)?.remedy
+    ?? checks.find((check) => check.area === 'secrets' && !check.ok)?.remedy;
+}
+
 async function probeFlyConnection(
   _cwd: string,
   opts: ProbeOptions,
   deps: ProbeDependencies,
 ): Promise<ConnectionStatus> {
+  const expectedSecrets = normalizeExpectedSecrets(opts.expectedSecrets);
   const cliAvailable = await deps.flyctlAvailable();
   if (!cliAvailable) {
+    const checks: ConnectionCheck[] = [
+      {
+        area: 'cli',
+        ok: false,
+        required: true,
+        summary: 'flyctl is not installed.',
+        remedy: 'Install flyctl with `brew install flyctl` or the official install script.',
+        command: 'brew install flyctl',
+      },
+      {
+        area: 'auth',
+        ok: false,
+        required: true,
+        summary: 'Fly authentication cannot be checked until flyctl is installed.',
+      },
+      {
+        area: 'project_binding',
+        ok: false,
+        required: Boolean(opts.appName),
+        summary: opts.appName
+          ? `Fly app \`${opts.appName}\` cannot be checked until flyctl is installed.`
+          : 'No Fly app binding was supplied for this lane yet.',
+      },
+      buildSecretsCheck('fly', expectedSecrets, []),
+      {
+        area: 'rollback',
+        ok: false,
+        required: false,
+        summary: 'Rollback is unavailable until flyctl can inspect the target app.',
+      },
+    ];
     return {
       platform: 'fly',
       cliAvailable: false,
@@ -112,12 +200,56 @@ async function probeFlyConnection(
       projectLinked: false,
       rollbackReady: false,
       envKeys: [],
-      recommendedRemedy: 'Install flyctl with `brew install flyctl` or the official install script.',
+      expectedSecrets,
+      missingExpectedSecrets: expectedSecrets,
+      secretsReady: expectedSecrets.length === 0,
+      checks,
+      recommendedRemedy: recommendedRemedyFromChecks(checks),
     };
   }
   const auth = await deps.flyAuthStatus();
   const envKeys = opts.appName ? await listFlySecrets(opts.appName, deps) : [];
   const projectLinked = opts.appName ? await deps.flyAppExists(opts.appName) : false;
+  const checks: ConnectionCheck[] = [
+    {
+      area: 'cli',
+      ok: true,
+      required: true,
+      summary: 'flyctl is installed.',
+    },
+    {
+      area: 'auth',
+      ok: auth.ok,
+      required: true,
+      summary: auth.ok
+        ? `Authenticated to Fly as ${auth.user ?? 'unknown user'}.`
+        : 'Fly CLI is not authenticated.',
+      ...(auth.ok ? {} : { remedy: 'Run `fly auth login`.', command: 'fly auth login' }),
+    },
+    {
+      area: 'project_binding',
+      ok: opts.appName ? projectLinked : false,
+      required: Boolean(opts.appName),
+      summary: opts.appName
+        ? (projectLinked
+          ? `Fly app \`${opts.appName}\` is reachable.`
+          : `Fly app \`${opts.appName}\` does not exist or is not visible to the current account.`)
+        : 'No Fly app name was supplied for this lane yet.',
+      ...(opts.appName && !projectLinked
+        ? { remedy: `Create or select the Fly app (${opts.appName}).` }
+        : {}),
+    },
+    buildSecretsCheck('fly', expectedSecrets, envKeys),
+    {
+      area: 'rollback',
+      ok: projectLinked,
+      required: false,
+      summary: projectLinked
+        ? 'Rollback can target the existing Fly app releases.'
+        : 'Rollback is unavailable until Convoy knows which Fly app this lane deploys to.',
+    },
+  ];
+  const missingExpectedSecrets = expectedSecrets.filter((key) => !envKeys.includes(key));
   return {
     platform: 'fly',
     cliAvailable,
@@ -127,11 +259,11 @@ async function probeFlyConnection(
     account: auth.user,
     projectBinding: opts.appName,
     envKeys,
-    recommendedRemedy: !auth.ok
-      ? 'Run `fly auth login`.'
-      : !projectLinked
-        ? `Create or select the Fly app (${opts.appName ?? 'missing app name'}).`
-        : undefined,
+    expectedSecrets,
+    missingExpectedSecrets,
+    secretsReady: missingExpectedSecrets.length === 0,
+    checks,
+    recommendedRemedy: recommendedRemedyFromChecks(checks),
   };
 }
 
@@ -151,11 +283,41 @@ async function listFlySecrets(appName: string, deps: ProbeDependencies): Promise
 
 async function probeVercelConnection(
   cwd: string,
-  _opts: ProbeOptions,
+  opts: ProbeOptions,
   deps: ProbeDependencies,
 ): Promise<ConnectionStatus> {
+  const expectedSecrets = normalizeExpectedSecrets(opts.expectedSecrets);
   const cliAvailable = await deps.vercelAvailable();
   if (!cliAvailable) {
+    const checks: ConnectionCheck[] = [
+      {
+        area: 'cli',
+        ok: false,
+        required: true,
+        summary: 'Vercel CLI is not installed.',
+        remedy: 'Install the Vercel CLI with `npm i -g vercel`.',
+        command: 'npm i -g vercel',
+      },
+      {
+        area: 'auth',
+        ok: false,
+        required: true,
+        summary: 'Vercel authentication cannot be checked until the CLI is installed.',
+      },
+      {
+        area: 'project_binding',
+        ok: false,
+        required: true,
+        summary: 'Workspace linking cannot be checked until the Vercel CLI is installed.',
+      },
+      buildSecretsCheck('vercel', expectedSecrets, []),
+      {
+        area: 'rollback',
+        ok: false,
+        required: false,
+        summary: 'Preview/prod rollback metadata is unavailable until the workspace is linked.',
+      },
+    ];
     return {
       platform: 'vercel',
       cliAvailable: false,
@@ -163,12 +325,55 @@ async function probeVercelConnection(
       projectLinked: false,
       rollbackReady: false,
       envKeys: [],
-      recommendedRemedy: 'Install the Vercel CLI with `npm i -g vercel`.',
+      expectedSecrets,
+      missingExpectedSecrets: expectedSecrets,
+      secretsReady: expectedSecrets.length === 0,
+      checks,
+      recommendedRemedy: recommendedRemedyFromChecks(checks),
     };
   }
   const auth = await deps.vercelAuthStatus();
   const project = await deps.vercelProjectInfo(cwd);
   const envKeys = auth.ok ? await listVercelEnvKeys(cwd, deps) : [];
+  const projectBinding = project ? `${project.name}${project.accountId ? ` (${project.accountId})` : ''}` : undefined;
+  const checks: ConnectionCheck[] = [
+    {
+      area: 'cli',
+      ok: true,
+      required: true,
+      summary: 'Vercel CLI is installed.',
+    },
+    {
+      area: 'auth',
+      ok: auth.ok,
+      required: true,
+      summary: auth.ok
+        ? `Authenticated to Vercel as ${auth.user ?? 'unknown user'}.`
+        : 'Vercel CLI is not authenticated.',
+      ...(auth.ok ? {} : { remedy: 'Run `vercel login`.', command: 'vercel login' }),
+    },
+    {
+      area: 'project_binding',
+      ok: project !== null,
+      required: true,
+      summary: project
+        ? `Workspace is linked to ${projectBinding}.`
+        : 'This workspace is not linked to a Vercel project.',
+      ...(project
+        ? {}
+        : { remedy: 'Link the workspace with `vercel link` before deploying.', command: 'vercel link' }),
+    },
+    buildSecretsCheck('vercel', expectedSecrets, envKeys),
+    {
+      area: 'rollback',
+      ok: project !== null,
+      required: false,
+      summary: project
+        ? 'Rollback can inspect prior READY Vercel deployments for this linked project.'
+        : 'Rollback metadata is unavailable until the workspace is linked.',
+    },
+  ];
+  const missingExpectedSecrets = expectedSecrets.filter((key) => !envKeys.includes(key));
   return {
     platform: 'vercel',
     cliAvailable,
@@ -176,13 +381,13 @@ async function probeVercelConnection(
     projectLinked: project !== null,
     rollbackReady: project !== null,
     account: auth.user,
-    projectBinding: project ? `${project.name}${project.accountId ? ` (${project.accountId})` : ''}` : undefined,
+    projectBinding,
     envKeys,
-    recommendedRemedy: !auth.ok
-      ? 'Run `vercel login`.'
-      : project === null
-        ? 'Link the workspace with `vercel link` before deploying.'
-        : undefined,
+    expectedSecrets,
+    missingExpectedSecrets,
+    secretsReady: missingExpectedSecrets.length === 0,
+    checks,
+    recommendedRemedy: recommendedRemedyFromChecks(checks),
   };
 }
 
@@ -202,11 +407,41 @@ async function listVercelEnvKeys(cwd: string, deps: ProbeDependencies): Promise<
 
 async function probeRailwayConnection(
   cwd: string,
-  _opts: ProbeOptions,
+  opts: ProbeOptions,
   deps: ProbeDependencies,
 ): Promise<ConnectionStatus> {
+  const expectedSecrets = normalizeExpectedSecrets(opts.expectedSecrets);
   const version = await deps.runCommand('railway', ['--version'], { cwd, timeoutMs: 5000 });
   if (!version.ok) {
+    const checks: ConnectionCheck[] = [
+      {
+        area: 'cli',
+        ok: false,
+        required: true,
+        summary: 'Railway CLI is not installed.',
+        remedy: 'Install Railway CLI with `npm i -g @railway/cli`.',
+        command: 'npm i -g @railway/cli',
+      },
+      {
+        area: 'auth',
+        ok: false,
+        required: true,
+        summary: 'Railway authentication cannot be checked until the CLI is installed.',
+      },
+      {
+        area: 'project_binding',
+        ok: false,
+        required: true,
+        summary: 'Project/service binding cannot be checked until the Railway CLI is installed.',
+      },
+      buildSecretsCheck('railway', expectedSecrets, []),
+      {
+        area: 'rollback',
+        ok: false,
+        required: false,
+        summary: 'Rollback stays manual until the target Railway service is linked.',
+      },
+    ];
     return {
       platform: 'railway',
       cliAvailable: false,
@@ -214,7 +449,11 @@ async function probeRailwayConnection(
       projectLinked: false,
       rollbackReady: false,
       envKeys: [],
-      recommendedRemedy: 'Install Railway CLI with `npm i -g @railway/cli`.',
+      expectedSecrets,
+      missingExpectedSecrets: expectedSecrets,
+      secretsReady: expectedSecrets.length === 0,
+      checks,
+      recommendedRemedy: recommendedRemedyFromChecks(checks),
     };
   }
   const whoami = await deps.runCommand('railway', ['whoami'], { cwd, timeoutMs: 5000 });
@@ -229,6 +468,47 @@ async function probeRailwayConnection(
   ]
     .filter(Boolean)
     .join('');
+  const checks: ConnectionCheck[] = [
+    {
+      area: 'cli',
+      ok: true,
+      required: true,
+      summary: 'Railway CLI is installed.',
+    },
+    {
+      area: 'auth',
+      ok: whoami.ok,
+      required: true,
+      summary: whoami.ok
+        ? `Authenticated to Railway as ${whoami.stdout.trim() || 'unknown user'}.`
+        : 'Railway CLI is not authenticated.',
+      ...(whoami.ok ? {} : { remedy: 'Run `railway login`.', command: 'railway login' }),
+    },
+    {
+      area: 'project_binding',
+      ok: projectLinked,
+      required: true,
+      summary: projectLinked
+        ? `Linked to ${binding}.`
+        : 'This workspace is not linked to a Railway project and service yet.',
+      ...(projectLinked
+        ? {}
+        : {
+            remedy: 'Link the workspace with `railway link` so Convoy can target the right Railway project/service.',
+            command: 'railway link',
+          }),
+    },
+    buildSecretsCheck('railway', expectedSecrets, envKeys),
+    {
+      area: 'rollback',
+      ok: projectLinked,
+      required: false,
+      summary: projectLinked
+        ? 'Railway rollback still remains manual in this revision.'
+        : 'Rollback context is unavailable until the Railway project/service is linked.',
+    },
+  ];
+  const missingExpectedSecrets = expectedSecrets.filter((key) => !envKeys.includes(key));
   return {
     platform: 'railway',
     cliAvailable: true,
@@ -238,11 +518,11 @@ async function probeRailwayConnection(
     account: whoami.stdout.trim() || undefined,
     projectBinding: binding || undefined,
     envKeys,
-    recommendedRemedy: !whoami.ok
-      ? 'Run `railway login`.'
-      : !projectLinked
-        ? 'Link the workspace with `railway link` so Convoy can target a specific Railway service.'
-        : 'Railway rollback remains manual in this revision.',
+    expectedSecrets,
+    missingExpectedSecrets,
+    secretsReady: missingExpectedSecrets.length === 0,
+    checks,
+    recommendedRemedy: recommendedRemedyFromChecks(checks) ?? 'Railway rollback remains manual in this revision.',
     raw: {
       project: parsedStatus.projectName,
       environment: parsedStatus.environmentName,
@@ -303,8 +583,37 @@ async function probeCloudRunConnection(
   opts: ProbeOptions,
   deps: ProbeDependencies,
 ): Promise<ConnectionStatus> {
+  const expectedSecrets = normalizeExpectedSecrets(opts.expectedSecrets);
   const version = await deps.runCommand('gcloud', ['version', '--format=json'], { cwd, timeoutMs: 5000 });
   if (!version.ok) {
+    const checks: ConnectionCheck[] = [
+      {
+        area: 'cli',
+        ok: false,
+        required: true,
+        summary: 'Google Cloud SDK (`gcloud`) is not installed.',
+        remedy: 'Install the Google Cloud SDK (`gcloud`).',
+      },
+      {
+        area: 'auth',
+        ok: false,
+        required: true,
+        summary: 'gcloud authentication cannot be checked until the SDK is installed.',
+      },
+      {
+        area: 'project_binding',
+        ok: false,
+        required: true,
+        summary: 'Project/service binding cannot be checked until gcloud is installed.',
+      },
+      buildSecretsCheck('cloudrun', expectedSecrets, []),
+      {
+        area: 'rollback',
+        ok: false,
+        required: false,
+        summary: 'Rollback metadata is unavailable until gcloud can inspect the target project/service.',
+      },
+    ];
     return {
       platform: 'cloudrun',
       cliAvailable: false,
@@ -312,7 +621,11 @@ async function probeCloudRunConnection(
       projectLinked: false,
       rollbackReady: false,
       envKeys: [],
-      recommendedRemedy: 'Install the Google Cloud SDK (`gcloud`).',
+      expectedSecrets,
+      missingExpectedSecrets: expectedSecrets,
+      secretsReady: expectedSecrets.length === 0,
+      checks,
+      recommendedRemedy: recommendedRemedyFromChecks(checks),
     };
   }
   const auth = await deps.runCommand('gcloud', ['auth', 'list', '--filter=status:ACTIVE', '--format=value(account)'], {
@@ -339,22 +652,72 @@ async function probeCloudRunConnection(
     : hasProject
       ? projectId
       : undefined;
+  const authOk = auth.ok && auth.stdout.trim().length > 0;
+  const checks: ConnectionCheck[] = [
+    {
+      area: 'cli',
+      ok: true,
+      required: true,
+      summary: 'gcloud is installed.',
+    },
+    {
+      area: 'auth',
+      ok: authOk,
+      required: true,
+      summary: authOk
+        ? `Authenticated to Google Cloud as ${auth.stdout.trim()}.`
+        : 'gcloud has no active authenticated account.',
+      ...(authOk ? {} : { remedy: 'Run `gcloud auth login`.', command: 'gcloud auth login' }),
+    },
+    {
+      area: 'project_binding',
+      ok: projectLinked,
+      required: true,
+      summary: !hasProject
+        ? 'gcloud has no active project configured for this lane.'
+        : !serviceName
+          ? 'Convoy could not infer which Cloud Run service this lane should target.'
+          : serviceDescribe?.ok === false
+            ? `Targeting ${projectBinding}, but the existing service could not be inspected. Convoy can still deploy if the binding is correct.`
+            : `Targeting ${projectBinding}.`
+        ,
+      ...(!hasProject
+        ? {
+            remedy: 'Set the target GCP project with `gcloud config set project <id>`.',
+            command: 'gcloud config set project <id>',
+          }
+        : !serviceName
+          ? {
+              remedy:
+                'Add a Cloud Run service binding (for example via cloudbuild.yaml) or pass an explicit service name before staging secrets.',
+            }
+          : {}),
+    },
+    buildSecretsCheck('cloudrun', expectedSecrets, envKeys),
+    {
+      area: 'rollback',
+      ok: projectLinked,
+      required: false,
+      summary: projectLinked
+        ? 'Rollback can target the configured Cloud Run project/service once the real runner lands.'
+        : 'Rollback metadata is unavailable until the Cloud Run project/service binding is known.',
+    },
+  ];
+  const missingExpectedSecrets = expectedSecrets.filter((key) => !envKeys.includes(key));
   return {
     platform: 'cloudrun',
     cliAvailable: true,
-    authenticated: auth.ok && auth.stdout.trim().length > 0,
+    authenticated: authOk,
     projectLinked,
     rollbackReady: projectLinked,
     account: auth.stdout.trim() || undefined,
     projectBinding,
     envKeys,
-    recommendedRemedy: !auth.ok || auth.stdout.trim().length === 0
-      ? 'Run `gcloud auth login`.'
-      : !hasProject
-        ? 'Set the target GCP project with `gcloud config set project <id>`.'
-        : !serviceName
-          ? 'Add a Cloud Run service binding (for example via cloudbuild.yaml) or pass an explicit service name before staging secrets.'
-          : undefined,
+    expectedSecrets,
+    missingExpectedSecrets,
+    secretsReady: missingExpectedSecrets.length === 0,
+    checks,
+    recommendedRemedy: recommendedRemedyFromChecks(checks),
     raw: {
       project: hasProject ? projectId : undefined,
       service: serviceName,

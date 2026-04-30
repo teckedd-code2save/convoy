@@ -6,10 +6,12 @@ import { resolve } from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 import { revalidatePath } from 'next/cache';
 
+import { probePlatformConnection } from '../../src/adapters/connections.js';
 import { appendChatTurn, listChatTurns } from '@/lib/medic-chat';
 import {
   appendAlreadySet,
   appendSecret,
+  computeStagedState,
   computeExpectedKeys,
   parseEnvText,
   unstageKey,
@@ -39,24 +41,24 @@ export type SecretAction =
  * (`vercel env add` / `flyctl secrets set` / Railway / Cloud Run) so the
  * deploy command that follows actually has the value. For each "already set" mark: write to
  * .env.convoy-already-set so future runs don't re-prompt. After all
- * actions are applied, approve the approval — the orchestrator unblocks
- * and CanaryStage proceeds with the platform deploy.
+ * actions are applied, re-probe the lane. Only approve the approval once
+ * auth, project binding, and required secrets are all ready; otherwise the
+ * gate stays pending and the UI surfaces the exact blocker.
  *
- * Best-effort on the platform push: the function returns per-key results
- * so the UI can surface "wrote locally but platform push failed" cases,
- * but a partial failure does NOT block the approval. The deploy step that
- * follows will fail loudly if a critical secret didn't actually land,
- * which is the point — Convoy never silently swallows a half-staged state.
+ * Platform pushes are therefore no longer "best effort then approve anyway".
+ * A failed push keeps the gate open so Convoy doesn't defer a known auth or
+ * binding problem into the later deploy stage.
  */
 export async function submitStagedSecrets(
   runId: string,
   approvalId: string,
   planId: string,
   actions: SecretAction[],
- context: {
+  context: {
     platform: 'fly' | 'vercel' | 'cloudrun' | 'railway';
     flyApp?: string | null;
     targetCwd: string;
+    expectedKeys?: string[];
     projectBinding?: string | null;
     railwayService?: string | null;
     railwayEnvironment?: string | null;
@@ -71,7 +73,7 @@ export async function submitStagedSecrets(
   if (!runId || typeof runId !== 'string') return { ok: false, reason: 'invalid runId', results: [] };
   if (!approvalId || typeof approvalId !== 'string') return { ok: false, reason: 'invalid approvalId', results: [] };
   if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId', results: [] };
-  if (!Array.isArray(actions) || actions.length === 0) return { ok: false, reason: 'no actions submitted', results: [] };
+  if (!Array.isArray(actions)) return { ok: false, reason: 'invalid actions payload', results: [] };
 
   const plan = getPlan(planId);
   if (!plan) return { ok: false, reason: 'plan not found', results: [] };
@@ -131,15 +133,21 @@ export async function submitStagedSecrets(
       continue;
     }
 
-    // 2. Push to platform CLI. Best-effort — failure here doesn't block
-    // the approval. The deploy step that follows will fail loud if the
-    // secret didn't actually land on the platform, which is the right
-    // surface for that failure.
+    // 2. Push to the platform CLI. A failed push keeps the approval gate
+    // open so the operator sees the exact blocker here, before deploy.
     const pushResult = await pushSecretToPlatform(
       action.key,
       action.value,
       context.platform,
-      { flyApp: context.flyApp ?? null, cwd: context.targetCwd },
+      {
+        flyApp: context.flyApp ?? null,
+        cwd: context.targetCwd,
+        projectBinding: context.projectBinding ?? null,
+        railwayService: context.railwayService ?? null,
+        railwayEnvironment: context.railwayEnvironment ?? null,
+        cloudRunService: context.cloudRunService ?? null,
+        cloudRunRegion: context.cloudRunRegion ?? null,
+      },
     );
     results.push({
       key: action.key,
@@ -148,10 +156,42 @@ export async function submitStagedSecrets(
     });
   }
 
-  // Approve the approval gate so the orchestrator unblocks. We approve
-  // even when individual platform pushes failed — the deploy will surface
-  // the breach in that case, which is more informative than a generic
-  // "approval rejected, retry."
+  const actionErrors = results.filter((result) => result.status === 'error');
+  if (actionErrors.length > 0) {
+    return {
+      ok: false,
+      reason: actionErrors.map((result) => `${result.key}: ${result.message ?? 'failed'}`).join(' · '),
+      results,
+    };
+  }
+
+  const connection = await probePlatformConnection(context.platform, context.targetCwd, {
+    appName: context.flyApp ?? undefined,
+    expectedSecrets: context.expectedKeys ?? [],
+  });
+  const { stagedLocally, markedAlreadySet } = computeStagedState(plan);
+  const skipped = new Set(actions.filter((action) => action.kind === 'skip').map((action) => action.key));
+  const unresolvedSecrets = (context.expectedKeys ?? []).filter((key) => (
+    !stagedLocally.has(key)
+    && !markedAlreadySet.has(key)
+    && !connection.envKeys.includes(key)
+    && !skipped.has(key)
+    && !isPlatformManagedKeyForAction(key, context.platform)
+  ));
+  const blockingChecks = connection.checks.filter((check) => check.required && !check.ok);
+  if (blockingChecks.length > 0 || unresolvedSecrets.length > 0) {
+    return {
+      ok: false,
+      reason: [
+        ...blockingChecks.map((check) => check.summary),
+        ...(unresolvedSecrets.length > 0 ? [`still missing: ${unresolvedSecrets.join(', ')}`] : []),
+      ].join(' · '),
+      results,
+    };
+  }
+
+  // Approve the approval gate so the orchestrator unblocks only after the
+  // lane re-probes as ready right now, not just because the operator clicked.
   const updated = decide(runId, approvalId, 'approved');
   if (!updated) {
     return {
@@ -163,6 +203,22 @@ export async function submitStagedSecrets(
 
   revalidatePath(`/runs/${runId}`);
   return { ok: true, results };
+}
+
+function isPlatformManagedKeyForAction(
+  key: string,
+  platform: 'fly' | 'vercel' | 'cloudrun' | 'railway',
+): boolean {
+  if (platform === 'vercel') {
+    return key.startsWith('VERCEL_') || key.startsWith('NEXT_PUBLIC_VERCEL_');
+  }
+  if (platform === 'fly') {
+    return key.startsWith('FLY_') || key === 'PORT';
+  }
+  if (platform === 'cloudrun') {
+    return key === 'PORT' || key === 'K_SERVICE' || key === 'K_REVISION' || key === 'K_CONFIGURATION';
+  }
+  return false;
 }
 
 /**

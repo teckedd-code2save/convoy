@@ -51,6 +51,23 @@ export interface PlatformCapability {
   rollbackReady: boolean;
 }
 
+export type ConnectionCheckArea =
+  | 'cli'
+  | 'auth'
+  | 'project_binding'
+  | 'secrets'
+  | 'rollback';
+
+export interface ConnectionCheck {
+  area: ConnectionCheckArea;
+  ok: boolean;
+  required: boolean;
+  summary: string;
+  remedy?: string;
+  command?: string;
+  missing?: string[];
+}
+
 export interface ConnectionStatus {
   platform: Platform;
   cliAvailable: boolean;
@@ -60,6 +77,10 @@ export interface ConnectionStatus {
   account?: string;
   projectBinding?: string;
   envKeys: string[];
+  expectedSecrets: string[];
+  missingExpectedSecrets: string[];
+  secretsReady: boolean;
+  checks: ConnectionCheck[];
   recommendedRemedy?: string;
   raw?: Record<string, unknown>;
 }
