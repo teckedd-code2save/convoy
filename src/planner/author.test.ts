@@ -43,6 +43,29 @@ test('draftAuthorSection keeps real env vars but never PORT for managed platform
   assert.doesNotMatch(schema.contentPreview, /PORT=/, 'Vercel manages PORT — must not appear in schema');
 });
 
+test('VPS authoring includes Dockerfile, deploy script, and PORT in env schema', () => {
+  const section = draftAuthorSection(scanResult({ framework: 'express' }), 'vps');
+  const paths = section.convoyAuthoredFiles.map((f) => f.path);
+  assert.ok(paths.includes('Dockerfile'), 'VPS deploys are container-based');
+  assert.ok(paths.includes('.convoy/vps-deploy.sh'), 'VPS gets a deploy script');
+  assert.ok(paths.includes('.convoy/vps-README.md'), 'VPS README documents the contract');
+
+  const schema = section.convoyAuthoredFiles.find((f) => f.path === '.env.schema');
+  assert.ok(schema, 'VPS exposes PORT — operator owns the docker run binding');
+  assert.match(schema.contentPreview, /PORT=/);
+});
+
+test('VPS deploy script wires blue/green slot ports and operator-owned env', () => {
+  const section = draftAuthorSection(scanResult({ port: 4000, healthPath: '/health' }), 'vps');
+  const script = section.convoyAuthoredFiles.find((f) => f.path === '.convoy/vps-deploy.sh');
+  assert.ok(script);
+  assert.match(script.contentPreview, /CONVOY_SLOT/, 'script reads slot from env');
+  assert.match(script.contentPreview, /18081/, 'blue slot port');
+  assert.match(script.contentPreview, /18082/, 'green slot port');
+  assert.match(script.contentPreview, /:4000/, 'binds container to scanner-detected internal port');
+  assert.match(script.contentPreview, /\/health/, 'health probe uses scanner-detected path');
+});
+
 function scanResult(overrides: Partial<ScanResult> = {}): ScanResult {
   return {
     localPath: '/tmp/repo',

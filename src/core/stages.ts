@@ -18,6 +18,18 @@ import {
   vercelRollback,
 } from '../adapters/vercel/runner.js';
 import { probePlatformConnection } from '../adapters/connections.js';
+import {
+  ensureDeployRoot,
+  executeDeploy,
+  probeRemote,
+  readActiveSlot,
+  rollbackSlot,
+  rsyncAvailable,
+  rsyncSource,
+  sshAvailable,
+  swapNginxUpstream,
+  writeActiveSlot,
+} from '../adapters/vps/runner.js';
 import type { ConvoyBus } from './bus.js';
 import {
   createPrFromAuthoredFiles,
@@ -1558,6 +1570,9 @@ export class PromoteStage extends BaseStage {
     if (ctx.opts.realVercel) {
       return this.#runRealVercel(ctx, ctx.opts.realVercel, ctx.prior['canary'] as Record<string, unknown> | undefined);
     }
+    if (ctx.opts.realVps) {
+      return this.#runRealVps(ctx, ctx.opts.realVps, ctx.prior['canary'] as Record<string, unknown> | undefined);
+    }
 
     this.emit(ctx, 'started', { mode: 'scripted' });
 
@@ -1687,6 +1702,58 @@ export class PromoteStage extends BaseStage {
     this.emit(ctx, 'finished', result);
     return result;
   }
+
+  /**
+   * VPS promote: flip traffic to the slot that CanaryStage just deployed
+   * into. When operator-managed nginx, this is just a marker file write —
+   * we trust the operator's upstream config to read it. With Convoy-managed
+   * nginx it's an atomic upstream rewrite + reload (zero connection drop).
+   */
+  async #runRealVps(
+    ctx: StageContext,
+    cfg: RealVpsOpt,
+    canaryResult: Record<string, unknown> | undefined,
+  ): Promise<unknown> {
+    const idleSlot = (canaryResult?.['idle_slot'] === 'green' ? 'green' : 'blue') satisfies 'blue' | 'green';
+    const previousSlot = (canaryResult?.['previous_slot'] === 'blue' ? 'blue' : canaryResult?.['previous_slot'] === 'green' ? 'green' : null) as 'blue' | 'green' | null;
+    this.emit(ctx, 'started', { mode: 'real-vps', phase: 'flip-traffic', new_slot: idleSlot });
+
+    const target = {
+      host: cfg.host,
+      deployRoot: cfg.deployRoot,
+      ...(cfg.sshPort !== undefined && { port: cfg.sshPort }),
+      ...(cfg.identityFile !== undefined && { identityFile: cfg.identityFile }),
+    };
+
+    if (cfg.manageNginx) {
+      this.emit(ctx, 'progress', { phase: 'vps.nginx_swap' });
+      const swap = await swapNginxUpstream(target, cfg.appName, idleSlot);
+      if (!swap.ok) {
+        // Pre-staged reverse: previous slot is still serving traffic
+        // because nginx never reloaded. Rollback is implicit — just don't
+        // mark the new slot active.
+        throw new Error(`nginx upstream swap failed: ${swap.stderr.trim().slice(0, 240)}. Previous slot is still serving traffic.`);
+      }
+    }
+
+    const writeMarker = await writeActiveSlot(target, idleSlot);
+    if (!writeMarker.ok) {
+      throw new Error(`failed to record active slot on ${cfg.host}: ${writeMarker.stderr.trim().slice(0, 240)}`);
+    }
+
+    const liveUrl = `http://${cfg.host.split('@').pop()}${cfg.healthPath ?? '/'}`;
+    ctx.store.updateRun(ctx.run.id, { liveUrl });
+    const updated = ctx.store.getRun(ctx.run.id);
+    if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
+
+    const result = {
+      live_url: liveUrl,
+      active_slot: idleSlot,
+      ...(previousSlot && { previous_slot: previousSlot }),
+    };
+    this.emit(ctx, 'finished', result);
+    return result;
+  }
 }
 
 /**
@@ -1738,6 +1805,9 @@ export class ObserveStage extends BaseStage {
     }
     if (ctx.opts.realVercel) {
       return this.#runRealVercel(ctx, ctx.opts.realVercel, ctx.prior['promote'] as Record<string, unknown> | undefined);
+    }
+    if (ctx.opts.realVps) {
+      return this.#runRealVps(ctx, ctx.opts.realVps, ctx.prior['promote'] as Record<string, unknown> | undefined);
     }
 
     this.emit(ctx, 'started', { bake_window_seconds: 2 });
@@ -1966,6 +2036,82 @@ export class ObserveStage extends BaseStage {
     const updated = ctx.store.getRun(ctx.run.id);
     if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
     throw new RollbackTriggeredError(reason, 'observe');
+  }
+
+  /**
+   * VPS observe: poll the live URL through the bake window. On breach,
+   * rollback by flipping the active slot back. The previous container is
+   * still running (the deploy script renamed it `convoy-<slot>-prev`), so
+   * recovery is one nginx swap (managed) or one marker file (operator-owned)
+   * — that's the principle's pre-staged reverse.
+   */
+  async #runRealVps(
+    ctx: StageContext,
+    cfg: RealVpsOpt,
+    promoteResult: Record<string, unknown> | undefined,
+  ): Promise<unknown> {
+    const window = cfg.bakeWindowSeconds ?? 60;
+    this.emit(ctx, 'started', { bake_window_seconds: window });
+
+    const target = {
+      host: cfg.host,
+      deployRoot: cfg.deployRoot,
+      ...(cfg.sshPort !== undefined && { port: cfg.sshPort }),
+      ...(cfg.identityFile !== undefined && { identityFile: cfg.identityFile }),
+    };
+    const liveUrl = (typeof promoteResult?.['live_url'] === 'string' ? promoteResult['live_url'] : null) ?? `http://${cfg.host.split('@').pop()}${cfg.healthPath ?? '/'}`;
+    const previousSlot = (promoteResult?.['previous_slot'] === 'blue' || promoteResult?.['previous_slot'] === 'green') ? promoteResult['previous_slot'] as 'blue' | 'green' : null;
+
+    const samples: { ok: boolean; ms: number }[] = [];
+    const deadline = Date.now() + window * 1000;
+    while (Date.now() < deadline) {
+      const t0 = Date.now();
+      try {
+        const res = await fetch(liveUrl, { method: 'GET' });
+        const ms = Date.now() - t0;
+        samples.push({ ok: res.ok, ms });
+      } catch {
+        samples.push({ ok: false, ms: Date.now() - t0 });
+      }
+      await this.sleep(5000, ctx.signal);
+    }
+
+    const failures = samples.filter((s) => !s.ok).length;
+    const errorRatePct = samples.length === 0 ? 0 : (failures / samples.length) * 100;
+    const p99 = percentile(samples.map((s) => s.ms), 0.99) ?? 0;
+    const errorThreshold = cfg.thresholdErrorRatePct ?? 5;
+    const p99Threshold = cfg.thresholdP99Ms ?? 1500;
+
+    this.emit(ctx, 'progress', {
+      phase: 'vps.bake_summary',
+      samples: samples.length,
+      error_rate_pct: errorRatePct,
+      p99_ms: p99,
+    });
+
+    if (errorRatePct > errorThreshold || p99 > p99Threshold) {
+      const reason = `bake breach: error_rate=${errorRatePct.toFixed(1)}% (>${errorThreshold}%) or p99=${p99}ms (>${p99Threshold}ms)`;
+      if (previousSlot) {
+        this.emit(ctx, 'progress', { phase: 'vps.rollback', to_slot: previousSlot, reason });
+        await rollbackSlot(target, cfg.appName, previousSlot, cfg.manageNginx === true);
+      }
+      ctx.store.updateRun(ctx.run.id, {
+        status: 'rolled_back',
+        completedAt: new Date(),
+        outcomeReason: reason,
+      });
+      const updated = ctx.store.getRun(ctx.run.id);
+      if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
+      throw new RollbackTriggeredError(reason, 'observe');
+    }
+
+    const result = {
+      window_seconds: window,
+      slo_healthy: true,
+      observations: { p99_ms: p99, error_rate_pct: errorRatePct, samples: samples.length },
+    };
+    this.emit(ctx, 'finished', result);
+    return result;
   }
 }
 

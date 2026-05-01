@@ -19,6 +19,7 @@ import {
   type RealFlyOpt,
   type RealRehearsalOpt,
   type RealVercelOpt,
+  type RealVpsOpt,
 } from './core/stages.js';
 import { RunStateStore } from './core/state.js';
 import type { Platform, Run, RunEvent, StageName } from './core/types.js';
@@ -716,6 +717,14 @@ interface ApplyOpts {
   alreadySet?: string[];
   recurring?: boolean;
   platform?: string;
+  // VPS flags (parallel to --real-fly). VPS deploys reach a box over SSH.
+  // No platform CLI to install; just the operator's existing SSH access.
+  realVps?: boolean;
+  vpsHost?: string;
+  vpsKey?: string;
+  vpsPort?: number;
+  vpsDeployRoot?: string;
+  vpsManageNginx?: boolean;
   /**
    * When set, runApply tells the orchestrator to continue this run row
    * instead of creating a new one. Set programmatically by `convoy resume`,
@@ -1440,6 +1449,17 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
     if (!opts.realFly) {
       report.checks.push({ name: 'real vercel', ok: true, detail: 'skipped (--no-real-fly)' });
     }
+  } else if (platform === 'vps') {
+    report.realFly = false;
+    if (opts.realVps === true) {
+      await appendVpsPreflight(plan, opts, report);
+    } else {
+      report.checks.push({
+        name: 'real vps',
+        ok: true,
+        detail: 'skipped (--real-vps not set)',
+      });
+    }
   } else {
     report.realFly = false;
     if (opts.realFly) {
@@ -1452,6 +1472,145 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
   }
 
   return report;
+}
+
+/**
+ * VPS preflight — surfaces actionable blockers before the deploy stage
+ * even creates a Run. Each blocker carries the exact remedy command. We
+ * only probe the remote box if the operator passed --real-vps AND a host;
+ * the probe itself is read-only (whoami, command -v docker, df) so we
+ * follow the no-autonomous-probing rule (the consent is the --real-vps
+ * flag plus the host argument).
+ */
+async function appendVpsPreflight(
+  plan: ConvoyPlan,
+  opts: ApplyOpts,
+  report: PreflightReport,
+): Promise<void> {
+  const { sshAvailable, rsyncAvailable, probeRemote } = await import('./adapters/vps/runner.js');
+
+  const sshOk = await sshAvailable();
+  if (!sshOk) {
+    report.blockers.push({
+      id: 'vps.cli.ssh-missing',
+      title: 'OpenSSH client (`ssh`) is not installed',
+      detail: 'Convoy reaches your box over SSH; without ssh installed locally, --real-vps cannot run.',
+      severity: 'hard',
+      fixes: [
+        { kind: 'shell', label: 'Install OpenSSH (Debian/Ubuntu)', command: 'apt install openssh-client', autoFixable: false },
+        { kind: 'manual', label: 'macOS ships ssh by default — verify your PATH', autoFixable: false },
+      ],
+    });
+    report.checks.push({ name: 'real vps', ok: false, detail: 'ssh not installed' });
+    return;
+  }
+  const rsyncOk = await rsyncAvailable();
+  if (!rsyncOk) {
+    report.blockers.push({
+      id: 'vps.cli.rsync-missing',
+      title: '`rsync` is not installed',
+      detail: 'Convoy uses rsync as the cheapest delivery mechanism (only the diff transfers).',
+      severity: 'hard',
+      fixes: [
+        { kind: 'shell', label: 'Install rsync (Debian/Ubuntu)', command: 'apt install rsync', autoFixable: false },
+        { kind: 'shell', label: 'Install rsync (macOS)', command: 'brew install rsync', autoFixable: false },
+      ],
+    });
+    report.checks.push({ name: 'real vps', ok: false, detail: 'rsync not installed' });
+    return;
+  }
+
+  const host = opts.vpsHost ?? process.env['CONVOY_VPS_HOST'];
+  if (!host) {
+    report.blockers.push({
+      id: 'vps.config.no-host',
+      title: 'No VPS host configured',
+      detail: 'Convoy needs to know which box to deploy to.',
+      severity: 'hard',
+      fixes: [
+        { kind: 'flag', label: 'Pass the host inline', flag: '--vps-host=user@host.example.com', autoFixable: false },
+        { kind: 'shell', label: 'Or set it in your shell', command: 'export CONVOY_VPS_HOST=user@host.example.com', autoFixable: false },
+      ],
+    });
+    report.checks.push({ name: 'real vps', ok: false, detail: 'no host configured' });
+    return;
+  }
+
+  const appName = autoFlyAppName(plan);
+  const deployRoot = opts.vpsDeployRoot ?? `/srv/${appName}`;
+  const target = {
+    host,
+    deployRoot,
+    ...(opts.vpsPort !== undefined && { port: opts.vpsPort }),
+    ...(opts.vpsKey !== undefined && { identityFile: opts.vpsKey }),
+  };
+
+  const remote = await probeRemote(target);
+  if (!remote.reachable) {
+    report.blockers.push({
+      id: 'vps.connection.unreachable',
+      title: `Cannot reach ${host} over SSH`,
+      detail: remote.rawError ?? 'connection refused or timed out',
+      severity: 'hard',
+      fixes: [
+        { kind: 'shell', label: 'Test the connection yourself', command: `ssh ${host} echo ok`, autoFixable: false },
+        { kind: 'manual', label: 'Verify firewall rules (port 22 by default) and key permissions', autoFixable: false },
+      ],
+    });
+    report.checks.push({ name: 'real vps', ok: false, detail: 'unreachable' });
+    return;
+  }
+
+  if (!remote.hasDocker) {
+    report.blockers.push({
+      id: 'vps.docker.missing',
+      title: `Docker is not installed on ${host}`,
+      detail: 'Convoy ships your image as a container — Docker on the box is required.',
+      severity: 'hard',
+      fixes: [
+        { kind: 'shell', label: 'Convoy can install Docker for you (idempotent)', command: `npm run convoy -- vps bootstrap ${host} --yes`, autoFixable: false },
+        { kind: 'manual', label: 'Or install manually: https://docs.docker.com/engine/install/', autoFixable: false },
+      ],
+    });
+    report.checks.push({ name: 'real vps', ok: false, detail: 'no docker on host' });
+    return;
+  }
+
+  if (opts.vpsManageNginx === true && !remote.hasNginx) {
+    report.blockers.push({
+      id: 'vps.nginx.missing',
+      title: `nginx is not installed on ${host} but --vps-manage-nginx was set`,
+      detail: 'Either install nginx or drop the flag (Convoy will leave traffic routing to you).',
+      severity: 'hard',
+      fixes: [
+        { kind: 'shell', label: 'Convoy can install nginx + Docker', command: `npm run convoy -- vps bootstrap ${host} --with-nginx --yes`, autoFixable: false },
+        { kind: 'flag', label: 'Or drop the flag and route traffic yourself', flag: '--no-vps-manage-nginx', autoFixable: true },
+      ],
+    });
+    report.checks.push({ name: 'real vps', ok: false, detail: 'nginx requested but missing' });
+    return;
+  }
+
+  if (remote.diskFreeGb !== null && remote.diskFreeGb < 2) {
+    report.blockers.push({
+      id: 'vps.disk.low',
+      title: `Less than 2 GB free near ${deployRoot}`,
+      detail: `Disk free: ${remote.diskFreeGb} GB. Docker builds need headroom for layers and the source tree.`,
+      severity: 'hard',
+      fixes: [
+        { kind: 'shell', label: 'Reclaim Docker space', command: `ssh ${host} 'docker system prune -af'`, autoFixable: false },
+        { kind: 'manual', label: 'Or free disk space manually', autoFixable: false },
+      ],
+    });
+    report.checks.push({ name: 'real vps', ok: false, detail: `disk full (${remote.diskFreeGb} GB free)` });
+    return;
+  }
+
+  report.checks.push({
+    name: 'real vps',
+    ok: true,
+    detail: `${host} ready (user=${remote.user ?? '?'}, docker=${remote.hasDocker ? 'yes' : 'no'}, nginx=${remote.hasNginx ? 'yes' : 'no'}, ${remote.diskFreeGb ?? '?'} GB free)`,
+  });
 }
 
 function renderPreflight(report: PreflightReport): void {
@@ -1723,6 +1882,38 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
         `${pc.dim('Real Vercel deploy:')} ${pc.bold(cwd)} ${pc.dim(`(bake: ${realVercel.bakeWindowSeconds}s)`)}\n`,
       );
     }
+  }
+
+  if (platform === 'vps' && opts.realVps === true) {
+    const host = opts.vpsHost ?? process.env['CONVOY_VPS_HOST'];
+    if (!host) {
+      console.error(
+        pc.red('--real-vps requires --vps-host=user@host (or set CONVOY_VPS_HOST in your shell).'),
+      );
+      process.exit(2);
+    }
+    const cwd = plan.target.workspace
+      ? `${plan.target.localPath}/${plan.target.workspace}`
+      : plan.target.localPath;
+    const appName = autoFlyAppName(plan); // reuse the same slug heuristic
+    const realVps: RealVpsOpt = {
+      host,
+      cwd,
+      appName,
+      deployRoot: opts.vpsDeployRoot ?? `/srv/${appName}`,
+      ...(opts.vpsPort !== undefined && { sshPort: opts.vpsPort }),
+      ...(opts.vpsKey !== undefined && { identityFile: opts.vpsKey }),
+      ...(opts.vpsManageNginx !== undefined && { manageNginx: opts.vpsManageNginx }),
+      healthPath: primaryLane(plan).rehearsal.healthPath ?? '/health',
+      thresholdErrorRatePct: 5.0,
+      thresholdP99Ms: 1500,
+      bakeWindowSeconds: opts.flyBakeWindow ?? 60,
+      convoyAuthoredFiles: aggregateAuthoredFiles(plan).map((f) => f.path),
+    };
+    orchestratorOpts.realVps = realVps;
+    process.stdout.write(
+      `${pc.dim('Real VPS deploy:')} ${pc.bold(host)} ${pc.dim(`→ ${realVps.deployRoot} (bake: ${realVps.bakeWindowSeconds}s, nginx: ${realVps.manageNginx ? 'managed' : 'operator-owned'})`)}\n`,
+    );
   }
 
   // Make sure the web viewer is up before the orchestrator creates the run.
@@ -2016,6 +2207,99 @@ interface PreflightOpts {
   realFly?: boolean;
   alreadySet?: string[];
   json?: boolean;
+}
+
+interface VpsBootstrapOpts {
+  withNginx?: boolean;
+  yes?: boolean;
+}
+
+/**
+ * Install Docker (and optionally nginx) on a fresh VPS over SSH.
+ *
+ * The contract:
+ *  1. Print the exact commands that will run on the remote host.
+ *  2. If --yes is not passed, exit without changes (dry-run by default).
+ *  3. Use the official get.docker.com convenience script — it's idempotent
+ *     and the canonical Docker install path. Skip if docker is already
+ *     present.
+ *  4. Never bypass sudo prompts. If the operator's SSH user can't sudo
+ *     non-interactively, the script fails with a clear remedy.
+ *
+ * The commands are visible and auditable. Convoy never silently runs
+ * privileged commands on a box.
+ */
+async function runVpsBootstrap(host: string, opts: VpsBootstrapOpts): Promise<void> {
+  const { sshAvailable, sshExec, probeRemote } = await import('./adapters/vps/runner.js');
+
+  const sshOk = await sshAvailable();
+  if (!sshOk) {
+    console.error(pc.red('ssh is not installed locally. Install OpenSSH and try again.'));
+    process.exit(2);
+  }
+
+  const target = { host, deployRoot: '/' };
+  const remote = await probeRemote(target);
+  if (!remote.reachable) {
+    console.error(pc.red(`Cannot reach ${host}: ${remote.rawError ?? 'connection refused'}`));
+    process.exit(2);
+  }
+  process.stdout.write(`${pc.dim('Connected as')} ${pc.bold(remote.user ?? '?')} ${pc.dim(`(docker=${remote.hasDocker ? 'yes' : 'no'}, nginx=${remote.hasNginx ? 'yes' : 'no'})`)}\n`);
+
+  const steps: { label: string; command: string; skip: boolean; reason?: string }[] = [];
+  steps.push({
+    label: 'Install Docker (official get.docker.com script)',
+    command: 'curl -fsSL https://get.docker.com | sudo sh',
+    skip: remote.hasDocker,
+    ...(remote.hasDocker ? { reason: 'docker already installed' } : {}),
+  });
+  steps.push({
+    label: `Add ${remote.user ?? 'your user'} to the docker group (avoid needing sudo for docker run)`,
+    command: `sudo usermod -aG docker ${remote.user ?? '$USER'}`,
+    skip: !remote.hasDocker && !opts.yes ? false : false,
+  });
+  if (opts.withNginx) {
+    steps.push({
+      label: 'Install nginx',
+      command: 'sudo apt-get update && sudo apt-get install -y nginx',
+      skip: remote.hasNginx,
+      ...(remote.hasNginx ? { reason: 'nginx already installed' } : {}),
+    });
+  }
+
+  process.stdout.write(`\n${pc.bold('vps bootstrap plan')} for ${pc.bold(host)}\n\n`);
+  for (let i = 0; i < steps.length; i += 1) {
+    const s = steps[i]!;
+    const prefix = s.skip ? pc.dim('  skip') : pc.cyan(`  ${i + 1}.  `);
+    process.stdout.write(`${prefix} ${s.label}\n`);
+    process.stdout.write(`        ${pc.dim('$')} ${pc.cyan(s.command)}\n`);
+    if (s.skip && s.reason) process.stdout.write(`        ${pc.dim(s.reason)}\n`);
+  }
+  process.stdout.write('\n');
+
+  if (opts.yes !== true) {
+    process.stdout.write(`${pc.yellow('Dry-run.')} ${pc.dim('Re-run with')} ${pc.bold('--yes')} ${pc.dim('to execute the steps above.')}\n`);
+    return;
+  }
+
+  for (let i = 0; i < steps.length; i += 1) {
+    const s = steps[i]!;
+    if (s.skip) {
+      process.stdout.write(`${pc.dim('skip:')} ${s.label}\n`);
+      continue;
+    }
+    process.stdout.write(`${pc.cyan('▶')} ${s.label}\n`);
+    const result = await sshExec(target, s.command, {
+      timeoutMs: 5 * 60 * 1000,
+      onLog: (line) => process.stdout.write(`  ${pc.dim(line)}\n`),
+    });
+    if (!result.ok) {
+      process.stdout.write(`${pc.red('✗')} step failed: ${result.stderr.trim().slice(0, 240)}\n`);
+      process.exit(2);
+    }
+    process.stdout.write(`${pc.green('✓')} ${s.label}\n`);
+  }
+  process.stdout.write(`\n${pc.green('Bootstrap complete.')} ${pc.dim('You may need to log out + back in for docker group membership to take effect.')}\n`);
 }
 
 async function runStageSecrets(planId: string): Promise<void> {
@@ -3487,6 +3771,12 @@ program
     if (idx > 0) acc[value.slice(0, idx)] = value.slice(idx + 1);
     return acc;
   }, {} as Record<string, string>)
+  .option('--real-vps', 'deploy to a VPS over SSH (rsync source, build on the box, blue/green slots)')
+  .option('--vps-host <host>', 'SSH destination: user@host (or set CONVOY_VPS_HOST)')
+  .option('--vps-key <path>', 'SSH private key path (default: ~/.ssh/config / agent)')
+  .option('--vps-port <port>', 'SSH port (default 22)', (v) => Number(v))
+  .option('--vps-deploy-root <path>', 'deploy root on the box (default: /srv/<app>)')
+  .option('--vps-manage-nginx', 'let Convoy author and reload nginx upstream config (default: leave nginx alone)')
   .action(async (planId: string, options: ApplyOpts) => {
     await runApply(planId, options);
   });
@@ -3582,6 +3872,25 @@ program
   )
   .action(async (planId: string) => {
     await runStageSecrets(planId);
+  });
+
+program
+  .command('vps')
+  .description('VPS-related subcommands. Use `convoy vps bootstrap <host>` to install Docker on a fresh box.')
+  .argument('[subcommand]', 'subcommand: bootstrap')
+  .argument('[host]', 'SSH destination: user@host')
+  .option('--with-nginx', 'also install nginx (skip if you already manage your own)')
+  .option('-y, --yes', 'actually run the install commands (otherwise prints what it would do and exits)')
+  .action(async (subcommand: string | undefined, host: string | undefined, options: VpsBootstrapOpts) => {
+    if (subcommand !== 'bootstrap') {
+      console.error(pc.red(`Unknown vps subcommand: ${subcommand ?? '(none)'}. Try \`convoy vps bootstrap <host>\`.`));
+      process.exit(2);
+    }
+    if (!host) {
+      console.error(pc.red('vps bootstrap requires a host: `convoy vps bootstrap user@host`.'));
+      process.exit(2);
+    }
+    await runVpsBootstrap(host, options);
   });
 
 program
