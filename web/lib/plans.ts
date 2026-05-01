@@ -138,6 +138,28 @@ function plansDirExists(): boolean {
   }
 }
 
+/**
+ * Plans saved by the CLI use an integrity envelope:
+ *
+ *   { format: 'convoy-plan-v1', savedAt: '…', sha256: '…', plan: {...} }
+ *
+ * Older plans (pre-2da4bbb) were saved as the raw PlanSummary at the top
+ * level. The web reader has to handle both — unwrap when an envelope is
+ * present, return the body otherwise. Without this the plan listing
+ * blew up with `Cannot read properties of undefined (reading 'slice')`
+ * because `plan.id` was undefined for every newly-saved plan.
+ */
+function unwrapEnvelope(parsed: unknown): PlanSummary | null {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const obj = parsed as Record<string, unknown>;
+  if (obj['format'] === 'convoy-plan-v1' && obj['plan'] && typeof obj['plan'] === 'object') {
+    return obj['plan'] as PlanSummary;
+  }
+  // Legacy raw shape — `id` lives at the top level.
+  if (typeof obj['id'] === 'string') return obj as unknown as PlanSummary;
+  return null;
+}
+
 export function listPlans(): PlanSummary[] {
   if (!plansDirExists()) return [];
   let files: string[];
@@ -151,8 +173,8 @@ export function listPlans(): PlanSummary[] {
     if (!file.endsWith('.json')) continue;
     try {
       const raw = readFileSync(join(PLANS_DIR, file), 'utf8');
-      const plan = JSON.parse(raw) as PlanSummary;
-      out.push(plan);
+      const plan = unwrapEnvelope(JSON.parse(raw));
+      if (plan && typeof plan.id === 'string') out.push(plan);
     } catch {
       continue;
     }
@@ -166,7 +188,8 @@ export function getPlan(id: string): PlanSummary | null {
   const exactPath = join(PLANS_DIR, `${id}.json`);
   if (existsSync(exactPath)) {
     try {
-      return JSON.parse(readFileSync(exactPath, 'utf8')) as PlanSummary;
+      const plan = unwrapEnvelope(JSON.parse(readFileSync(exactPath, 'utf8')));
+      if (plan && typeof plan.id === 'string') return plan;
     } catch {
       return null;
     }
