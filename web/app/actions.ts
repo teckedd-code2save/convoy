@@ -1,7 +1,8 @@
 'use server';
 
 import { spawn } from 'node:child_process';
-import { resolve } from 'node:path';
+import { mkdirSync, openSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
 import Anthropic from '@anthropic-ai/sdk';
 import { revalidatePath } from 'next/cache';
@@ -22,6 +23,8 @@ import {
   acknowledgeBlocker as acknowledge,
   decideApproval as decide,
   listEvents,
+  listOpenBlockers,
+  listRunsForPlan,
 } from '@/lib/runs';
 
 const MEDIC_MODEL = 'claude-opus-4-7';
@@ -740,6 +743,92 @@ export async function setRecurring(
   writeRecurringPref(plan, recurring === true);
   revalidatePath(`/plans/${planId}`);
   return { ok: true };
+}
+
+/**
+ * Kick off `convoy apply <planId>` from the web UI. Detached spawn — the
+ * pipeline runs for minutes and we don't want to hold a server action
+ * worker open for that. The contract is:
+ *
+ *   1. Refuse to apply if hard blockers are still open. The CLI would
+ *      refuse anyway and the operator wants to know fast, not after a
+ *      multi-second spawn.
+ *   2. Refuse if a run for this plan is already in flight. One apply per
+ *      plan at a time keeps the SQLite state and approval gates
+ *      unambiguous.
+ *   3. Spawn the CLI with stdio redirected to .convoy/apply-<planId>.log
+ *      so the operator can `tail -f` if they want raw output.
+ *   4. Poll listRunsForPlan() until the orchestrator has created its row
+ *      (the CLI does this within ~200 ms of preflight passing). Return
+ *      the runId so the client can redirect to the run timeline.
+ *
+ * Default flags: scripted (no --real-author / --real-rehearsal /
+ * --real-fly). Real applies still happen via the CLI for now — the web
+ * pathway is the demo + verification path. We can expose a "real apply"
+ * mode here once the approval surfaces fully cover the interactive cases.
+ */
+export async function applyPlan(
+  planId: string,
+): Promise<{ ok: boolean; runId?: string; reason?: string }> {
+  if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId' };
+  const plan = getPlan(planId);
+  if (!plan) return { ok: false, reason: 'plan not found' };
+
+  // Refuse if there are unresolved hard blockers — let the operator see
+  // the same message they'd get from the CLI without waiting for a spawn.
+  const blockers = listOpenBlockers(plan.id);
+  const hard = blockers.filter((b) => b.payload.severity === 'hard');
+  if (hard.length > 0) {
+    return {
+      ok: false,
+      reason: `${hard.length} hard blocker${hard.length === 1 ? '' : 's'} unresolved — resolve them or acknowledge first, then re-run preflight.`,
+    };
+  }
+
+  // Refuse if an apply for this plan is already running.
+  const existing = listRunsForPlan(plan.id);
+  const inFlight = existing.find((r) => r.status === 'pending' || r.status === 'running' || r.status === 'awaiting_approval' || r.status === 'awaiting_fix');
+  if (inFlight) {
+    return { ok: false, runId: inFlight.id, reason: `apply already in flight (run ${inFlight.id.slice(0, 8)}, status ${inFlight.status})` };
+  }
+
+  const convoyHome = resolve(process.cwd(), '..');
+  // Persist stdio to a log so the operator can replay raw CLI output if
+  // anything looks off in the timeline. Per-plan log keeps history readable.
+  const logDir = join(convoyHome, '.convoy');
+  try { mkdirSync(logDir, { recursive: true }); } catch { /* exists */ }
+  const logPath = join(logDir, `apply-${plan.id.slice(0, 8)}.log`);
+  const logFd = openSync(logPath, 'a');
+
+  const args = ['run', 'convoy', '--silent', '--', 'apply', planId];
+  const child = spawn('npm', args, {
+    cwd: convoyHome,
+    env: { ...process.env, CONVOY_AUTO_APPROVE: '0' },
+    stdio: ['ignore', logFd, logFd],
+    detached: true,
+  });
+  // Detach so the child outlives this server action invocation.
+  child.unref();
+
+  // Poll for the orchestrator-created run row keyed to this plan. We check
+  // for any run with started_at after now (so prior runs don't satisfy the
+  // poll). 8s window matches the CLI's "Plan in web UI" lag tolerance.
+  const startedAtFloor = new Date();
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    const runs = listRunsForPlan(plan.id);
+    const fresh = runs.find((r) => new Date(r.startedAt).getTime() >= startedAtFloor.getTime() - 500);
+    if (fresh) {
+      revalidatePath(`/plans/${planId}`);
+      return { ok: true, runId: fresh.id };
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+
+  return {
+    ok: false,
+    reason: `spawned convoy apply but no run row appeared within 8s. Check ${logPath} for output.`,
+  };
 }
 
 /**

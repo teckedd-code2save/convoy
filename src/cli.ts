@@ -2165,12 +2165,17 @@ async function runPreflight(planId: string, opts: PreflightOpts): Promise<void> 
   if ('error' in resolvedPlan) printPlanResolutionFailure(resolvedPlan);
   const plan = normalizePlan(resolvedPlan.plan);
 
-  // Reuse the apply preflight so checks stay aligned. The opts shape is
-  // the same — we just default the real-* flags and never apply.
+  // Mirror `convoy apply`'s real-* defaults so previewing preflight gives
+  // the same verdict as actually applying. Earlier this defaulted to
+  // false-on-undefined, which made the web's "Re-run preflight" button
+  // silently clear open blockers (the original `convoy ship` had real-*
+  // on, but the rerun ran with them off → empty blocker set → DB stamped
+  // them all 'resolved'). Commander treats `--real-*` / `--no-real-*` as
+  // a boolean tri-state via undefined, so we coerce undefined → true.
   const applyOpts: ApplyOpts = {
-    realAuthor: opts.realAuthor === true,
-    realRehearsal: opts.realRehearsal === true,
-    realFly: opts.realFly === true,
+    realAuthor: opts.realAuthor !== false,
+    realRehearsal: opts.realRehearsal !== false,
+    realFly: opts.realFly !== false,
     autoApprove: false,
     autoMerge: false,
     demo: false,
@@ -3850,11 +3855,11 @@ program
 program
   .command('preflight <planId>')
   .description(
-    'Run preflight without applying. Persists blockers so the web viewer can render them. Exits 0 even when blocked.',
+    'Run preflight without applying. Mirrors `convoy apply` real-* defaults (all on); use --no-real-* to skip. Persists blockers so the web viewer can render them. Exits 0 even when blocked.',
   )
-  .option('--real-author', 'preflight real PR author (gh + git remote checks)')
-  .option('--real-rehearsal', 'preflight real local rehearsal (start command + workspace)')
-  .option('--real-fly', 'preflight real platform deploy (CLI/auth/binding)')
+  .option('--no-real-author', 'skip real PR author preflight (gh + git remote checks)')
+  .option('--no-real-rehearsal', 'skip real local rehearsal preflight (start command + workspace)')
+  .option('--no-real-fly', 'skip real platform deploy preflight (CLI/auth/binding)')
   .option(
     '--already-set <keys>',
     'comma-separated env var names declared as already set on the deploy target',

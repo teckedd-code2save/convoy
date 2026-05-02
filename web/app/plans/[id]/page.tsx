@@ -10,6 +10,7 @@ import { listOpenBlockers, listRunsForPlan, type BlockerRow, type RunRow } from 
 
 import { ConfigPanel, type PanelRow } from './config-panel';
 import { BlockersSection } from './blockers-section';
+import { ApplyButton } from './apply-button';
 
 const SUPPORTED_PLATFORMS = ['fly', 'railway', 'vercel', 'cloudrun'];
 
@@ -68,18 +69,12 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
       <EvidenceSection evidence={plan.evidence} />
 
       {notDeployable ? null : (
-        <div className="flex items-center gap-4 pt-6 border-t border-rule">
-          <button
-            disabled
-            title="Apply from CLI: npm run convoy -- apply <id>"
-            className="px-4 py-2 rounded-md bg-ink text-white text-sm font-medium opacity-60 cursor-not-allowed"
-          >
-            Apply plan →
-          </button>
-          <code className="text-xs text-muted">
-            npm run convoy -- apply {plan.id.slice(0, 8)}
-          </code>
-        </div>
+        <ApplyButton
+          planId={plan.id}
+          planIdShort={plan.id.slice(0, 8)}
+          hardBlockerCount={blockers.filter((b) => b.payload.severity === 'hard').length}
+          runInFlight={runs.some((r) => r.status === 'pending' || r.status === 'running' || r.status === 'awaiting_approval' || r.status === 'awaiting_fix')}
+        />
       )}
     </article>
   );
