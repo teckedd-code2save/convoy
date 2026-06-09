@@ -16,7 +16,8 @@
     "test": "tsx --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "dev": "tsx watch src/index.ts",
-    "convoy": "tsx --env-file-if-exists=.env src/cli.ts"
+    "convoy": "tsx --env-file-if-exists=.env src/cli.ts",
+    "mcp": "tsx --env-file-if-exists=.env src/mcp/index.ts"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
@@ -27,8 +28,10 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.90.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^12.9.0",
     "commander": "^14.0.3",
-    "picocolors": "^1.1.1"
+    "picocolors": "^1.1.1",
+    "zod": "^4.4.3"
   }
 }
