@@ -17,7 +17,8 @@
     "typecheck": "tsc --noEmit",
     "dev": "tsx watch src/index.ts",
     "convoy": "tsx --env-file-if-exists=.env src/cli.ts",
-    "mcp": "tsx --env-file-if-exists=.env src/mcp/index.ts"
+    "mcp": "tsx --env-file-if-exists=.env src/mcp/index.ts",
+    "mcp-http": "tsx --env-file-if-exists=.env src/mcp/http.ts"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

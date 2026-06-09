@@ -12,7 +12,7 @@
  * owns it for JSON-RPC frames. Diagnostics go to console.error only.
  */
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, openSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -23,6 +23,7 @@ import { z } from 'zod';
 import { PlanStore } from '../core/plan.js';
 import { RunStateStore } from '../core/state.js';
 import type { Approval, Platform, Run, RunEvent } from '../core/types.js';
+import type { RealVpsGhcrOpt } from '../core/stages.js';
 import { buildPlan } from '../planner/index.js';
 
 // ---------------------------------------------------------------------------
@@ -227,9 +228,29 @@ export function registerConvoyTools(server: McpServer): void {
           .describe('Open a real GitHub PR with the drafted files (needs gh auth; default false)'),
         realFly: z.boolean().optional()
           .describe('Deploy for real via flyctl (needs fly auth; default false)'),
+        realVpsGhcr: z.object({
+          host: z.string().describe('SSH destination: user@host'),
+          cwd: z.string().describe('Local path for docker build context'),
+          deployRoot: z.string().describe('Base deploy directory on VPS, e.g. /opt/my-app'),
+          appName: z.string().describe('App name used in logs and Caddy site file'),
+          imageRef: z.string().describe('GHCR image ref without tag, e.g. ghcr.io/myorg/my-app'),
+          ghcrUsername: z.string().describe('GitHub username for docker login'),
+          ghcrToken: z.string().describe('GitHub token with packages:write (agent) and packages:read (box)'),
+          buildArgs: z.record(z.string(), z.string()).optional().describe('Docker --build-arg key=value pairs'),
+          composeService: z.string().optional().describe('Compose service name (default: web)'),
+          runMigrations: z.boolean().optional().describe('Run Prisma migrate deploy before rolling (default false)'),
+          manageCaddy: z.boolean().optional().describe('Write /etc/caddy/sites/<app>.caddy and reload Caddy'),
+          domain: z.string().optional().describe('Domain for Caddy site file; required when manageCaddy=true'),
+          containerPort: z.number().optional().describe('Container port (default 3000)'),
+          healthPath: z.string().optional().describe('Health check path (default /)'),
+          bakeWindowSeconds: z.number().optional().describe('Observe bake window in seconds (default 60)'),
+          sshPort: z.number().optional().describe('SSH port (default 22)'),
+          identityFile: z.string().optional().describe('SSH private key path'),
+        }).optional()
+          .describe('Deploy via GHCR (build + push locally, docker compose pull+up on VPS). Requires docker + ssh locally.'),
       },
     },
-    async ({ planId, autoApprove, realRehearsal, realAuthor, realFly }) =>
+    async ({ planId, autoApprove, realRehearsal, realAuthor, realFly, realVpsGhcr }) =>
       guarded(async () => {
         const resolved = resolvePlanId(planId);
         if ('error' in resolved) return fail(resolved.error);
@@ -261,6 +282,14 @@ export function registerConvoyTools(server: McpServer): void {
           if (realAuthor !== true) args.push('--no-real-author');
           if (realRehearsal !== true) args.push('--no-real-rehearsal');
           if (realFly !== true) args.push('--no-real-fly');
+
+          // GHCR VPS config is complex; write to a JSON file and pass the
+          // path flag rather than trying to flatten it into CLI flags.
+          if (realVpsGhcr !== undefined) {
+            const configPath = join(logDir, `ghcr-${fullPlanId.slice(0, 8)}.json`);
+            writeFileSync(configPath, JSON.stringify(realVpsGhcr as RealVpsGhcrOpt, null, 2), 'utf8');
+            args.push('--real-vps-ghcr', '--real-vps-ghcr-config', configPath);
+          }
 
           const child = spawn('npm', args, {
             cwd: REPO_ROOT,
