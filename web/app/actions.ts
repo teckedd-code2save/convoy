@@ -430,7 +430,16 @@ Tool calls I made during investigation (${toolCalls.length} total):
 ${toolCallSummary || '(none recorded)'}`;
 
   const messages: Anthropic.MessageParam[] = [
-    { role: 'user', content: investigationContext },
+    {
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: investigationContext,
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    },
     {
       role: 'assistant',
       content:
