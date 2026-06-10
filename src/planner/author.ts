@@ -9,13 +9,25 @@ import { repoName, type ScanResult } from './scanner.js';
  * contentPreview with AI-generated content tailored to the specific repo —
  * particularly for Dockerfiles where the dimensionality of choices is too high
  * to express as deterministic templates.
+ *
+ * @param servicePath - path of this service relative to the repo root, e.g.
+ *   "apps/api". Pass "." (or omit) for single-service repos. Used to prefix
+ *   authored file paths so multi-service monorepos don't collide (Dockerfile
+ *   becomes apps/api/Dockerfile instead of overwriting the root Dockerfile).
  */
-export function draftAuthorSection(scan: ScanResult, platform: Platform): PlanAuthorSection {
+export function draftAuthorSection(
+  scan: ScanResult,
+  platform: Platform,
+  servicePath = '.',
+): PlanAuthorSection {
+  const prefix = (p: string) =>
+    servicePath === '.' || servicePath === '' ? p : `${servicePath}/${p}`;
+
   const files: PlanAuthoredFile[] = [];
   const profile = authoringProfile(platform);
 
   if (profile.needsDockerfile && !scan.hasDockerfile) {
-    files.push(draftDockerfile(scan, platform));
+    files.push(prefixFile(draftDockerfile(scan, platform), prefix));
     // A Dockerfile without a .dockerignore means `COPY . .` pulls
     // node_modules, .next, .git, .env*, build caches, IDE state — everything.
     // The build context balloons, the upload to Depot/buildkit takes minutes
@@ -23,25 +35,29 @@ export function draftAuthorSection(scan: ScanResult, platform: Platform): PlanAu
     // finishes. We learned this from a 45-minute Fly build that died on
     // "Invalid token". Author them as a pair, always.
     if (!scan.hasDockerignore) {
-      files.push(draftDockerignore(scan));
+      files.push(prefixFile(draftDockerignore(scan), prefix));
     }
   }
 
   if (scan.existingPlatform !== platform) {
     const platformConfig = profile.platformConfigFile?.(scan);
-    if (platformConfig) files.push(platformConfig);
+    if (platformConfig) files.push(prefixFile(platformConfig, prefix));
   }
   // Extra files some platforms need beyond their main config (e.g. VPS
   // ships a deploy.sh + optional nginx snippet alongside the Dockerfile).
   if (profile.extraFiles) {
-    for (const f of profile.extraFiles(scan)) files.push(f);
+    for (const f of profile.extraFiles(scan)) files.push(prefixFile(f, prefix));
   }
 
   const envSchema = draftEnvSchema(scan, platform);
-  if (envSchema) files.push(envSchema);
-  if (files.length > 0) files.push(draftConvoyManifest(files));
+  if (envSchema) files.push(prefixFile(envSchema, prefix));
+  if (files.length > 0) files.push(draftConvoyManifest(files, prefix));
 
   return { convoyAuthoredFiles: files };
+}
+
+function prefixFile(file: PlanAuthoredFile, prefix: (p: string) => string): PlanAuthoredFile {
+  return { ...file, path: prefix(file.path) };
 }
 
 /**
@@ -700,9 +716,13 @@ ${vars.join('\n')}
   };
 }
 
-function draftConvoyManifest(files: PlanAuthoredFile[]): PlanAuthoredFile {
+function draftConvoyManifest(
+  files: PlanAuthoredFile[],
+  prefix: (p: string) => string = (p) => p,
+): PlanAuthoredFile {
+  const manifestPath = prefix('.convoy/manifest.yaml');
   const entries = files
-    .filter((f) => f.path !== '.convoy/manifest.yaml')
+    .filter((f) => f.path !== manifestPath)
     .map((f) => `  - path: ${f.path}\n    authored_by: convoy`)
     .join('\n');
   const content = `# Provenance record. Files here are Convoy-authored and may be
@@ -713,7 +733,7 @@ files:
 ${entries}
 `;
   return {
-    path: '.convoy/manifest.yaml',
+    path: manifestPath,
     lines: content.split('\n').length,
     summary: `${files.length} files tracked`,
     contentPreview: content,

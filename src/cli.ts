@@ -1805,10 +1805,12 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     ...(resolvedApiKey !== null && { apiKey: resolvedApiKey }),
   };
 
-  if (opts.injectFailure === 'rehearse' || opts.injectFailure === 'canary') {
+  const injectStage = opts.injectFailure === 'concurrency' ? 'rehearse' : opts.injectFailure;
+  if (injectStage === 'rehearse' || injectStage === 'canary') {
     orchestratorOpts.injectFailure = {
-      stage: opts.injectFailure,
-      kind: 'error-rate',
+      stage: injectStage,
+      kind: opts.injectFailure === 'concurrency' ? 'latency' : 'error-rate',
+      ...(opts.injectFailure === 'concurrency' && { scenario: 'concurrency' as const }),
       repoPath: plan.target.localPath,
       convoyAuthoredFiles: aggregateAuthoredFiles(plan).map((f) => f.path),
       ...(opts.logs !== undefined && { logsPath: opts.logs }),
@@ -3836,7 +3838,7 @@ program
   .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate (default: canary)')
   .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set` (default: <target>/.env.convoy-secrets)')
   .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds (default: 60)', (v) => Number(v))
-  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary (triggers medic with fixture logs)')
+  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary|concurrency (triggers medic with fixture logs; concurrency = serialised-renderer p99 breach)')
   .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
   .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
   .option(
@@ -3898,7 +3900,7 @@ program
   .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate (default: canary)')
   .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set` (default: <target>/.env.convoy-secrets)')
   .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds (default: 60)', (v) => Number(v))
-  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary (triggers medic with fixture logs)')
+  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary|concurrency (triggers medic with fixture logs; concurrency = serialised-renderer p99 breach)')
   .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
   .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
   .option(

@@ -290,6 +290,8 @@ export interface RealRehearsalOpt {
 export type InjectFailureOpt = {
   stage: 'rehearse' | 'canary';
   kind: 'latency' | 'error-rate' | 'build';
+  /** 'concurrency' — serialised-renderer bottleneck (0% errors, catastrophic p99) */
+  scenario?: 'concurrency';
   logsPath?: string;
   repoPath?: string;
   convoyAuthoredFiles?: string[];
@@ -942,13 +944,15 @@ export class RehearseStage extends BaseStage {
 
       const inject = ctx.opts.injectFailure;
       if (inject && inject.stage === 'rehearse') {
+        const isConcurrency = inject.scenario === 'concurrency';
         this.emit(ctx, 'progress', {
           phase: 'synthetic_load.breach',
-          p99_ms: 494,
-          error_rate_pct: 6.67,
-          threshold_error_rate_pct: 1.0,
+          p99_ms: isConcurrency ? 8740 : 494,
+          error_rate_pct: isConcurrency ? 0.0 : 6.67,
+          threshold_error_rate_pct: isConcurrency ? 0.0 : 1.0,
+          threshold_p99_ms: isConcurrency ? 500 : undefined,
         }, lane.id);
-        const logs = await loadInjectedLogs(inject);
+        const logs = isConcurrency ? defaultConcurrentLogs() : await loadInjectedLogs(inject);
         this.emit(ctx, 'progress', { phase: 'medic.invoked' }, lane.id);
         const diagnosis = await diagnose({
           stage: 'rehearse',
@@ -961,8 +965,12 @@ export class RehearseStage extends BaseStage {
           repoPath: inject.repoPath ?? '.',
           convoyAuthoredFiles: inject.convoyAuthoredFiles ?? [],
           logs,
-          metrics: { p99_ms: 494, p95_ms: 410, error_rate_pct: 6.67, count: 90 },
-          errorMessage: 'synthetic load breached error-rate tolerance (6.67% > 1%)',
+          metrics: isConcurrency
+            ? { p99_ms: 8740, p95_ms: 6210, error_rate_pct: 0.0, count: 300 }
+            : { p99_ms: 494, p95_ms: 410, error_rate_pct: 6.67, count: 90 },
+          errorMessage: isConcurrency
+            ? 'synthetic load breached p99 tolerance (8740ms > 500ms) — all requests succeeded but serialised'
+            : 'synthetic load breached error-rate tolerance (6.67% > 1%)',
         }, this.medicTelemetry(ctx));
         this.emit(ctx, 'diagnosis', diagnosis, lane.id);
         throw new RehearsalBreachError(diagnosis);
@@ -1084,6 +1092,29 @@ function defaultBuggyLogs(): string[] {
     `{"ts":"${now}","level":"info","message":"orders_served","count":20,"page":6,"pageSize":20,"latency_ms":14}`,
     `{"ts":"${now}","level":"error","message":"orders_query_timeout","latency_ms":461,"endpoint":"/orders","page":3,"pageSize":20,"note":"downstream orders-db call exceeded deadline"}`,
   ];
+}
+
+function defaultConcurrentLogs(): string[] {
+  const now = new Date().toISOString();
+  // Simulate 30 concurrent /render requests queuing through a global serialisation
+  // lock. All requests succeed (HTTP 200) but wait times stack up linearly.
+  // The medic should identify renderLock in src/routes/render.ts as the root cause.
+  const entries: string[] = [
+    `{"ts":"${now}","level":"info","message":"server_started","port":8080,"mode":"concurrent"}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-001","waited_ms":0}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-002","waited_ms":301}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-003","waited_ms":604}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-004","waited_ms":906}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-005","waited_ms":1208}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-010","waited_ms":2710}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-020","waited_ms":5720}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-029","waited_ms":8432}`,
+    `{"ts":"${now}","level":"info","message":"render_complete","reportId":"rep-001","pages":1,"render_ms":301,"total_ms":301}`,
+    `{"ts":"${now}","level":"info","message":"render_complete","reportId":"rep-002","pages":1,"render_ms":300,"total_ms":601}`,
+    `{"ts":"${now}","level":"info","message":"render_complete","reportId":"rep-010","pages":1,"render_ms":299,"total_ms":3009}`,
+    `{"ts":"${now}","level":"info","message":"render_complete","reportId":"rep-029","pages":1,"render_ms":301,"total_ms":8733}`,
+  ];
+  return entries;
 }
 
 export class CanaryStage extends BaseStage {
