@@ -598,6 +598,7 @@ interface PlanOpts {
   json?: boolean;
   noAi?: boolean;
   open?: boolean;
+  skipOnboard?: boolean;
 }
 
 async function runPlan(path: string, opts: PlanOpts): Promise<void> {
@@ -629,6 +630,22 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
     });
 
     const inferredRepoUrl = opts.repoUrl ?? resolved.repoUrl ?? undefined;
+
+    // Check for preferences and warn if missing
+    const { loadPreferences } = await import('./onboard/preferences.js');
+    const prefs = loadPreferences(resolved.localPath);
+    if (!prefs && !opts.skipOnboard) {
+      process.stderr.write(`${pc.yellow('⚠')}  No team preferences on file. Run ${pc.bold(`convoy onboard ${resolved.localPath}`)} first to capture deployment style,\n`);
+      process.stderr.write(`   approvers, compliance requirements, and platform preferences.\n`);
+      process.stderr.write(`   Using defaults for now. Pass --skip-onboard to suppress this warning.\n\n`);
+    }
+    // If platform mandate is set, use it as override
+    if (prefs?.platform.mandate && !opts.platform) {
+      opts.platform = prefs.platform.mandate;
+      if (isPlatform(opts.platform)) {
+        platformOverride = opts.platform;
+      }
+    }
 
     const byokKey = await resolveAnthropicKey(loadByokConfig(resolved.localPath));
     const { plan, enrichmentSource } = await buildPlan(resolved.localPath, {
@@ -762,6 +779,15 @@ interface ApplyOpts {
    * commit subject. Falls back to "fix: changes from operator" otherwise.
    */
   carryCommitMessage?: string;
+  // Railway flags
+  realRailway?: boolean;
+  railwayProject?: string;
+  // Cloud Run flags
+  realCloudrun?: boolean;
+  cloudrunService?: string;
+  cloudrunImage?: string;
+  cloudrunRegion?: string;
+  cloudrunProject?: string;
 }
 
 interface PreflightCheck {
@@ -2006,6 +2032,47 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     orchestratorOpts.realVpsGhcr = ghcrOpts;
     process.stdout.write(
       `${pc.dim('Real VPS GHCR deploy:')} ${pc.bold(ghcrOpts.host)} ${pc.dim(`→ ${ghcrOpts.imageRef} (bake: ${ghcrOpts.bakeWindowSeconds}s, caddy: ${ghcrOpts.manageCaddy ? ghcrOpts.domain ?? 'managed' : 'operator-owned'})`)}\n`,
+    );
+  }
+
+  if (opts.realRailway === true) {
+    const cwd = plan.target.workspace
+      ? `${plan.target.localPath}/${plan.target.workspace}`
+      : plan.target.localPath;
+    const { realRailway: _rr, ...realRailwayOpt } = {
+      realRailway: true,
+      cwd,
+      ...(opts.railwayProject !== undefined && { projectId: opts.railwayProject }),
+      convoyAuthoredFiles: aggregateAuthoredFiles(plan).map((f) => f.path),
+      bakeWindowSeconds: opts.flyBakeWindow ?? 60,
+    };
+    orchestratorOpts.realRailway = realRailwayOpt;
+    process.stdout.write(
+      `${pc.dim('Real Railway deploy:')} ${pc.bold(cwd)} ${pc.dim(`(bake: ${realRailwayOpt.bakeWindowSeconds}s)`)}\n`,
+    );
+  }
+
+  if (opts.realCloudrun === true) {
+    const service = opts.cloudrunService ?? autoFlyAppName(plan);
+    const image = opts.cloudrunImage;
+    if (!image) {
+      console.error(pc.red('--real-cloudrun requires --cloudrun-image=<image-ref>'));
+      process.exit(2);
+    }
+    const cwd = plan.target.workspace
+      ? `${plan.target.localPath}/${plan.target.workspace}`
+      : plan.target.localPath;
+    orchestratorOpts.realCloudRun = {
+      cwd,
+      service,
+      image,
+      region: opts.cloudrunRegion ?? 'us-central1',
+      ...(opts.cloudrunProject !== undefined && { project: opts.cloudrunProject }),
+      convoyAuthoredFiles: aggregateAuthoredFiles(plan).map((f) => f.path),
+      bakeWindowSeconds: opts.flyBakeWindow ?? 60,
+    };
+    process.stdout.write(
+      `${pc.dim('Real Cloud Run deploy:')} ${pc.bold(service)} ${pc.dim(`(image: ${image}, region: ${opts.cloudrunRegion ?? 'us-central1'})`)}\n`,
     );
   }
 
@@ -3802,6 +3869,7 @@ program
   .option('--open', 'open the saved plan in the web UI (requires --save)')
   .option('--json', 'output the raw plan as JSON instead of the human-readable render', false)
   .option('--no-ai', 'skip the Opus narrative pass and use the deterministic output')
+  .option('--skip-onboard', 'suppress the "no team preferences on file" warning')
   .action(async (path: string, options: PlanOpts) => {
     await runPlan(path, options);
   });
@@ -3870,6 +3938,13 @@ program
   .option('--vps-container-port <port>', 'port the container listens on for Caddy reverse proxy (default 3000)', (v) => Number(v))
   .option('--vps-run-migrations', 'run Prisma migrate deploy in a one-shot container before rolling the service')
   .option('--vps-bake-window <seconds>', 'observe-stage bake window in seconds (default 60)', (v) => Number(v))
+  .option('--real-railway', 'deploy via Railway CLI')
+  .option('--railway-project <id>', 'Railway project ID')
+  .option('--real-cloudrun', 'deploy via gcloud run deploy')
+  .option('--cloudrun-service <name>', 'Cloud Run service name')
+  .option('--cloudrun-image <ref>', 'Container image ref (e.g. gcr.io/proj/app:latest)')
+  .option('--cloudrun-region <region>', 'GCP region (default: us-central1)')
+  .option('--cloudrun-project <id>', 'GCP project ID (reads gcloud config if omitted)')
   .action(async (planId: string, options: ApplyOpts) => {
     await runApply(planId, options);
   });
@@ -3996,6 +4071,78 @@ program
   .action((service: string) => {
     console.error(pc.yellow(`rollback ${service}: not yet implemented`));
     process.exit(2);
+  });
+
+program
+  .command('orient [path]')
+  .description('Discover what platforms, CI/CD, secrets, and observability this repo already uses. Run before `convoy plan` on an unfamiliar codebase.')
+  .option('--json', 'emit full result as JSON')
+  .action(async (targetPath: string | undefined, opts: { json?: boolean }) => {
+    const localPath = resolve(targetPath ?? '.');
+    if (!existsSync(localPath)) {
+      process.stderr.write(`${pc.red('error')} path not found: ${localPath}\n`);
+      process.exit(1);
+    }
+    const { orientRepo } = await import('./orient/index.js');
+    const result = await orientRepo(localPath);
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+      return;
+    }
+    // Pretty-print
+    process.stdout.write(`\n${pc.bold('■ Team context')} — ${pc.cyan(result.graph.readmeTitle ?? localPath)}\n\n`);
+    process.stdout.write(`${pc.dim('Summary:')} ${result.summary}\n\n`);
+
+    if (result.graph.nodes.length > 0) {
+      process.stdout.write(`${pc.bold('SERVICES')}\n`);
+      for (const node of result.graph.nodes) {
+        const platform = node.existingPlatform ? pc.green(node.existingPlatform) : pc.dim('no platform config');
+        process.stdout.write(`  ${pc.cyan(node.name)}  ${platform}  ${node.ecosystem}${node.framework ? ` · ${node.framework}` : ''}\n`);
+        if (node.secretsHints.expectedKeys.length > 0) {
+          process.stdout.write(`    ${pc.dim('secrets:')} ${node.secretsHints.expectedKeys.join(', ')}\n`);
+        }
+      }
+      process.stdout.write('\n');
+    }
+
+    if (result.ciWorkflows.length > 0) {
+      process.stdout.write(`${pc.bold('CI/CD')}\n`);
+      for (const wf of result.ciWorkflows) {
+        process.stdout.write(`  ${wf.file}  triggers: ${wf.triggers.join(', ')}\n`);
+        if (wf.deploySteps.length > 0) {
+          process.stdout.write(`    ${pc.dim('deploy steps:')} ${wf.deploySteps.slice(0, 2).join(' / ')}\n`);
+        }
+        if (wf.secretsReferenced.length > 0) {
+          process.stdout.write(`    ${pc.dim('secrets used:')} ${wf.secretsReferenced.join(', ')}\n`);
+        }
+      }
+      process.stdout.write('\n');
+    }
+
+    if (result.secretsManager) {
+      process.stdout.write(`${pc.bold('SECRETS')}  ${result.secretsManager}\n\n`);
+    }
+
+    if (result.observability.length > 0) {
+      process.stdout.write(`${pc.bold('OBSERVABILITY')}  ${result.observability.join(', ')}\n\n`);
+    }
+
+    process.stdout.write(`${pc.dim('Run')} ${pc.bold('convoy onboard ' + localPath)} ${pc.dim('to capture team deployment preferences.')}\n\n`);
+  });
+
+program
+  .command('onboard [path]')
+  .description('Capture team deployment preferences interactively. Persists to .convoy/preferences.json.')
+  .option('--answers <json>', 'pre-fill answers as JSON (for non-interactive/MCP use)')
+  .action(async (targetPath: string | undefined, opts: { answers?: string }) => {
+    const localPath = resolve(targetPath ?? '.');
+    if (!existsSync(localPath)) {
+      process.stderr.write(`${pc.red('error')} path not found: ${localPath}\n`);
+      process.exit(1);
+    }
+    const prefilled = opts.answers ? JSON.parse(opts.answers) as Record<string, unknown> : {};
+    const { runOnboard } = await import('./onboard/index.js');
+    await runOnboard(localPath, prefilled);
   });
 
 await program.parseAsync();

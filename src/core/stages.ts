@@ -58,7 +58,7 @@ import {
   type RepoSourceSnapshot,
 } from './github-runner.js';
 import { diagnose, type DiagnoseOptions } from './medic.js';
-import { aggregateAuthoredFiles, normalizePlan, primaryLane, type ConvoyPlan, type DeploymentLane } from './plan.js';
+import { aggregateAuthoredFiles, normalizePlan, primaryLane, topoSortLanes, type ConvoyPlan, type DeploymentLane } from './plan.js';
 import { RehearsalRunner, type MetricsSnapshot } from './rehearsal-runner.js';
 import { pickPlatform } from '../planner/picker.js';
 import { scanRepository, type ScanResult } from '../planner/scanner.js';
@@ -109,6 +109,8 @@ export interface OrchestratorOpts {
   realVercel?: RealVercelOpt;
   realVps?: RealVpsOpt;
   realVpsGhcr?: RealVpsGhcrOpt;
+  realRailway?: RealRailwayOpt;
+  realCloudRun?: RealCloudRunOpt;
   /**
    * Resolved Anthropic API key for this run. Passed to the medic agent and
    * enricher so hosted Convoy can inject a team's BYOK key without touching
@@ -193,6 +195,31 @@ export interface RealVpsGhcrOpt {
   /** Error rate threshold %. Default 5. */
   thresholdErrorRatePct?: number;
   /** P99 latency threshold ms. Default 1500. */
+  thresholdP99Ms?: number;
+  convoyAuthoredFiles?: string[];
+}
+
+export interface RealRailwayOpt {
+  cwd: string;
+  projectId?: string;
+  secrets?: Record<string, string>;
+  healthPath?: string;
+  bakeWindowSeconds?: number;
+  thresholdErrorRatePct?: number;
+  thresholdP99Ms?: number;
+  convoyAuthoredFiles?: string[];
+}
+
+export interface RealCloudRunOpt {
+  cwd: string;
+  service: string;
+  image: string;
+  region?: string;
+  project?: string;
+  secrets?: Record<string, string>;
+  healthPath?: string;
+  bakeWindowSeconds?: number;
+  thresholdErrorRatePct?: number;
   thresholdP99Ms?: number;
   convoyAuthoredFiles?: string[];
 }
@@ -427,6 +454,39 @@ abstract class BaseStage implements Stage {
       const decided = ctx.store.decideApproval(approval.id, 'approved');
       ctx.bus.emit({ type: 'approval.decided', approval: decided });
       return decided;
+    }
+
+    // Trust-based auto-approval (fires at level 1+ when compliance doesn't require manual)
+    {
+      const plan = ctx.opts.plan ? normalizePlan(ctx.opts.plan) : null;
+      const repoPath = plan?.repo.localPath ?? null;
+      if (repoPath) {
+        const { readRunHistory, computeTrustLevel, shouldAutoApprove } = await import('./run-history.js');
+        const { loadPreferences } = await import('../onboard/preferences.js');
+        const serviceName = plan?.target.name ?? 'default';
+        const history = readRunHistory(repoPath);
+        const trust = computeTrustLevel(history, serviceName);
+        const prefs = loadPreferences(repoPath);
+        const hasCompliance = (prefs?.secrets.compliance.length ?? 0) > 0;
+        const rehearsalPrior = ctx.prior['rehearse'];
+        const rehearsalClean = rehearsalPrior && typeof rehearsalPrior === 'object'
+          ? (rehearsalPrior as Record<string, unknown>)['healthy'] === true
+          : false;
+
+        if (shouldAutoApprove(trust, kind, rehearsalClean, hasCompliance)) {
+          this.emit(ctx, 'progress', {
+            phase: 'trust.action',
+            action: `auto-approved ${kind}`,
+            trust_level: trust.level,
+            total_successful_deploys: trust.totalSuccessful,
+            rehearsal_clean: rehearsalClean,
+          });
+          await this.sleep(400, ctx.signal);
+          const decided = ctx.store.decideApproval(approval.id, 'approved');
+          ctx.bus.emit({ type: 'approval.decided', approval: decided });
+          return decided;
+        }
+      }
     }
 
     // No timeout — operator drives from the web UI on their own schedule.
@@ -1133,7 +1193,7 @@ export class CanaryStage extends BaseStage {
     // Unlike the first revision, this gate now probes the platform
     // connection read-only so the operator sees the exact missing lane
     // prerequisite before the deploy command fails late.
-    const isRealDeploy = Boolean(ctx.opts.realFly || ctx.opts.realVercel || ctx.opts.realVps || ctx.opts.realVpsGhcr);
+    const isRealDeploy = Boolean(ctx.opts.realFly || ctx.opts.realVercel || ctx.opts.realVps || ctx.opts.realVpsGhcr || ctx.opts.realRailway || ctx.opts.realCloudRun);
     if (isRealDeploy && ctx.opts.plan) {
       const plan = normalizePlan(ctx.opts.plan);
       for (const lane of plan.lanes) {
@@ -1153,30 +1213,40 @@ export class CanaryStage extends BaseStage {
     if (ctx.opts.realVpsGhcr) {
       return this.#runRealVpsGhcr(ctx, ctx.opts.realVpsGhcr);
     }
+    if (ctx.opts.realRailway) {
+      return this.#runRealRailway(ctx, ctx.opts.realRailway);
+    }
+    if (ctx.opts.realCloudRun) {
+      return this.#runRealCloudRun(ctx, ctx.opts.realCloudRun);
+    }
+
+    // Scripted path — DAG-aware multi-lane sequencing
+    const plan = ctx.opts.plan ? normalizePlan(ctx.opts.plan) : null;
+    const allLanes = plan?.lanes ?? [];
+    const deps = plan?.dependencies ?? [];
+    const waves = allLanes.length > 0 ? topoSortLanes(allLanes, deps) : [[null as DeploymentLane | null]];
 
     this.emit(ctx, 'started', {});
+    const results: Record<string, unknown> = {};
 
-    await this.awaitApproval(ctx, 'promote', {
-      note: 'Rehearsal clean. Promote to canary at 5% traffic?',
-      bake_window_seconds: 120,
-    });
-
-    this.emit(ctx, 'progress', { traffic_split_percent: 5 });
-    await this.sleep(1200, ctx.signal);
-
-    this.emit(ctx, 'progress', {
-      baseline_comparison: { p99_delta_ms: 3, error_rate_delta_pct: 0.0 },
-    });
-    await this.sleep(400, ctx.signal);
-
-    const result = {
-      healthy: true,
-      traffic_split_percent: 5,
-      p99_delta_ms: 3,
-      error_rate_delta_pct: 0.0,
-    };
-    this.emit(ctx, 'finished', result);
-    return result;
+    for (const wave of waves) {
+      for (const lane of wave) {
+        const laneId = lane?.id ?? null;
+        await this.awaitApproval(ctx, 'promote', {
+          note: 'Rehearsal clean. Promote to canary at 5% traffic?',
+          bake_window_seconds: 120,
+          ...(laneId ? { lane_id: laneId } : {}),
+        }, laneId);
+        this.emit(ctx, 'progress', { traffic_split_percent: 5 }, laneId);
+        await this.sleep(1200, ctx.signal);
+        this.emit(ctx, 'progress', { baseline_comparison: { p99_delta_ms: 3, error_rate_delta_pct: 0.0 } }, laneId);
+        await this.sleep(400, ctx.signal);
+        const result = { healthy: true, traffic_split_percent: 5, p99_delta_ms: 3, error_rate_delta_pct: 0.0 };
+        results[laneId ?? 'default'] = result;
+        this.emit(ctx, 'finished', result, laneId);
+      }
+    }
+    return results;
   }
 
   async #runRealFly(ctx: StageContext, cfg: RealFlyOpt): Promise<unknown> {
@@ -1705,6 +1775,134 @@ export class CanaryStage extends BaseStage {
     }, lane.id);
 
     this.emit(ctx, 'progress', { phase: 'secrets.gate.cleared', missing: filtered }, lane.id);
+  }
+
+  async #runRealRailway(ctx: StageContext, cfg: RealRailwayOpt): Promise<unknown> {
+    this.emit(ctx, 'started', { mode: 'real-railway', cwd: cfg.cwd });
+
+    const { railwayAvailable, railwayAuthStatus, railwaySetSecrets, railwayDeploy } = await import('../adapters/railway/runner.js');
+
+    const available = await railwayAvailable();
+    if (!available) {
+      throw new Error('railway CLI is not installed. Install it first: `npm i -g @railway/cli`');
+    }
+    const auth = await railwayAuthStatus();
+    if (!auth.ok) {
+      throw new Error(`railway CLI not authenticated: ${auth.error ?? 'unknown'}. Run: railway login`);
+    }
+    this.emit(ctx, 'progress', { phase: 'railway.authenticated', user: auth.user });
+
+    if (cfg.secrets && Object.keys(cfg.secrets).length > 0) {
+      this.emit(ctx, 'progress', { phase: 'secrets.staging', count: Object.keys(cfg.secrets).length });
+      await railwaySetSecrets(cfg.secrets, cfg.cwd, cfg.projectId);
+      this.emit(ctx, 'progress', { phase: 'secrets.staged' });
+    }
+
+    await this.awaitApproval(ctx, 'promote', {
+      note: `Rehearsal clean. Deploy to Railway${cfg.projectId ? ` (project: ${cfg.projectId})` : ''}?`,
+      cwd: cfg.cwd,
+    });
+
+    this.emit(ctx, 'progress', { phase: 'railway.deploying' });
+
+    const deployResult = await railwayDeploy({
+      cwd: cfg.cwd,
+      projectId: cfg.projectId,
+      onLog: (line) => {
+        if (/error|failed/i.test(line)) this.emit(ctx, 'log', { line });
+      },
+    });
+
+    if (!deployResult.ok) {
+      this.emit(ctx, 'progress', { phase: 'railway.deploy_failed', error: deployResult.error });
+      const diagnosis = await diagnose({
+        stage: 'canary',
+        phase: 'railway_deploy',
+        repoPath: cfg.cwd,
+        convoyAuthoredFiles: cfg.convoyAuthoredFiles ?? [],
+        logs: deployResult.logs,
+        errorMessage: deployResult.error ?? 'railway deploy failed',
+      }, this.medicTelemetry(ctx));
+      this.emit(ctx, 'diagnosis', diagnosis);
+      throw new Error(`Railway deploy failed: ${deployResult.error}`);
+    }
+
+    const result = {
+      healthy: true,
+      url: deployResult.url,
+      deploymentId: deployResult.deploymentId,
+    };
+    this.emit(ctx, 'finished', result);
+    return result;
+  }
+
+  async #runRealCloudRun(ctx: StageContext, cfg: RealCloudRunOpt): Promise<unknown> {
+    this.emit(ctx, 'started', { mode: 'real-cloudrun', service: cfg.service, region: cfg.region ?? 'us-central1' });
+
+    const { gcloudAvailable, cloudRunAuthStatus, cloudRunGetCurrentRevision, cloudRunDeploy } = await import('../adapters/cloudrun/runner.js');
+
+    const available = await gcloudAvailable();
+    if (!available) {
+      throw new Error('gcloud CLI is not installed. Install it first: https://cloud.google.com/sdk/docs/install');
+    }
+    const auth = await cloudRunAuthStatus();
+    if (!auth.ok) {
+      throw new Error(`gcloud not authenticated: ${auth.error ?? 'unknown'}. Run: gcloud auth login`);
+    }
+    this.emit(ctx, 'progress', { phase: 'cloudrun.authenticated', account: auth.account, project: auth.project });
+
+    const region = cfg.region ?? 'us-central1';
+
+    // Pre-stage rollback target
+    const previousRevision = await cloudRunGetCurrentRevision(cfg.service, region, cfg.project);
+    if (previousRevision) {
+      this.emit(ctx, 'progress', { phase: 'rollback.prestaged', previous_revision: previousRevision });
+    }
+
+    await this.awaitApproval(ctx, 'promote', {
+      note: `Rehearsal clean. Deploy ${cfg.image} to Cloud Run service "${cfg.service}" in ${region}?`,
+      service: cfg.service,
+      image: cfg.image,
+      region,
+    });
+
+    this.emit(ctx, 'progress', { phase: 'cloudrun.deploying', service: cfg.service, image: cfg.image, region });
+
+    const deployResult = await cloudRunDeploy({
+      service: cfg.service,
+      image: cfg.image,
+      region,
+      project: cfg.project,
+      envVars: cfg.secrets,
+      onLog: (line) => {
+        if (/error|failed/i.test(line)) this.emit(ctx, 'log', { line });
+      },
+    });
+
+    if (!deployResult.ok) {
+      this.emit(ctx, 'progress', { phase: 'cloudrun.deploy_failed', error: deployResult.error });
+      const diagnosis = await diagnose({
+        stage: 'canary',
+        phase: 'cloudrun_deploy',
+        repoPath: cfg.cwd,
+        convoyAuthoredFiles: cfg.convoyAuthoredFiles ?? [],
+        logs: deployResult.logs,
+        errorMessage: deployResult.error ?? 'cloud run deploy failed',
+      }, this.medicTelemetry(ctx));
+      this.emit(ctx, 'diagnosis', diagnosis);
+      throw new Error(`Cloud Run deploy failed: ${deployResult.error}`);
+    }
+
+    const result = {
+      healthy: true,
+      url: deployResult.url,
+      revision: deployResult.revision,
+      service: cfg.service,
+      region,
+      ...(previousRevision ? { previous_revision: previousRevision } : {}),
+    };
+    this.emit(ctx, 'finished', result);
+    return result;
   }
 }
 

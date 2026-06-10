@@ -436,6 +436,35 @@ export function primaryLane(plan: ConvoyPlan): DeploymentLane {
   return plan.lanes[0]!;
 }
 
+export function topoSortLanes(
+  lanes: DeploymentLane[],
+  dependencies: PlanLaneDependency[],
+): DeploymentLane[][] {
+  // Kahn's algorithm. Returns array of waves (each wave deploys in parallel).
+  // Throws if cycle detected.
+  const laneById = new Map(lanes.map(l => [l.id, l]));
+  const inDegree = new Map(lanes.map(l => [l.id, 0]));
+  const adj = new Map(lanes.map(l => [l.id, [] as string[]]));
+  for (const dep of dependencies) {
+    adj.get(dep.from)!.push(dep.to);
+    inDegree.set(dep.to, (inDegree.get(dep.to) ?? 0) + 1);
+  }
+  const waves: DeploymentLane[][] = [];
+  let remaining = new Set(lanes.map(l => l.id));
+  while (remaining.size > 0) {
+    const wave = [...remaining].filter(id => (inDegree.get(id) ?? 0) === 0);
+    if (wave.length === 0) throw new Error('Cycle detected in lane dependencies');
+    waves.push(wave.map(id => laneById.get(id)!));
+    for (const id of wave) {
+      remaining.delete(id);
+      for (const next of (adj.get(id) ?? [])) {
+        inDegree.set(next, (inDegree.get(next) ?? 0) - 1);
+      }
+    }
+  }
+  return waves;
+}
+
 export function aggregateAuthoredFiles(plan: ConvoyPlan): PlanAuthoredFile[] {
   return dedupeFiles(plan.lanes.flatMap((lane) => lane.author.convoyAuthoredFiles));
 }
