@@ -78,10 +78,16 @@ export interface PlanPlatformDecision {
   candidates: PlanPlatformCandidate[];
 }
 
+export interface PlanPlatformAdjustment {
+  label: string;
+  delta: number;
+}
+
 export interface PlanPlatformCandidate {
   platform: Platform;
   score: number;
   reason: string;
+  adjustments: PlanPlatformAdjustment[];
 }
 
 export interface PlanLaneDependency {
@@ -519,16 +525,26 @@ export function renderPlan(plan: ConvoyPlan): string {
   }
   L.push('');
 
-  L.push('Why this platform');
-  const rankings = primary.platformDecision.candidates
-    .map((c) => {
-      const marker = c.platform === primary.platformDecision.chosen ? '●' : '·';
-      return `${marker} ${c.platform} ${c.score}`;
-    })
-    .join('   ');
-  L.push(`  ${primary.platformDecision.chosen} chosen (${primary.platformDecision.source})`);
-  L.push(`  ${rankings}`);
-  L.push(`  ${wrap(primary.platformDecision.reason, 72, '  ').trim()}`);
+  L.push('Platform selection');
+  for (const lane of plan.lanes) {
+    const pd = lane.platformDecision;
+    const laneLabel = plan.lanes.length > 1 ? `  [${lane.role}] ` : '  ';
+    L.push(`${laneLabel}${pd.chosen}  (${pd.source}${pd.source === 'scored' ? `, score ${pd.candidates.find((c) => c.platform === pd.chosen)?.score ?? '?'}` : ''})`);
+    if (pd.source === 'scored') {
+      // Show top 3 candidates with their score and the top adjustments.
+      for (const c of pd.candidates.slice(0, 3)) {
+        const marker = c.platform === pd.chosen ? '  ●' : '  ·';
+        const topAdj = (c.adjustments ?? [])
+          .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+          .slice(0, 2)
+          .map((a) => `${a.delta > 0 ? '+' : ''}${a.delta} ${a.label}`)
+          .join(', ');
+        L.push(`${marker} ${c.platform.padEnd(10)} ${String(c.score).padStart(3)}  ${topAdj || c.reason}`);
+      }
+    } else {
+      L.push(`    ${pd.reason}`);
+    }
+  }
 
   const advisory = computePlatformAdvisory(plan);
   if (advisory) {

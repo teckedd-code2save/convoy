@@ -315,6 +315,9 @@ function PlatformSection({ plan }: { plan: PlanSummary }) {
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 pt-1">
           {sortedCandidates.map((c) => {
             const chosen = c.platform === plan.platform.chosen;
+            const topAdj = ((c as { adjustments?: Array<{ delta: number; label: string }> }).adjustments ?? [])
+              .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+              .slice(0, 3);
             return (
               <div
                 key={c.platform}
@@ -329,7 +332,20 @@ function PlatformSection({ plan }: { plan: PlanSummary }) {
                   <span className="font-mono text-sm font-semibold">{c.platform}</span>
                   <span className="text-xs text-muted font-mono tabular-nums">{c.score}</span>
                 </div>
-                <div className="text-xs text-muted mt-2 line-clamp-3">{c.reason}</div>
+                {topAdj.length > 0 ? (
+                  <ul className="mt-2 space-y-0.5">
+                    {topAdj.map((a, i) => (
+                      <li key={i} className="flex items-baseline gap-1.5 text-[11px]">
+                        <span className={`tabular-nums font-mono shrink-0 ${a.delta > 0 ? 'text-success' : 'text-danger'}`}>
+                          {a.delta > 0 ? '+' : ''}{a.delta}
+                        </span>
+                        <span className="text-muted line-clamp-1">{a.label}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <div className="text-xs text-muted mt-2 line-clamp-3">{c.reason}</div>
+                )}
               </div>
             );
           })}

@@ -881,6 +881,7 @@ export class AuthorStage extends BaseStage {
       pr_url: pr.prUrl,
       pr_number: pr.prNumber,
       branch: pr.branch,
+      rehearsal: summarizeRehearsalForApproval(ctx.prior['rehearse']),
       note: sourceForApproval
         ? `This PR is based on local HEAD ${sourceForApproval.head_sha.slice(0, 7)}${sourceForApproval.branch ? ` from \`${sourceForApproval.branch}\`` : ''}. Review the full GitHub diff, including any operator-authored application commits from that snapshot, then approve to merge.`
         : 'Review the full GitHub diff and approve to merge.',
