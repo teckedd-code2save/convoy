@@ -35,6 +35,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
               </a>
               <nav className="flex items-center gap-5 text-sm text-muted">
                 <a href="/" className="hover:text-ink transition-colors">Home</a>
+                <a href="/projects" className="hover:text-ink transition-colors">Projects</a>
                 <a href="/plans" className="hover:text-ink transition-colors">Plans</a>
                 <a href="/runs" className="hover:text-ink transition-colors">Runs</a>
                 <a

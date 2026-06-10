@@ -12,7 +12,7 @@ import type {
 } from '../core/plan.js';
 import type { ScanResult } from './scanner.js';
 
-const MODEL = 'claude-opus-4-7';
+const MODEL = 'claude-sonnet-4-6';
 const MAX_TOKENS = 4000;
 const CACHE_VERSION = 'v2';
 
@@ -84,7 +84,7 @@ export async function enrichPlan(
     const response = await client.messages.create({
       model: opts.model ?? MODEL,
       max_tokens: MAX_TOKENS,
-      system: SYSTEM_PROMPT,
+      system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: buildUserPrompt(scan, plan) }],
     });
 

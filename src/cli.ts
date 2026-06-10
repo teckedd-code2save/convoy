@@ -19,6 +19,7 @@ import {
   type RealFlyOpt,
   type RealRehearsalOpt,
   type RealVercelOpt,
+  type RealVpsGhcrOpt,
   type RealVpsOpt,
 } from './core/stages.js';
 import { RunStateStore } from './core/state.js';
@@ -725,6 +726,17 @@ interface ApplyOpts {
   vpsPort?: number;
   vpsDeployRoot?: string;
   vpsManageNginx?: boolean;
+  // GHCR-based VPS deploy (build+push locally, compose pull+up on box).
+  realVpsGhcr?: boolean;
+  realVpsGhcrConfig?: string;  // path to JSON config file
+  vpsGhcrImage?: string;
+  vpsGhcrUsername?: string;
+  vpsGhcrToken?: string;
+  vpsManageCaddy?: boolean;
+  vpsDomain?: string;
+  vpsContainerPort?: number;
+  vpsRunMigrations?: boolean;
+  vpsBakeWindow?: number;
   /**
    * When set, runApply tells the orchestrator to continue this run row
    * instead of creating a new one. Set programmatically by `convoy resume`,
@@ -1913,6 +1925,70 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     orchestratorOpts.realVps = realVps;
     process.stdout.write(
       `${pc.dim('Real VPS deploy:')} ${pc.bold(host)} ${pc.dim(`→ ${realVps.deployRoot} (bake: ${realVps.bakeWindowSeconds}s, nginx: ${realVps.manageNginx ? 'managed' : 'operator-owned'})`)}\n`,
+    );
+  }
+
+  if (opts.realVpsGhcr === true) {
+    // Config may come from --real-vps-ghcr-config (written by MCP server) or
+    // from individual --vps-* flags. The JSON file wins; flags are the
+    // fallback for direct CLI users.
+    let ghcrOpts: RealVpsGhcrOpt | null = null;
+
+    if (opts.realVpsGhcrConfig) {
+      try {
+        const { readFileSync } = await import('node:fs');
+        ghcrOpts = JSON.parse(readFileSync(opts.realVpsGhcrConfig, 'utf8')) as RealVpsGhcrOpt;
+      } catch (err) {
+        console.error(pc.red(`--real-vps-ghcr-config: failed to read ${opts.realVpsGhcrConfig}: ${err instanceof Error ? err.message : String(err)}`));
+        process.exit(2);
+      }
+    } else {
+      const host = opts.vpsHost ?? process.env['CONVOY_VPS_HOST'];
+      const imageRef = opts.vpsGhcrImage ?? process.env['CONVOY_GHCR_IMAGE'];
+      const ghcrUsername = opts.vpsGhcrUsername ?? process.env['GHCR_USERNAME'] ?? process.env['GITHUB_ACTOR'];
+      const ghcrToken = opts.vpsGhcrToken ?? process.env['GHCR_TOKEN'] ?? process.env['GH_TOKEN'] ?? process.env['GITHUB_TOKEN'];
+
+      if (!host || !imageRef || !ghcrUsername || !ghcrToken) {
+        const missing = [
+          !host && '--vps-host / CONVOY_VPS_HOST',
+          !imageRef && '--vps-ghcr-image / CONVOY_GHCR_IMAGE',
+          !ghcrUsername && '--vps-ghcr-username / GHCR_USERNAME',
+          !ghcrToken && '--vps-ghcr-token / GHCR_TOKEN or GH_TOKEN',
+        ].filter(Boolean);
+        console.error(pc.red(`--real-vps-ghcr missing required values: ${missing.join(', ')}`));
+        process.exit(2);
+      }
+
+      const cwd = plan.target.workspace
+        ? `${plan.target.localPath}/${plan.target.workspace}`
+        : plan.target.localPath;
+      const appName = autoFlyAppName(plan);
+
+      ghcrOpts = {
+        host,
+        cwd,
+        deployRoot: opts.vpsDeployRoot ?? `/opt/${appName}`,
+        appName,
+        imageRef,
+        ghcrUsername,
+        ghcrToken,
+        ...(opts.vpsPort !== undefined && { sshPort: opts.vpsPort }),
+        ...(opts.vpsKey !== undefined && { identityFile: opts.vpsKey }),
+        ...(opts.vpsManageCaddy !== undefined && { manageCaddy: opts.vpsManageCaddy }),
+        ...(opts.vpsDomain !== undefined && { domain: opts.vpsDomain }),
+        ...(opts.vpsContainerPort !== undefined && { containerPort: opts.vpsContainerPort }),
+        ...(opts.vpsRunMigrations !== undefined && { runMigrations: opts.vpsRunMigrations }),
+        healthPath: primaryLane(plan).rehearsal.healthPath ?? '/',
+        thresholdErrorRatePct: 5.0,
+        thresholdP99Ms: 1500,
+        bakeWindowSeconds: opts.vpsBakeWindow ?? opts.flyBakeWindow ?? 60,
+        convoyAuthoredFiles: aggregateAuthoredFiles(plan).map((f) => f.path),
+      };
+    }
+
+    orchestratorOpts.realVpsGhcr = ghcrOpts;
+    process.stdout.write(
+      `${pc.dim('Real VPS GHCR deploy:')} ${pc.bold(ghcrOpts.host)} ${pc.dim(`→ ${ghcrOpts.imageRef} (bake: ${ghcrOpts.bakeWindowSeconds}s, caddy: ${ghcrOpts.manageCaddy ? ghcrOpts.domain ?? 'managed' : 'operator-owned'})`)}\n`,
     );
   }
 
@@ -3782,6 +3858,16 @@ program
   .option('--vps-port <port>', 'SSH port (default 22)', (v) => Number(v))
   .option('--vps-deploy-root <path>', 'deploy root on the box (default: /srv/<app>)')
   .option('--vps-manage-nginx', 'let Convoy author and reload nginx upstream config (default: leave nginx alone)')
+  .option('--real-vps-ghcr', 'build image locally, push to GHCR, deploy via docker compose on VPS (requires --real-vps-ghcr-config or individual --vps-* flags)')
+  .option('--real-vps-ghcr-config <path>', 'JSON file containing RealVpsGhcrOpt (written by `convoy apply` from MCP; see docs/mcp.md)')
+  .option('--vps-ghcr-image <ref>', 'GHCR image ref without tag, e.g. ghcr.io/myorg/my-app')
+  .option('--vps-ghcr-username <user>', 'GitHub username for docker login (or set GHCR_USERNAME)')
+  .option('--vps-ghcr-token <token>', 'GitHub token with packages:write (or set GHCR_TOKEN / GH_TOKEN)')
+  .option('--vps-manage-caddy', 'write /etc/caddy/sites/<app>.caddy and reload Caddy on the box')
+  .option('--vps-domain <domain>', 'domain for Caddy site file (required with --vps-manage-caddy)')
+  .option('--vps-container-port <port>', 'port the container listens on for Caddy reverse proxy (default 3000)', (v) => Number(v))
+  .option('--vps-run-migrations', 'run Prisma migrate deploy in a one-shot container before rolling the service')
+  .option('--vps-bake-window <seconds>', 'observe-stage bake window in seconds (default 60)', (v) => Number(v))
   .action(async (planId: string, options: ApplyOpts) => {
     await runApply(planId, options);
   });
