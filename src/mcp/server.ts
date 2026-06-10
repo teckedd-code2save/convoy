@@ -24,6 +24,7 @@ import { PlanStore } from '../core/plan.js';
 import { RunStateStore } from '../core/state.js';
 import type { Approval, Platform, Run, RunEvent } from '../core/types.js';
 import type { RealVpsGhcrOpt } from '../core/stages.js';
+import { resolveAnthropicKey, type ByokConfig } from '../core/key-resolver.js';
 import { buildPlan } from '../planner/index.js';
 
 // ---------------------------------------------------------------------------
@@ -139,6 +140,28 @@ function resolvePlanId(idOrPrefix: string): { id: string } | { error: string } {
 // Tool registration (transport-agnostic)
 // ---------------------------------------------------------------------------
 
+// Reusable BYOK input schema — same shape accepted by both convoy_plan and
+// convoy_apply. Teams supply this once per call; the server resolves the
+// Anthropic key (Infisical fetch or direct) before any AI work starts.
+const byokSchema = z.object({
+  provider: z.enum(['infisical', 'direct'])
+    .describe('"infisical" fetches ANTHROPIC_API_KEY from your vault via universal auth; "direct" accepts the key inline'),
+  apiKey: z.string().optional()
+    .describe('Required when provider=direct — the raw sk-ant-... key'),
+  siteUrl: z.string().optional()
+    .describe('Infisical instance URL (default: https://app.infisical.com)'),
+  clientId: z.string().optional()
+    .describe('Infisical universal-auth client ID'),
+  clientSecret: z.string().optional()
+    .describe('Infisical universal-auth client secret'),
+  projectId: z.string().optional()
+    .describe('Infisical project/workspace ID'),
+  environment: z.string().optional()
+    .describe('Infisical environment (e.g. "prod", "staging")'),
+  secretName: z.string().optional()
+    .describe('Secret name to fetch (default: ANTHROPIC_API_KEY)'),
+}).optional().describe('BYOK: supply your own Anthropic API key so Convoy does not bill you for AI calls. Omit to use the server\'s key (if any).');
+
 export function registerConvoyTools(server: McpServer): void {
   server.registerTool(
     'convoy_plan',
@@ -151,9 +174,10 @@ export function registerConvoyTools(server: McpServer): void {
           .describe('Force a platform instead of letting Convoy score one'),
         workspace: z.string().optional()
           .describe('Subdirectory to target inside a monorepo (e.g. "backend", "apps/web")'),
+        byok: byokSchema,
       },
     },
-    async ({ repoPath, platform, workspace }) =>
+    async ({ repoPath, platform, workspace, byok }) =>
       guarded(async () => {
         const localPath = resolve(REPO_ROOT, repoPath);
         if (!existsSync(localPath)) {
@@ -163,11 +187,11 @@ export function registerConvoyTools(server: McpServer): void {
           return fail(`Unknown platform "${platform}". Supported: ${SUPPORTED_PLATFORMS.join(', ')}`);
         }
 
-        // AI enrichment stays on when ANTHROPIC_API_KEY is set; the planner
-        // falls back deterministically without it.
+        const apiKey = await resolveAnthropicKey(byok as ByokConfig | undefined ?? null);
         const { plan, enrichmentSource } = await buildPlan(localPath, {
           ...(platform !== undefined && { platformOverride: platform }),
           ...(workspace !== undefined && { workspace }),
+          ai: { ...(apiKey && { apiKey }) },
         });
 
         const store = new PlanStore(PLANS_DIR);
@@ -248,9 +272,10 @@ export function registerConvoyTools(server: McpServer): void {
           identityFile: z.string().optional().describe('SSH private key path'),
         }).optional()
           .describe('Deploy via GHCR (build + push locally, docker compose pull+up on VPS). Requires docker + ssh locally.'),
+        byok: byokSchema,
       },
     },
-    async ({ planId, autoApprove, realRehearsal, realAuthor, realFly, realVpsGhcr }) =>
+    async ({ planId, autoApprove, realRehearsal, realAuthor, realFly, realVpsGhcr, byok }) =>
       guarded(async () => {
         const resolved = resolvePlanId(planId);
         if ('error' in resolved) return fail(resolved.error);
@@ -291,9 +316,20 @@ export function registerConvoyTools(server: McpServer): void {
             args.push('--real-vps-ghcr', '--real-vps-ghcr-config', configPath);
           }
 
+          // Resolve BYOK key here so Infisical is fetched once on the server,
+          // then injected into the child env. The subprocess CLI auto-loads
+          // .convoy/byok.json too, so self-hosted teams without byok param
+          // are still served.
+          const byokKey = byok
+            ? await resolveAnthropicKey(byok as ByokConfig)
+            : null;
+
           const child = spawn('npm', args, {
             cwd: REPO_ROOT,
-            env: { ...process.env },
+            env: {
+              ...process.env,
+              ...(byokKey ? { ANTHROPIC_API_KEY: byokKey } : {}),
+            },
             stdio: ['ignore', logFd, logFd],
             detached: true,
           });
@@ -324,6 +360,69 @@ export function registerConvoyTools(server: McpServer): void {
           return fail(
             `Spawned convoy apply for plan ${fullPlanId.slice(0, 8)} but no run row appeared within 30s — preflight likely refused (hard blockers). Check ${logPath} for the CLI output, or convoy_list_runs in case the run started late.`,
           );
+        });
+      }),
+  );
+
+  server.registerTool(
+    'convoy_vps_bootstrap',
+    {
+      description:
+        'Install Docker + Caddy on a fresh VPS over SSH (idempotent — safe to re-run). ' +
+        'Detects OS (Debian/Ubuntu or RHEL/CentOS/Rocky), installs each tool if absent, ' +
+        'creates /etc/caddy/sites/ and patches the Caddyfile, creates the deploy root. ' +
+        'Prerequisite: the SSH user must have passwordless sudo. Run once before the first convoy_apply with realVpsGhcr.',
+      inputSchema: {
+        host: z.string().describe('SSH destination: user@host'),
+        deployRoot: z.string().optional()
+          .describe('Base deploy directory on the VPS (default: /opt/convoy)'),
+        sshPort: z.number().optional().describe('SSH port (default 22)'),
+        identityFile: z.string().optional().describe('Path to SSH private key'),
+        installDocker: z.boolean().optional().describe('Install Docker if absent (default true)'),
+        installCaddy: z.boolean().optional().describe('Install Caddy if absent (default true)'),
+      },
+    },
+    async ({ host, deployRoot, sshPort, identityFile, installDocker, installCaddy }) =>
+      guarded(async () => {
+        const { sshAvailable } = await import('../adapters/vps/runner.js');
+        const { bootstrapVps } = await import('../adapters/vps/bootstrap.js');
+
+        if (!(await sshAvailable())) {
+          return fail('ssh is not installed on the Convoy server. Install OpenSSH and try again.');
+        }
+
+        const target = {
+          host,
+          deployRoot: deployRoot ?? '/opt/convoy',
+          ...(sshPort !== undefined && { port: sshPort }),
+          ...(identityFile !== undefined && { identityFile }),
+        };
+
+        const log: string[] = [];
+        const report = await bootstrapVps(target, {
+          installDocker: installDocker !== false,
+          installCaddy: installCaddy !== false,
+          onStep: (label, status, detail) => {
+            log.push(`[${status}] ${label}${detail ? `: ${detail}` : ''}`);
+          },
+        });
+
+        if (!report.ok) {
+          const failed = report.steps.filter((s) => s.status === 'failed');
+          return fail(
+            `Bootstrap failed on ${host}.\n` +
+            failed.map((s) => `  ${s.label}${s.detail ? `: ${s.detail}` : ''}`).join('\n'),
+          );
+        }
+
+        return ok({
+          host,
+          deployRoot: target.deployRoot,
+          osFamily: report.osFamily,
+          user: report.user,
+          steps: report.steps,
+          log,
+          nextStep: `Bootstrap complete. You can now call convoy_apply with realVpsGhcr.deployRoot="${target.deployRoot}".`,
         });
       }),
   );

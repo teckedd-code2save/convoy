@@ -123,25 +123,59 @@ function scoreOne(platform: Platform, scan: ScanResult): PlanPlatformCandidate {
       reasons.push('extra GCP setup cost');
       break;
 
-    case 'vps':
-      // VPS is the "I own the box" path. We never *recommend* it over a
-      // managed PaaS unless the operator opts in (CONVOY_VPS_HOST set), or
-      // the repo is already container-shaped enough that VPS is a clean fit
-      // (Dockerfile present, no Next.js Vercel preference). The point isn't
-      // to outscore Fly — it's to be available when an operator says
-      // --platform=vps explicitly without surprising anyone with autopick.
+    case 'vps': {
+      // VPS is the "I own the box" path. The baseline penalty keeps it from
+      // autopicking over managed PaaSes unless signals clearly point here.
       if (process.env['CONVOY_VPS_HOST']) {
         score += 30;
         reasons.push('CONVOY_VPS_HOST set (operator opted in)');
       } else {
-        // Without explicit opt-in, stay below the managed PaaSes by default.
         score -= 10;
         reasons.push('opt-in only (set CONVOY_VPS_HOST or pass --platform=vps)');
       }
+
       if (scan.hasDockerfile) {
         score += 10;
         reasons.push('repo already ships a Dockerfile');
       }
+
+      // docker-compose.yml at root — operator has container orchestration
+      // already configured. Local-dev-only compose would live under a
+      // subdirectory; root-level compose targets production deployment.
+      const hasDockerCompose = scan.topLevelFiles.some(
+        (f) => f === 'docker-compose.yml' || f === 'docker-compose.yaml' ||
+               f === 'compose.yml' || f === 'compose.yaml',
+      );
+      if (hasDockerCompose) {
+        score += 15;
+        reasons.push('docker-compose.yml present — compose apps run naturally on VPS');
+      }
+
+      // Caddyfile at repo root = operator already configured Caddy as the
+      // reverse proxy. Almost always means they own the box it runs on.
+      if (scan.topLevelFiles.includes('Caddyfile')) {
+        score += 15;
+        reasons.push('Caddyfile present — repo already configures Caddy reverse proxy');
+      }
+
+      // deploy.yml at root is the ship-to-vps convention: app was explicitly
+      // scaffolded for VPS deployment. Strongest non-env-var signal.
+      if (
+        scan.topLevelFiles.includes('deploy.yml') ||
+        scan.topLevelFiles.includes('deploy.yaml')
+      ) {
+        score += 20;
+        reasons.push('deploy.yml present — repo scaffolded for VPS deployment');
+      }
+
+      // Multi-service monorepos with 3+ services are expensive on managed
+      // PaaSes (one deployment unit per service); a single VPS with compose
+      // is often the practical choice.
+      if (scan.subServices.length >= 3) {
+        score += 10;
+        reasons.push(`${scan.subServices.length}-service repo — VPS compose avoids per-service PaaS pricing`);
+      }
+
       if (isStatic) {
         score -= 30;
         reasons.push('static sites belong on a CDN, not a VPS');
@@ -151,6 +185,7 @@ function scoreOne(platform: Platform, scan: ScanResult): PlanPlatformCandidate {
         reasons.push('Next.js fits Vercel better unless you need a box');
       }
       break;
+    }
   }
 
   score = Math.max(0, Math.min(100, score));
