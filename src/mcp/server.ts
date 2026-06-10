@@ -365,6 +365,69 @@ export function registerConvoyTools(server: McpServer): void {
   );
 
   server.registerTool(
+    'convoy_vps_bootstrap',
+    {
+      description:
+        'Install Docker + Caddy on a fresh VPS over SSH (idempotent — safe to re-run). ' +
+        'Detects OS (Debian/Ubuntu or RHEL/CentOS/Rocky), installs each tool if absent, ' +
+        'creates /etc/caddy/sites/ and patches the Caddyfile, creates the deploy root. ' +
+        'Prerequisite: the SSH user must have passwordless sudo. Run once before the first convoy_apply with realVpsGhcr.',
+      inputSchema: {
+        host: z.string().describe('SSH destination: user@host'),
+        deployRoot: z.string().optional()
+          .describe('Base deploy directory on the VPS (default: /opt/convoy)'),
+        sshPort: z.number().optional().describe('SSH port (default 22)'),
+        identityFile: z.string().optional().describe('Path to SSH private key'),
+        installDocker: z.boolean().optional().describe('Install Docker if absent (default true)'),
+        installCaddy: z.boolean().optional().describe('Install Caddy if absent (default true)'),
+      },
+    },
+    async ({ host, deployRoot, sshPort, identityFile, installDocker, installCaddy }) =>
+      guarded(async () => {
+        const { sshAvailable } = await import('../adapters/vps/runner.js');
+        const { bootstrapVps } = await import('../adapters/vps/bootstrap.js');
+
+        if (!(await sshAvailable())) {
+          return fail('ssh is not installed on the Convoy server. Install OpenSSH and try again.');
+        }
+
+        const target = {
+          host,
+          deployRoot: deployRoot ?? '/opt/convoy',
+          ...(sshPort !== undefined && { port: sshPort }),
+          ...(identityFile !== undefined && { identityFile }),
+        };
+
+        const log: string[] = [];
+        const report = await bootstrapVps(target, {
+          installDocker: installDocker !== false,
+          installCaddy: installCaddy !== false,
+          onStep: (label, status, detail) => {
+            log.push(`[${status}] ${label}${detail ? `: ${detail}` : ''}`);
+          },
+        });
+
+        if (!report.ok) {
+          const failed = report.steps.filter((s) => s.status === 'failed');
+          return fail(
+            `Bootstrap failed on ${host}.\n` +
+            failed.map((s) => `  ${s.label}${s.detail ? `: ${s.detail}` : ''}`).join('\n'),
+          );
+        }
+
+        return ok({
+          host,
+          deployRoot: target.deployRoot,
+          osFamily: report.osFamily,
+          user: report.user,
+          steps: report.steps,
+          log,
+          nextStep: `Bootstrap complete. You can now call convoy_apply with realVpsGhcr.deployRoot="${target.deployRoot}".`,
+        });
+      }),
+  );
+
+  server.registerTool(
     'convoy_status',
     {
       description:

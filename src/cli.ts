@@ -2306,96 +2306,81 @@ interface PreflightOpts {
 }
 
 interface VpsBootstrapOpts {
-  withNginx?: boolean;
+  deployRoot?: string;
+  sshPort?: string;
+  identityFile?: string;
+  noDocker?: boolean;
+  noCaddy?: boolean;
   yes?: boolean;
 }
 
-/**
- * Install Docker (and optionally nginx) on a fresh VPS over SSH.
- *
- * The contract:
- *  1. Print the exact commands that will run on the remote host.
- *  2. If --yes is not passed, exit without changes (dry-run by default).
- *  3. Use the official get.docker.com convenience script — it's idempotent
- *     and the canonical Docker install path. Skip if docker is already
- *     present.
- *  4. Never bypass sudo prompts. If the operator's SSH user can't sudo
- *     non-interactively, the script fails with a clear remedy.
- *
- * The commands are visible and auditable. Convoy never silently runs
- * privileged commands on a box.
- */
 async function runVpsBootstrap(host: string, opts: VpsBootstrapOpts): Promise<void> {
-  const { sshAvailable, sshExec, probeRemote } = await import('./adapters/vps/runner.js');
+  const { sshAvailable } = await import('./adapters/vps/runner.js');
+  const { bootstrapVps } = await import('./adapters/vps/bootstrap.js');
 
-  const sshOk = await sshAvailable();
-  if (!sshOk) {
+  if (!(await sshAvailable())) {
     console.error(pc.red('ssh is not installed locally. Install OpenSSH and try again.'));
     process.exit(2);
   }
 
-  const target = { host, deployRoot: '/' };
-  const remote = await probeRemote(target);
-  if (!remote.reachable) {
-    console.error(pc.red(`Cannot reach ${host}: ${remote.rawError ?? 'connection refused'}`));
-    process.exit(2);
-  }
-  process.stdout.write(`${pc.dim('Connected as')} ${pc.bold(remote.user ?? '?')} ${pc.dim(`(docker=${remote.hasDocker ? 'yes' : 'no'}, nginx=${remote.hasNginx ? 'yes' : 'no'})`)}\n`);
+  const deployRoot = opts.deployRoot ?? '/opt/convoy';
+  const target = {
+    host,
+    deployRoot,
+    ...(opts.sshPort !== undefined && { port: parseInt(opts.sshPort, 10) }),
+    ...(opts.identityFile !== undefined && { identityFile: opts.identityFile }),
+  };
 
-  const steps: { label: string; command: string; skip: boolean; reason?: string }[] = [];
-  steps.push({
-    label: 'Install Docker (official get.docker.com script)',
-    command: 'curl -fsSL https://get.docker.com | sudo sh',
-    skip: remote.hasDocker,
-    ...(remote.hasDocker ? { reason: 'docker already installed' } : {}),
-  });
-  steps.push({
-    label: `Add ${remote.user ?? 'your user'} to the docker group (avoid needing sudo for docker run)`,
-    command: `sudo usermod -aG docker ${remote.user ?? '$USER'}`,
-    skip: !remote.hasDocker && !opts.yes ? false : false,
-  });
-  if (opts.withNginx) {
-    steps.push({
-      label: 'Install nginx',
-      command: 'sudo apt-get update && sudo apt-get install -y nginx',
-      skip: remote.hasNginx,
-      ...(remote.hasNginx ? { reason: 'nginx already installed' } : {}),
-    });
-  }
-
-  process.stdout.write(`\n${pc.bold('vps bootstrap plan')} for ${pc.bold(host)}\n\n`);
-  for (let i = 0; i < steps.length; i += 1) {
-    const s = steps[i]!;
-    const prefix = s.skip ? pc.dim('  skip') : pc.cyan(`  ${i + 1}.  `);
-    process.stdout.write(`${prefix} ${s.label}\n`);
-    process.stdout.write(`        ${pc.dim('$')} ${pc.cyan(s.command)}\n`);
-    if (s.skip && s.reason) process.stdout.write(`        ${pc.dim(s.reason)}\n`);
-  }
-  process.stdout.write('\n');
+  process.stdout.write(`${pc.dim('Probing')} ${pc.bold(host)} ${pc.dim('...')}\n`);
 
   if (opts.yes !== true) {
-    process.stdout.write(`${pc.yellow('Dry-run.')} ${pc.dim('Re-run with')} ${pc.bold('--yes')} ${pc.dim('to execute the steps above.')}\n`);
+    // Dry-run: show what would happen without executing
+    process.stdout.write(`\n${pc.bold('vps bootstrap plan')} for ${pc.bold(host)}\n`);
+    process.stdout.write(`${pc.dim('deploy root:')} ${deployRoot}\n\n`);
+
+    if (opts.noDocker !== true) {
+      process.stdout.write(`  ${pc.cyan('1.')} Install Docker (get.docker.com — skip if already present)\n`);
+      process.stdout.write(`     ${pc.dim('$ curl -fsSL https://get.docker.com | sudo sh')}\n`);
+      process.stdout.write(`  ${pc.cyan('2.')} Enable Docker service + add user to docker group\n`);
+    }
+    if (opts.noCaddy !== true) {
+      process.stdout.write(`  ${pc.cyan('3.')} Install Caddy (official repo — skip if already present)\n`);
+      process.stdout.write(`  ${pc.cyan('4.')} Create /etc/caddy/sites/ and patch Caddyfile\n`);
+      process.stdout.write(`  ${pc.cyan('5.')} Enable Caddy service\n`);
+    }
+    process.stdout.write(`  ${pc.cyan('6.')} Create deploy root ${deployRoot}\n`);
+    process.stdout.write(`\n${pc.yellow('Dry-run.')} ${pc.dim('Re-run with')} ${pc.bold('--yes')} ${pc.dim('to execute.')}\n`);
     return;
   }
 
-  for (let i = 0; i < steps.length; i += 1) {
-    const s = steps[i]!;
-    if (s.skip) {
-      process.stdout.write(`${pc.dim('skip:')} ${s.label}\n`);
-      continue;
-    }
-    process.stdout.write(`${pc.cyan('▶')} ${s.label}\n`);
-    const result = await sshExec(target, s.command, {
-      timeoutMs: 5 * 60 * 1000,
-      onLog: (line) => process.stdout.write(`  ${pc.dim(line)}\n`),
-    });
-    if (!result.ok) {
-      process.stdout.write(`${pc.red('✗')} step failed: ${result.stderr.trim().slice(0, 240)}\n`);
-      process.exit(2);
-    }
-    process.stdout.write(`${pc.green('✓')} ${s.label}\n`);
+  const report = await bootstrapVps(target, {
+    installDocker: opts.noDocker !== true,
+    installCaddy: opts.noCaddy !== true,
+    onStep: (label, status, detail) => {
+      if (status === 'running') {
+        process.stdout.write(`${pc.cyan('▶')} ${label} ...\n`);
+      } else if (status === 'done') {
+        process.stdout.write(`${pc.green('✓')} ${label}\n`);
+      } else if (status === 'skipped') {
+        process.stdout.write(`${pc.dim('–')} ${label} ${pc.dim(`(${detail ?? 'skipped'})`)}\n`);
+      } else {
+        process.stdout.write(`${pc.red('✗')} ${label}${detail ? `: ${detail}` : ''}\n`);
+      }
+    },
+  });
+
+  if (!report.ok) {
+    const failed = report.steps.filter((s) => s.status === 'failed');
+    process.stdout.write(`\n${pc.red('Bootstrap failed.')} ${failed.map((s) => s.label).join(', ')}\n`);
+    process.exit(2);
   }
-  process.stdout.write(`\n${pc.green('Bootstrap complete.')} ${pc.dim('You may need to log out + back in for docker group membership to take effect.')}\n`);
+
+  process.stdout.write(
+    `\n${pc.green('Bootstrap complete.')} ` +
+    `${pc.dim('OS:')} ${report.osFamily} · ` +
+    `${pc.dim('user:')} ${report.user ?? '?'}\n` +
+    `${pc.dim('You may need to log out and back in for docker group membership to take effect.')}\n`,
+  );
 }
 
 async function runStageSecrets(planId: string): Promise<void> {
@@ -3982,10 +3967,14 @@ program
 
 program
   .command('vps')
-  .description('VPS-related subcommands. Use `convoy vps bootstrap <host>` to install Docker on a fresh box.')
+  .description('VPS-related subcommands. Use `convoy vps bootstrap <host>` to install Docker + Caddy on a fresh box.')
   .argument('[subcommand]', 'subcommand: bootstrap')
   .argument('[host]', 'SSH destination: user@host')
-  .option('--with-nginx', 'also install nginx (skip if you already manage your own)')
+  .option('--deploy-root <path>', 'base deploy directory on the box (default: /opt/convoy)')
+  .option('--ssh-port <n>', 'SSH port (default: 22)')
+  .option('--identity-file <path>', 'path to SSH private key')
+  .option('--no-docker', 'skip Docker install')
+  .option('--no-caddy', 'skip Caddy install')
   .option('-y, --yes', 'actually run the install commands (otherwise prints what it would do and exits)')
   .action(async (subcommand: string | undefined, host: string | undefined, options: VpsBootstrapOpts) => {
     if (subcommand !== 'bootstrap') {
