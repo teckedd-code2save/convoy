@@ -27,6 +27,7 @@ import type { Platform, Run, RunEvent, StageName } from './core/types.js';
 import { probePlatformConnection } from './adapters/connections.js';
 import type { ConnectionCheck, ConnectionStatus } from './adapters/types.js';
 import { buildPlan } from './planner/index.js';
+import { loadByokConfig, resolveAnthropicKey } from './core/key-resolver.js';
 import { scanRepository } from './planner/scanner.js';
 import { resolveTarget } from './planner/target-resolver.js';
 
@@ -540,13 +541,14 @@ async function runShip(
 
     const inferredRepoUrl = resolved.repoUrl ?? undefined;
 
+    const byokKey = await resolveAnthropicKey(loadByokConfig(resolved.localPath));
     const { plan, enrichmentSource } = await buildPlan(resolved.localPath, {
       ...(inferredRepoUrl !== undefined && { repoUrl: inferredRepoUrl }),
       ...(resolved.branch !== undefined && { branch: resolved.branch }),
       ...(resolved.sha !== undefined && { sha: resolved.sha }),
       ...(platformOverride !== undefined && { platformOverride }),
       ...(opts.workspace !== undefined && { workspace: opts.workspace }),
-      ai: opts.noAi ? { disable: true } : {},
+      ai: opts.noAi ? { disable: true } : { ...(byokKey && { apiKey: byokKey }) },
     });
     thinking.stop();
 
@@ -628,13 +630,14 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
 
     const inferredRepoUrl = opts.repoUrl ?? resolved.repoUrl ?? undefined;
 
+    const byokKey = await resolveAnthropicKey(loadByokConfig(resolved.localPath));
     const { plan, enrichmentSource } = await buildPlan(resolved.localPath, {
       ...(inferredRepoUrl !== undefined && { repoUrl: inferredRepoUrl }),
       ...(resolved.branch !== undefined && { branch: resolved.branch }),
       ...(resolved.sha !== undefined && { sha: resolved.sha }),
       ...(platformOverride !== undefined && { platformOverride }),
       ...(opts.workspace !== undefined && { workspace: opts.workspace }),
-      ai: opts.noAi ? { disable: true } : {},
+      ai: opts.noAi ? { disable: true } : { ...(byokKey && { apiKey: byokKey }) },
     });
     thinking?.stop();
 
@@ -1194,7 +1197,11 @@ async function appendLaneConnectionChecks(
   }
 }
 
-async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<PreflightReport> {
+async function preflightApply(
+  plan: ConvoyPlan,
+  opts: ApplyOpts,
+  resolvedApiKey?: string | null,
+): Promise<PreflightReport> {
   plan = normalizePlan(plan);
   const report: PreflightReport = {
     realAuthor: opts.realAuthor,
@@ -1220,7 +1227,7 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
   // degrade gracefully on API errors, but silent degradation during the demo
   // would turn the "Claude agent medic" centerpiece into a deterministic
   // fallback card with no warning.
-  const apiKey = process.env['ANTHROPIC_API_KEY'];
+  const apiKey = resolvedApiKey ?? process.env['ANTHROPIC_API_KEY'];
   if (apiKey) {
     const modelCheck = await preflightAnthropicModel(apiKey, MEDIC_MODEL);
     if (modelCheck.ok) {
@@ -1756,6 +1763,13 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     );
   }
 
+  // Resolve the Anthropic key once — BYOK config in .convoy/byok.json wins
+  // over the server's env var. This lets hosted Convoy inject a team's key
+  // without touching the server process's ANTHROPIC_API_KEY.
+  const resolvedApiKey = await resolveAnthropicKey(
+    loadByokConfig(plan.target.localPath),
+  );
+
   const store = new RunStateStore(STATE_PATH);
   const bus = new ConvoyBus();
   const stages = defaultStages();
@@ -1766,7 +1780,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
 
   // Preflight — confirm each real-* stage can actually run. If a hard
   // prereq is missing and the user didn't opt out, fail with a clear remedy.
-  const preflight = await preflightApply(plan, opts);
+  const preflight = await preflightApply(plan, opts, resolvedApiKey);
   renderPreflight(preflight);
   // Persist blockers regardless of outcome — the viewer reads from this.
   // An empty list is a valid state ("we ran preflight, nothing's blocking").
@@ -1788,6 +1802,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     alreadySetKeys: opts.alreadySet ?? [],
     ...(platformOverride !== undefined && { platformOverride }),
     ...(opts.continueRunId !== undefined && { continueRunId: opts.continueRunId }),
+    ...(resolvedApiKey !== null && { apiKey: resolvedApiKey }),
   };
 
   if (opts.injectFailure === 'rehearse' || opts.injectFailure === 'canary') {

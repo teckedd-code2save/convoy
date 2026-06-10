@@ -109,6 +109,12 @@ export interface OrchestratorOpts {
   realVercel?: RealVercelOpt;
   realVps?: RealVpsOpt;
   realVpsGhcr?: RealVpsGhcrOpt;
+  /**
+   * Resolved Anthropic API key for this run. Passed to the medic agent and
+   * enricher so hosted Convoy can inject a team's BYOK key without touching
+   * the server process's own ANTHROPIC_API_KEY env var.
+   */
+  apiKey?: string;
 }
 
 /**
@@ -389,6 +395,7 @@ abstract class BaseStage implements Stage {
    */
   protected medicTelemetry(ctx: StageContext): DiagnoseOptions {
     return {
+      ...(ctx.opts.apiKey !== undefined && { apiKey: ctx.opts.apiKey }),
       onToolCall: (call) => {
         this.emit(ctx, 'progress', {
           phase: 'medic.tool_use',
