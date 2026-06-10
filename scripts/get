@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Convoy no-clone installer.
+#
+#   curl -fsSL https://raw.githubusercontent.com/teckedd-code2save/convoy/main/scripts/get | bash
+#
+# Clones (or updates) Convoy into ~/.convoy/app and hands off to
+# scripts/install, which does everything else: npm deps, .env, shell
+# helpers, Claude Code plugin + MCP registration. You never have to
+# manage the checkout yourself — it lives out of the way and re-running
+# this script fast-forwards it.
+#
+# Override the install location with CONVOY_INSTALL_DIR.
+set -euo pipefail
+
+REPO_URL="${CONVOY_REPO_URL:-https://github.com/teckedd-code2save/convoy.git}"
+DEST="${CONVOY_INSTALL_DIR:-$HOME/.convoy/app}"
+
+for bin in git node npm; do
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "✗ $bin is required but not on PATH. Install it and re-run." >&2
+    exit 1
+  fi
+done
+
+if [ -d "$DEST/.git" ]; then
+  echo "Updating existing Convoy install at $DEST"
+  git -C "$DEST" pull --ff-only
+else
+  echo "Installing Convoy to $DEST"
+  mkdir -p "$(dirname "$DEST")"
+  git clone --depth 1 "$REPO_URL" "$DEST"
+fi
+
+# When piped through `curl | bash`, stdin is the script stream — reattach
+# the terminal so scripts/install can prompt for the API key.
+if [ -r /dev/tty ]; then
+  exec "$DEST/scripts/install" < /dev/tty
+else
+  exec "$DEST/scripts/install"
+fi
