@@ -12,6 +12,45 @@ Built for the *Built with Opus 4.7* Claude Code hackathon (April 21–26, 2026).
 
 ---
 
+## The Meridian scenario
+
+Meet the problem Convoy was built to solve.
+
+Meridian is a three-service fintech startup: an orders API (Express + Postgres), a PDF report renderer, and a payments worker. Their principal engineer Karan is leaving next week. Production is throwing intermittent 503s on the orders service — a mystery bug that only Karan fully understands. The CTO wants to ship a payment-processing refactor and bring up the new reports service before Karan walks out the door.
+
+Without Convoy, the team is blocked. Every deployment went through Karan: he knew which environment variables were missing on Fly, which services depended on which, what the rollback story was. None of that is written down. The new engineer is afraid to touch prod.
+
+With Convoy, they run one command:
+
+```bash
+convoy plan ./meridian-orders --save
+convoy apply <plan-id>
+```
+
+Here's what happens in the next 8 minutes:
+
+1. **Scan** — Convoy reads the repo. It finds the Express app, the Prisma schema, the BullMQ worker, the `.env.example` with `DATABASE_URL` and `STRIPE_SECRET_KEY`. It detects the health endpoint at `/health`. No config, no annotation — it reads the evidence.
+
+2. **Pick** — Fly.io scores highest (+25 for the worker topology, +15 for the Dockerfile). The platform decision is inspectable: a score table with the delta for each signal, so the team can disagree and override with `--platform=railway` if they want.
+
+3. **Rehearse** — Before a single line of config is committed, Convoy spawns the orders service locally, hits it with 60 synthetic requests, and scrapes the metrics. This is where it catches the bug: p99 of 8,740ms. Zero errors — all requests succeeded — but every user waited 8 seconds. The medic agent (Claude Opus) reads the logs and reports: _"I found a global `renderLock` in `src/routes/render.ts` that serialises all PDF requests through a single promise chain. Replace it with a semaphore."_ The pipeline stops. Nobody approved anything. Nobody got paged at 2am.
+
+4. **Fix and resume** — the new engineer fixes the lock. They run `convoy resume`. Convoy carries the uncommitted fix onto the convoy branch as a `fix:` commit — the medic's diagnosis is the commit subject. Rehearsal passes: p99 142ms.
+
+5. **Author gate** — Convoy pauses. The approval card shows rehearsal evidence: p99, error rate, smoke tests. The CTO approves from evidence. Convoy opens the PR with the Dockerfile, `fly.toml`, CI workflow, and `.env.schema`.
+
+6. **Secrets gate** — Before the deploy command runs, Convoy diffs the expected vars against what Fly has staged. `STRIPE_SECRET_KEY` is missing. It pauses — not fails, pauses — surfaces the key in the web UI, and lets the operator paste the value inline. Convoy pushes it to Fly via `fly secrets set` and proceeds.
+
+7. **Canary** — Convoy deploys to one machine at 5% traffic, compares the p99 delta (+3ms), declares healthy, and promotes.
+
+8. **Observe** — 120 seconds of post-deploy monitoring. SLO healthy. Done.
+
+Total time: 8 minutes. Total tribal knowledge required: zero. The plan page is the handoff document: what was scanned, what was scored, what rehearsal found, what secrets were staged.
+
+Karan can leave. The team can ship.
+
+---
+
 ## See it in action
 
 [![Convoy: AI Deployment Agent from Commit to Production](https://img.youtube.com/vi/5btzce8adeE/maxresdefault.jpg)](https://www.youtube.com/watch?v=5btzce8adeE)

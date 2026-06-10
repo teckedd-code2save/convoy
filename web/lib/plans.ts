@@ -12,6 +12,7 @@ export interface PlanPlatformCandidate {
   platform: string;
   score: number;
   reason: string;
+  adjustments?: Array<{ delta: number; label: string }>;
 }
 
 export interface PlanShipStep {
@@ -41,6 +42,9 @@ export interface PlanSummary {
       framework: string | null;
       topology: string;
       dataLayer: string[];
+      risks?: Array<{ level: string; message: string }>;
+      healthPath?: string | null;
+      port?: number | null;
     };
     platformDecision: {
       chosen: string;
