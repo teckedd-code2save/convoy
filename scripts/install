@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # Convoy one-shot setup.
 #
-# Does two things so you never have to pass --plugin-dir again:
+# Does four things so you can start shipping immediately:
 #
-#   1. Exports CONVOY_HOME in your shell profile (zsh / bash / fish / sh).
+#   1. Installs npm dependencies (root, web/, demo-app/).
+#   2. Creates .env from .env.example and prompts for ANTHROPIC_API_KEY.
+#   3. Exports CONVOY_HOME in your shell profile (zsh / bash / fish / sh).
 #      CONVOY_HOME points at the Convoy repo root — this script's own
 #      directory's parent. The plugin commands cd into CONVOY_HOME before
 #      invoking the CLI and Convoy's state (.convoy/*) accumulates there.
-#
-#   2. Registers this repo as a local-path Claude Code marketplace in
+#   4. Registers this repo as a local-path Claude Code marketplace in
 #      ~/.claude/settings.json and enables the `convoy` plugin, so every
-#      Claude Code session picks up /convoy:where, /convoy:ship, etc.
+#      Claude Code session picks up /convoy:where, /convoy:ship, etc. The
+#      plugin's .mcp.json wires up the convoy MCP server automatically.
 #
 # Idempotent. Running it twice is safe — it won't duplicate your shell
 # profile export or clobber other settings.json keys.
@@ -30,6 +32,59 @@ if [ ! -f "$CONVOY_HOME/package.json" ] || ! grep -q '"name": "convoy"' "$CONVOY
   exit 1
 fi
 echo "  ✓ package.json present"
+
+# ---------------------------------------------------------------------------
+# Step 0 — install npm dependencies.
+# ---------------------------------------------------------------------------
+
+echo
+echo "Installing dependencies..."
+npm install --prefix "$CONVOY_HOME" --silent
+echo "  ✓ root dependencies installed"
+
+if [ -f "$CONVOY_HOME/web/package.json" ]; then
+  npm install --prefix "$CONVOY_HOME/web" --silent
+  echo "  ✓ web/ dependencies installed"
+fi
+
+if [ -f "$CONVOY_HOME/demo-app/package.json" ]; then
+  npm install --prefix "$CONVOY_HOME/demo-app" --silent
+  echo "  ✓ demo-app/ dependencies installed"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 0b — create .env from .env.example if not already present.
+# ---------------------------------------------------------------------------
+
+ENV_FILE="$CONVOY_HOME/.env"
+ENV_EXAMPLE="$CONVOY_HOME/.env.example"
+
+if [ ! -f "$ENV_FILE" ] && [ -f "$ENV_EXAMPLE" ]; then
+  cp "$ENV_EXAMPLE" "$ENV_FILE"
+  echo "  ✓ Created .env from .env.example"
+fi
+
+# Prompt for ANTHROPIC_API_KEY if the file exists but the key is still a placeholder.
+if [ -f "$ENV_FILE" ] && grep -qE '^ANTHROPIC_API_KEY=(your[_-]|sk-placeholder|$)' "$ENV_FILE"; then
+  if [ -t 0 ]; then
+    echo
+    echo "Convoy uses Claude for enrichment and diagnosis."
+    printf "  Enter your Anthropic API key (sk-ant-...): "
+    read -r API_KEY
+    if [ -n "$API_KEY" ]; then
+      sed -i.bak "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=$API_KEY|" "$ENV_FILE"
+      rm -f "$ENV_FILE.bak"
+      echo "  ✓ ANTHROPIC_API_KEY written to .env"
+    else
+      echo "  ⚠ Skipped — edit .env manually to add ANTHROPIC_API_KEY."
+      echo "    Without it, Convoy falls back to deterministic output (no AI enrichment)."
+    fi
+  else
+    echo "  ⚠ .env has a placeholder ANTHROPIC_API_KEY. Edit it before running real deploys."
+  fi
+elif [ ! -f "$ENV_FILE" ]; then
+  echo "  ⚠ No .env found. Copy .env.example and add ANTHROPIC_API_KEY to enable AI enrichment."
+fi
 
 # ---------------------------------------------------------------------------
 # Step 1 — export CONVOY_HOME in the user's shell profile.
@@ -201,6 +256,28 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
+# Step 3 — register the MCP server with Claude Code (global scope).
+#
+# The plugin's .mcp.json wires up the server automatically when the plugin
+# is active, but registering it globally via `claude mcp add` also makes it
+# available in sessions where the plugin isn't loaded (CI, other projects).
+# ---------------------------------------------------------------------------
+
+if command -v claude >/dev/null 2>&1; then
+  # `claude mcp add` is idempotent — running it twice just overwrites the entry.
+  if claude mcp add convoy --scope global -- bash "$CONVOY_HOME/scripts/mcp-server" 2>/dev/null; then
+    echo "  ✓ Registered convoy MCP server globally (claude mcp add)"
+  else
+    echo "  ⚠ claude mcp add failed — the plugin's .mcp.json still wires it up when the plugin is active."
+  fi
+else
+  echo "  ⚠ claude CLI not found on PATH — skipping global MCP registration."
+  echo "    The MCP server is still available via the plugin's .mcp.json once you restart Claude Code."
+  echo "    To register manually after installing Claude Code:"
+  echo "      claude mcp add convoy --scope global -- bash \"$CONVOY_HOME/scripts/mcp-server\""
+fi
+
+# ---------------------------------------------------------------------------
 # Finish.
 # ---------------------------------------------------------------------------
 
@@ -210,13 +287,15 @@ echo
 echo "Two steps to activate:"
 echo "  1. Reload your shell:         source \"$PROFILE\""
 echo "                                 (or open a new terminal)"
-echo "  2. Restart Claude Code if it's running (picks up the new plugin)"
+echo "  2. Restart Claude Code if it's running (picks up the new plugin + MCP server)"
 echo
 echo "Then from any directory:"
 echo "  convoy status              — raw CLI helper"
 echo "  convoy-ship-here           — raw CLI helper for the current repo"
 echo "  /convoy:where             — orient"
 echo "  /convoy:ship <target>     — ship a repo end-to-end"
+echo "  convoy_plan / convoy_apply — MCP tools available inside any Claude Code session"
 echo
 echo "Uninstall: remove the CONVOY_HOME line from $PROFILE,"
-echo "           and the convoy entries from $SETTINGS."
+echo "           and the convoy entries from $SETTINGS,"
+echo "           and run: claude mcp remove convoy --scope global"
