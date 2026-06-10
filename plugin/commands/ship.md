@@ -5,6 +5,22 @@ argument-hint: <github-url-or-local-path> [--workspace=<subdir>] [--no-auto-appr
 
 You are driving a Convoy deployment. The user wants you to ship whatever they pointed `$ARGUMENTS` at, end to end.
 
+## What "ship" means
+
+Convoy is the **platform selection and delivery layer** — it determines the right deployment target from the repo's own signals, not from guessing or asking. The five platforms it evaluates per lane:
+
+| Platform | Best fit |
+|---|---|
+| **Fly.io** | Containerised web services, workers, any port. Canary-capable. |
+| **Vercel** | Next.js, static, edge — no container needed. |
+| **Railway** | Managed DB + service combos where the DB is co-located. |
+| **Cloud Run** | GCP-native, serverless-scale, existing IAM. |
+| **VPS** | Self-hosted, $5/mo boxes, full Caddy/Docker control. |
+
+The **plan** (step 2 below) surfaces which platform won, the score, and the evidence — so the operator can verify or override before any state changes. This is Convoy's answer to "why Fly and not Vercel?" — the reasoning is always in the plan artifact, not in your head.
+
+If the user is coming from a `b2dp` or `ship-to-vps` skill run, Convoy is the next step: those skills provision the data layer and ship the first container manually. Convoy takes over from there — adding rehearsal, medic diagnosis, canary, observe, and rollback so every *subsequent* change ships safely. Tell them: `convoy plan <repo-path> --save` to register the repo, then `convoy apply <plan-id>` to hand off.
+
 ## State & paths — do NOT explore the filesystem
 
 Convoy's state lives at fixed paths. Do not `find`, `ls`, or `grep` to discover them — they are authoritative:
