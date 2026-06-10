@@ -265,7 +265,7 @@ fi
 
 if command -v claude >/dev/null 2>&1; then
   # `claude mcp add` is idempotent — running it twice just overwrites the entry.
-  if claude mcp add convoy --scope global -- bash "$CONVOY_HOME/scripts/mcp-server" 2>/dev/null; then
+  if claude mcp add convoy -s user -- bash "$CONVOY_HOME/scripts/mcp-server" 2>/dev/null; then
     echo "  ✓ Registered convoy MCP server globally (claude mcp add)"
   else
     echo "  ⚠ claude mcp add failed — the plugin's .mcp.json still wires it up when the plugin is active."
@@ -274,7 +274,7 @@ else
   echo "  ⚠ claude CLI not found on PATH — skipping global MCP registration."
   echo "    The MCP server is still available via the plugin's .mcp.json once you restart Claude Code."
   echo "    To register manually after installing Claude Code:"
-  echo "      claude mcp add convoy --scope global -- bash \"$CONVOY_HOME/scripts/mcp-server\""
+  echo "      claude mcp add convoy -s user -- bash \"$CONVOY_HOME/scripts/mcp-server\""
 fi
 
 # ---------------------------------------------------------------------------

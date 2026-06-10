@@ -61,24 +61,40 @@ Everything you see above is real output from `convoy apply --inject-failure=rehe
 ```bash
 git clone https://github.com/teckedd-code2save/convoy.git
 cd convoy
-npm install
-cp .env.example .env                 # add ANTHROPIC_API_KEY
+./scripts/install        # installs deps, creates .env, registers Claude Code plugin + MCP
+source ~/.zshrc          # or ~/.bashrc / config.fish — then restart Claude Code
+```
 
-# Optional but recommended: install shell helpers
-./scripts/install
-source ~/.zshrc                      # or ~/.bashrc / config.fish
+That's it. `./scripts/install` is the only setup step: it runs `npm install` for the root, `web/`, and `demo-app/`, copies `.env.example` → `.env` and prompts for your Anthropic API key, wires up the Claude Code plugin and MCP server, and adds shell helpers. Re-running it is safe.
 
-# Plan for any local repo or GitHub URL. --save persists the plan;
-# --open pops the plan straight into the web viewer.
-npm run convoy -- plan ../my-web-app --save --open
+Once Claude Code restarts, Convoy is available three ways:
 
-# Boot the web viewer in another terminal (port 3737)
-(cd web && npm install && npm run dev)
+**As MCP tools in any Claude Code session** — no slash command needed:
+```
+convoy_plan    — scan a repo, produce a deployment plan
+convoy_apply   — run the pipeline against a saved plan
+convoy_status  — follow a run; see pending approval gates
+convoy_approve — approve or reject a gate from inside Claude Code
+convoy_diagnose — read the medic's root-cause card for a failed run
+```
 
-# Apply — the pipeline runs coordinated lanes through
-# scan → pick → rehearse → author → canary → promote → observe.
-# The run URL prints as soon as it starts.
-npm run convoy -- apply <plan-id> --open
+**As slash commands** via the `convoy` plugin:
+```
+/convoy:where   — orient (what Convoy sees from here)
+/convoy:ship    — plan + apply for a target repo
+```
+
+**As raw CLI helpers** from any terminal:
+```bash
+convoy plan ../my-web-app --save --open   # plan + open in web viewer
+convoy apply <plan-id> --open             # run + open the live timeline
+convoy ship .                             # plan + apply in one shot
+convoy-ship-here --demo                   # same, from your current repo
+```
+
+Boot the web viewer in a separate terminal (port 3737):
+```bash
+cd web && npm run dev
 ```
 
 By default Convoy **pauses at every approval gate** and you approve from the web UI (the URL is printed when the run starts; it's also what `--open` launches). Pass `--auto-approve` or `-y` for unattended runs.
@@ -86,26 +102,16 @@ By default Convoy **pauses at every approval gate** and you approve from the web
 Want to watch the medic agent work without a real breach? Inject a scripted failure — the tool loop runs against the demo fixture, and the web viewer renders the medic spotlight in real time:
 
 ```bash
-npm run convoy -- apply <plan-id> --demo -y --inject-failure=rehearse
+convoy apply <plan-id> --demo -y --inject-failure=rehearse
 ```
 
 When a real rehearsal breaches and medic classifies it `owned=developer`, the run pauses with status `awaiting_fix`. Edit the code (or let Claude Code do it) and run:
 
 ```bash
-npm run convoy -- resume          # continues the same run; carries dirty tree onto convoy/<plan>
+convoy resume             # continues the same run; carries dirty tree onto convoy/<plan>
 ```
 
 You **don't have to push your fix to main first**. Convoy detects the uncommitted changes, carries them onto the plan-keyed `convoy/<plan>` branch as a separate `fix:` commit (the medic's diagnosis becomes the commit subject), and surfaces the combined diff in the `open_pr` approval card. The fix and the deploy plumbing land in the same PR — main only sees them at merge time, after rehearsal proved they work. This is what makes Convoy safe on git-deploy platforms (Vercel, Netlify, Cloud Run) where pushing to main would otherwise trigger a prod build outside Convoy's gates.
-
-If you ran `./scripts/install`, you also get raw shell helpers:
-
-```bash
-convoy status
-convoy ship .
-convoy-ship-here --demo
-```
-
-The installed `convoy` helper preserves the directory you launched it from, so `convoy ship .` targets your current repo even though the CLI itself runs from `CONVOY_HOME`. `convoy-ship-here` remains the explicit absolute-path variant.
 
 ---
 
