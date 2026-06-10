@@ -9,13 +9,25 @@ import { repoName, type ScanResult } from './scanner.js';
  * contentPreview with AI-generated content tailored to the specific repo —
  * particularly for Dockerfiles where the dimensionality of choices is too high
  * to express as deterministic templates.
+ *
+ * @param servicePath - path of this service relative to the repo root, e.g.
+ *   "apps/api". Pass "." (or omit) for single-service repos. Used to prefix
+ *   authored file paths so multi-service monorepos don't collide (Dockerfile
+ *   becomes apps/api/Dockerfile instead of overwriting the root Dockerfile).
  */
-export function draftAuthorSection(scan: ScanResult, platform: Platform): PlanAuthorSection {
+export function draftAuthorSection(
+  scan: ScanResult,
+  platform: Platform,
+  servicePath = '.',
+): PlanAuthorSection {
+  const prefix = (p: string) =>
+    servicePath === '.' || servicePath === '' ? p : `${servicePath}/${p}`;
+
   const files: PlanAuthoredFile[] = [];
   const profile = authoringProfile(platform);
 
   if (profile.needsDockerfile && !scan.hasDockerfile) {
-    files.push(draftDockerfile(scan, platform));
+    files.push(prefixFile(draftDockerfile(scan, platform), prefix));
     // A Dockerfile without a .dockerignore means `COPY . .` pulls
     // node_modules, .next, .git, .env*, build caches, IDE state — everything.
     // The build context balloons, the upload to Depot/buildkit takes minutes
@@ -23,25 +35,29 @@ export function draftAuthorSection(scan: ScanResult, platform: Platform): PlanAu
     // finishes. We learned this from a 45-minute Fly build that died on
     // "Invalid token". Author them as a pair, always.
     if (!scan.hasDockerignore) {
-      files.push(draftDockerignore(scan));
+      files.push(prefixFile(draftDockerignore(scan), prefix));
     }
   }
 
   if (scan.existingPlatform !== platform) {
     const platformConfig = profile.platformConfigFile?.(scan);
-    if (platformConfig) files.push(platformConfig);
+    if (platformConfig) files.push(prefixFile(platformConfig, prefix));
   }
   // Extra files some platforms need beyond their main config (e.g. VPS
   // ships a deploy.sh + optional nginx snippet alongside the Dockerfile).
   if (profile.extraFiles) {
-    for (const f of profile.extraFiles(scan)) files.push(f);
+    for (const f of profile.extraFiles(scan)) files.push(prefixFile(f, prefix));
   }
 
   const envSchema = draftEnvSchema(scan, platform);
-  if (envSchema) files.push(envSchema);
-  if (files.length > 0) files.push(draftConvoyManifest(files));
+  if (envSchema) files.push(prefixFile(envSchema, prefix));
+  if (files.length > 0) files.push(draftConvoyManifest(files, prefix));
 
   return { convoyAuthoredFiles: files };
+}
+
+function prefixFile(file: PlanAuthoredFile, prefix: (p: string) => string): PlanAuthoredFile {
+  return { ...file, path: prefix(file.path) };
 }
 
 /**
@@ -125,74 +141,150 @@ function draftDockerfile(scan: ScanResult, platform: Platform): PlanAuthoredFile
 }
 
 /**
- * Deliberately simple fallback. One template per ecosystem. When ANTHROPIC_API_KEY
- * is set, the enricher overwrites this with a Dockerfile tailored to the actual
- * repo (framework, package manager, prisma, port, startup, etc.).
+ * Signal-aware fallback. Uses every scan field that's relevant for a
+ * production-quality Dockerfile: port, package manager, build command,
+ * start command, framework (Next.js standalone), and data layer (Prisma
+ * generate). When ANTHROPIC_API_KEY is set the enricher overwrites this
+ * with a Dockerfile further tailored to the specific repo, but this
+ * fallback is now good enough to deploy without enrichment for common stacks.
  */
 function fallbackDockerfile(scan: ScanResult): string {
+  const port = scan.port ?? 8080;
+
   switch (scan.ecosystem) {
-    case 'python':
-      return `FROM python:3.12-slim
-WORKDIR /app
-COPY . .
-RUN pip install --no-cache-dir -r requirements.txt || pip install --no-cache-dir .
-EXPOSE 8080
-CMD ["python", "main.py"]
-`;
+    case 'python': {
+      const hasDeps = scan.topLevelFiles.includes('requirements.txt') ||
+        scan.topLevelFiles.includes('pyproject.toml');
+      const installCmd = scan.packageManager === 'poetry'
+        ? 'pip install poetry && poetry install --no-dev'
+        : scan.packageManager === 'uv'
+          ? 'pip install uv && uv sync --no-dev'
+          : 'pip install --no-cache-dir -r requirements.txt || pip install --no-cache-dir .';
+      const startCmd = scan.startCommand
+        ?? (scan.framework === 'fastapi' ? `uvicorn main:app --host 0.0.0.0 --port ${port}`
+          : scan.framework === 'django' ? `gunicorn --bind 0.0.0.0:${port} wsgi:application`
+          : `python main.py`);
+      return [
+        `FROM python:3.12-slim`,
+        `WORKDIR /app`,
+        hasDeps ? `COPY ${scan.packageManager === 'poetry' ? 'pyproject.toml poetry.lock' : scan.packageManager === 'uv' ? 'pyproject.toml uv.lock' : 'requirements.txt'} ./` : `COPY . .`,
+        hasDeps ? `RUN ${installCmd}` : null,
+        hasDeps ? `COPY . .` : null,
+        `EXPOSE ${port}`,
+        `CMD ["sh", "-c", "${startCmd}"]`,
+      ].filter(Boolean).join('\n') + '\n';
+    }
+
     case 'go':
-      return `FROM golang:1.23-alpine AS build
+      return `FROM golang:1.24-alpine AS build
 WORKDIR /src
 COPY . .
 RUN go build -o /out/app ./...
 
-FROM alpine:3.19
+FROM alpine:3.21
 COPY --from=build /out/app /app
-EXPOSE 8080
+EXPOSE ${port}
 CMD ["/app"]
 `;
+
     case 'rust':
-      return `FROM rust:1.83-slim AS build
+      return `FROM rust:1.84-slim AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release
+RUN cargo build --release --bin $(basename $(cargo metadata --no-deps --format-version 1 | grep -o '"name":"[^"]*"' | head -1 | cut -d: -f2 | tr -d '"') 2>/dev/null || echo app)
 
 FROM debian:bookworm-slim
-COPY --from=build /src/target/release/* /app
-EXPOSE 8080
-CMD ["/app"]
+COPY --from=build /src/target/release/* /usr/local/bin/
+EXPOSE ${port}
+CMD ["sh", "-c", "$(ls /usr/local/bin/ | head -1)"]
 `;
+
     case 'ruby':
-      return `FROM ruby:3.3-slim
+      return `FROM ruby:3.4-slim
 WORKDIR /app
-COPY . .
+COPY Gemfile Gemfile.lock ./
 RUN bundle install --without development test
-EXPOSE 8080
-CMD ["bundle", "exec", "rackup", "-p", "8080", "-o", "0.0.0.0"]
+COPY . .
+EXPOSE ${port}
+CMD ["bundle", "exec", "rackup", "-p", "${port}", "-o", "0.0.0.0"]
 `;
+
     case 'java-jvm':
       return `FROM eclipse-temurin:21 AS build
 WORKDIR /src
 COPY . .
-RUN ./gradlew bootJar || ./mvnw package -DskipTests
+RUN ./gradlew bootJar -x test 2>/dev/null || ./mvnw package -DskipTests
 
 FROM eclipse-temurin:21-jre
 COPY --from=build /src/build/libs/*.jar /app/app.jar
-EXPOSE 8080
+EXPOSE ${port}
 CMD ["java", "-jar", "/app/app.jar"]
 `;
+
     case 'static':
       return `FROM nginx:alpine
 COPY . /usr/share/nginx/html
 EXPOSE 80
 `;
-    default:
-      return `FROM node:20-alpine
+
+    default: {
+      // Node / JS — use every scan signal that's available.
+      const installCmd = nodeInstallCmd(scan.packageManager);
+      const hasPrisma = scan.dataLayer.some(d => d.toLowerCase().includes('prisma'));
+      const isNext = scan.framework === 'next' || scan.framework === 'nextjs';
+      const buildCmd = scan.buildCommand ?? (isNext ? 'npm run build' : null);
+      const startCmd = scan.startCommand ?? 'npm start';
+
+      if (isNext) {
+        // Next.js standalone output — smallest possible production image.
+        // The enricher can add output: 'standalone' to next.config if absent,
+        // but this Dockerfile is already wired for it.
+        return `FROM node:22-alpine AS deps
 WORKDIR /app
+COPY package*.json ${scan.packageManager === 'pnpm' ? 'pnpm-lock.yaml .npmrc* ' : scan.packageManager === 'yarn' ? 'yarn.lock ' : scan.packageManager === 'bun' ? 'bun.lockb ' : ''}./
+RUN ${installCmd}
+
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN npm ci
-EXPOSE 8080
-CMD ["npm", "start"]
+${hasPrisma ? 'RUN npx prisma generate' : ''}
+RUN ${buildCmd}
+
+FROM node:22-alpine AS run
+WORKDIR /app
+ENV NODE_ENV=production PORT=${port}
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/.next/static ./.next/static
+COPY --from=build /app/public ./public
+EXPOSE ${port}
+CMD ["node", "server.js"]
 `;
+      }
+
+      const lines = [
+        `FROM node:22-alpine`,
+        `WORKDIR /app`,
+        `COPY package*.json ${scan.packageManager === 'pnpm' ? 'pnpm-lock.yaml .npmrc* ' : scan.packageManager === 'yarn' ? 'yarn.lock ' : scan.packageManager === 'bun' ? 'bun.lockb ' : ''}./`,
+        `RUN ${installCmd}`,
+        hasPrisma ? `COPY prisma ./prisma` : null,
+        hasPrisma ? `RUN npx prisma generate` : null,
+        `COPY . .`,
+        buildCmd ? `RUN ${buildCmd}` : null,
+        `EXPOSE ${port}`,
+        `CMD ["sh", "-c", "${startCmd}"]`,
+      ];
+      return lines.filter(Boolean).join('\n') + '\n';
+    }
+  }
+}
+
+function nodeInstallCmd(pm: ScanResult['packageManager']): string {
+  switch (pm) {
+    case 'pnpm': return 'corepack enable pnpm && pnpm install --frozen-lockfile';
+    case 'yarn': return 'corepack enable yarn && yarn install --frozen-lockfile';
+    case 'bun':  return 'npm i -g bun && bun install --frozen-lockfile';
+    default:     return 'npm ci';
   }
 }
 
@@ -624,9 +716,13 @@ ${vars.join('\n')}
   };
 }
 
-function draftConvoyManifest(files: PlanAuthoredFile[]): PlanAuthoredFile {
+function draftConvoyManifest(
+  files: PlanAuthoredFile[],
+  prefix: (p: string) => string = (p) => p,
+): PlanAuthoredFile {
+  const manifestPath = prefix('.convoy/manifest.yaml');
   const entries = files
-    .filter((f) => f.path !== '.convoy/manifest.yaml')
+    .filter((f) => f.path !== manifestPath)
     .map((f) => `  - path: ${f.path}\n    authored_by: convoy`)
     .join('\n');
   const content = `# Provenance record. Files here are Convoy-authored and may be
@@ -637,7 +733,7 @@ files:
 ${entries}
 `;
   return {
-    path: '.convoy/manifest.yaml',
+    path: manifestPath,
     lines: content.split('\n').length,
     summary: `${files.length} files tracked`,
     contentPreview: content,

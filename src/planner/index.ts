@@ -53,6 +53,9 @@ export async function buildPlan(
     : graph.nodes.map((node) => buildLane(node, opts.platformOverride));
   const dependencies = buildDependencies(lanes);
   const connectionRequirements = buildConnectionRequirements(lanes);
+  // Each lane's files are already path-prefixed by draftAuthorSection (e.g.
+  // apps/api/Dockerfile). Dedup only within paths — cross-lane files should
+  // never share a path now that servicePath prefixing is applied.
   const author = {
     convoyAuthoredFiles: dedupeAuthoredFiles(lanes.flatMap((lane) => lane.author.convoyAuthoredFiles)),
   };
@@ -124,7 +127,7 @@ export async function buildPlan(
 
 function buildLane(node: ServiceNode, override?: Platform): DeploymentLane {
   const platformDecision = pickPlatformForLane(node, override);
-  const author = draftAuthorSection(node.scan, platformDecision.chosen);
+  const author = draftAuthorSection(node.scan, platformDecision.chosen, node.path);
   const rehearsal = defaultRehearsal(node.scan, platformDecision.chosen);
   const promotion = defaultPromotion();
   const rollback = defaultRollback(platformDecision.chosen);

@@ -42,6 +42,13 @@ else
   echo "  ✗ http://localhost:3737 (not responding — will auto-spawn on next plan/apply)"
 fi
 echo
+echo "PLATFORM READINESS:"
+command -v flyctl >/dev/null 2>&1 && flyctl auth whoami >/dev/null 2>&1 && echo "  ✓ fly  (flyctl authenticated)" || { command -v flyctl >/dev/null 2>&1 && echo "  ✗ fly  (flyctl present but not authenticated — run: fly auth login)" || echo "  - fly  (flyctl not installed — brew install flyctl)"; }
+command -v vercel >/dev/null 2>&1 && vercel whoami >/dev/null 2>&1 && echo "  ✓ vercel (authenticated)" || { command -v vercel >/dev/null 2>&1 && echo "  ✗ vercel (present but not authenticated — run: vercel login)" || echo "  - vercel (not installed — npm i -g vercel)"; }
+command -v railway >/dev/null 2>&1 && echo "  ✓ railway (CLI present)" || echo "  - railway (not installed — npm i -g @railway/cli)"
+command -v gcloud >/dev/null 2>&1 && echo "  ✓ cloudrun (gcloud present)" || echo "  - cloudrun (gcloud not installed)"
+command -v ssh >/dev/null 2>&1 && echo "  ✓ vps    (ssh available — set --vps-host=<host> when planning)"
+echo
 echo "RECENT PLANS (up to 5):"
 if [ -d "$STATE/plans" ]; then
   ls -1t "$STATE/plans"/*.json 2>/dev/null | head -5 | while read f; do
