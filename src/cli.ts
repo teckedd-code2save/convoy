@@ -16,7 +16,9 @@ import {
   defaultStages,
   type OrchestratorOpts,
   type RealAuthorOpt,
+  type RealCloudRunOpt,
   type RealFlyOpt,
+  type RealRailwayOpt,
   type RealRehearsalOpt,
   type RealVercelOpt,
   type RealVpsGhcrOpt,
@@ -2039,16 +2041,16 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     const cwd = plan.target.workspace
       ? `${plan.target.localPath}/${plan.target.workspace}`
       : plan.target.localPath;
-    const { realRailway: _rr, ...realRailwayOpt } = {
-      realRailway: true,
+    const bakeWindowSeconds = opts.flyBakeWindow ?? 60;
+    const realRailwayOpt: RealRailwayOpt = {
       cwd,
       ...(opts.railwayProject !== undefined && { projectId: opts.railwayProject }),
       convoyAuthoredFiles: aggregateAuthoredFiles(plan).map((f) => f.path),
-      bakeWindowSeconds: opts.flyBakeWindow ?? 60,
+      bakeWindowSeconds,
     };
     orchestratorOpts.realRailway = realRailwayOpt;
     process.stdout.write(
-      `${pc.dim('Real Railway deploy:')} ${pc.bold(cwd)} ${pc.dim(`(bake: ${realRailwayOpt.bakeWindowSeconds}s)`)}\n`,
+      `${pc.dim('Real Railway deploy:')} ${pc.bold(cwd)} ${pc.dim(`(bake: ${bakeWindowSeconds}s)`)}\n`,
     );
   }
 
