@@ -2060,6 +2060,9 @@ function MergePrApprovalCard({
   const prNumber = typeof summary['pr_number'] === 'number' ? summary['pr_number'] : null;
   const branch = typeof summary['branch'] === 'string' ? summary['branch'] : null;
   const note = typeof summary['note'] === 'string' ? summary['note'] : null;
+  const rehearsal = summary['rehearsal'] && typeof summary['rehearsal'] === 'object'
+    ? (summary['rehearsal'] as Record<string, unknown>)
+    : null;
 
   // New shape: files is an array of {path, lines, summary, contentPreview}.
   // Older shape (pre-rewrite): files is a string[] of paths only.
@@ -2115,6 +2118,14 @@ function MergePrApprovalCard({
           branch: <span className="text-ink">{branch}</span>
         </div>
       ) : null}
+
+      {rehearsal ? <RehearsalEvidence rehearsal={rehearsal} /> : (
+        mode !== 'scripted' ? (
+          <div className="text-xs text-muted italic">
+            No rehearsal evidence — check the rehearse stage above.
+          </div>
+        ) : null
+      )}
 
       {note ? (
         <p className="text-sm text-muted leading-relaxed">{note}</p>

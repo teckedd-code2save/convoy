@@ -83,30 +83,116 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
 function LaneSection({ plan }: { plan: PlanSummary }) {
   const lanes = plan.lanes ?? [];
   if (lanes.length === 0) return null;
+  const { stagedLocally, markedAlreadySet } = computeStagedState(plan);
+
   return (
     <section className="space-y-4">
       <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">Lanes</h2>
-      <div className="grid gap-3 md:grid-cols-2">
-        {lanes.map((lane) => (
-          <div key={lane.id} className="border border-rule rounded-lg bg-card px-4 py-3 space-y-2">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="font-medium">{lane.displayName}</span>
-              <Tag>{lane.role}</Tag>
-              <Tag>{lane.platformDecision.chosen}</Tag>
+      <div className="grid gap-4 md:grid-cols-2">
+        {lanes.map((lane) => {
+          const laneRisks = lane.scan.risks ?? [];
+          const hardRisks = laneRisks.filter((r) => r.level === 'block');
+          const warnRisks = laneRisks.filter((r) => r.level === 'warn');
+          const infoRisks = laneRisks.filter((r) => r.level === 'info');
+          const expectedKeys = lane.secrets?.expectedKeys ?? [];
+
+          return (
+            <div key={lane.id} className="border border-rule rounded-lg bg-card overflow-hidden">
+              {/* Lane header */}
+              <div className="px-4 py-3 space-y-1.5">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-medium">{lane.displayName}</span>
+                  <Tag>{lane.role}</Tag>
+                  <Tag>{lane.platformDecision.chosen}</Tag>
+                </div>
+                <div className="text-xs text-muted font-mono">{lane.servicePath}</div>
+                <div className="text-sm text-muted">
+                  {lane.scan.ecosystem}
+                  {lane.scan.framework ? ` · ${lane.scan.framework}` : ''}
+                  {lane.scan.topology ? ` · ${lane.scan.topology}` : ''}
+                  {lane.scan.healthPath ? <span className="ml-1 font-mono text-xs">health={lane.scan.healthPath}</span> : null}
+                  {lane.scan.port ? <span className="ml-1 font-mono text-xs">:{lane.scan.port}</span> : null}
+                </div>
+              </div>
+
+              {/* Per-lane risks */}
+              {laneRisks.length > 0 ? (
+                <div className="border-t border-rule/60 px-4 py-3 space-y-1.5">
+                  <div className="text-[10px] uppercase tracking-wider text-muted font-semibold mb-2">
+                    Scan signals
+                  </div>
+                  {hardRisks.map((r, i) => (
+                    <div key={i} className="flex items-start gap-2 text-xs">
+                      <span className="shrink-0 text-[9px] uppercase tracking-wider font-medium px-1 py-0.5 rounded bg-danger/10 text-danger mt-0.5">block</span>
+                      <span className="text-ink/80">{r.message}</span>
+                    </div>
+                  ))}
+                  {warnRisks.map((r, i) => (
+                    <div key={i} className="flex items-start gap-2 text-xs">
+                      <span className="shrink-0 text-[9px] uppercase tracking-wider font-medium px-1 py-0.5 rounded bg-warn/10 text-warn mt-0.5">warn</span>
+                      <span className="text-ink/80">{r.message}</span>
+                    </div>
+                  ))}
+                  {infoRisks.map((r, i) => (
+                    <div key={i} className="flex items-start gap-2 text-xs">
+                      <span className="shrink-0 text-[9px] uppercase tracking-wider font-medium px-1 py-0.5 rounded bg-accent/10 text-accent mt-0.5">info</span>
+                      <span className="text-muted">{r.message}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+
+              {/* Per-lane secrets */}
+              {expectedKeys.length > 0 ? (
+                <div className="border-t border-rule/60 px-4 py-3">
+                  <div className="text-[10px] uppercase tracking-wider text-muted font-semibold mb-2">
+                    Required secrets ({expectedKeys.length})
+                  </div>
+                  <ul className="space-y-1">
+                    {expectedKeys.map((key) => {
+                      const staged = stagedLocally.has(key);
+                      const declared = markedAlreadySet.has(key);
+                      const state = staged ? 'staged' : declared ? 'declared' : 'missing';
+                      return (
+                        <li key={key} className="flex items-center gap-2 text-xs">
+                          <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                            state === 'staged' ? 'bg-success' :
+                            state === 'declared' ? 'bg-accent' :
+                            'bg-warn animate-pulse'
+                          }`} />
+                          <span className="font-mono text-ink/90">{key}</span>
+                          {state === 'staged' ? (
+                            <span className="text-success text-[9px]">staged</span>
+                          ) : state === 'declared' ? (
+                            <span className="text-accent text-[9px]">already-set</span>
+                          ) : (
+                            <span className="text-warn text-[9px]">missing</span>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  {expectedKeys.some((k) => !stagedLocally.has(k) && !markedAlreadySet.has(k)) ? (
+                    <p className="text-[10px] text-muted mt-2">
+                      Stage missing vars via <code className="font-mono bg-rule/60 rounded px-0.5">convoy stage-secrets {plan.id.slice(0, 8)}</code> or the panel below.
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
-            <div className="text-xs text-muted">{lane.servicePath}</div>
-            <div className="text-sm text-muted">
-              {lane.scan.ecosystem}
-              {lane.scan.framework ? ` · ${lane.scan.framework}` : ''}
-              {lane.scan.topology ? ` · ${lane.scan.topology}` : ''}
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
       {plan.dependencies && plan.dependencies.length > 0 ? (
-        <div className="text-sm text-muted space-y-1">
+        <div className="text-sm text-muted space-y-1 border border-rule/40 rounded-lg px-4 py-3 bg-card/40">
+          <div className="text-[10px] uppercase tracking-wider font-semibold mb-1">Deploy order</div>
           {plan.dependencies.map((dep) => (
-            <div key={`${dep.from}-${dep.to}`}>{dep.from} → {dep.to} · {dep.reason}</div>
+            <div key={`${dep.from}-${dep.to}`} className="text-xs">
+              <span className="font-mono">{dep.from}</span>
+              <span className="text-muted mx-1.5">→</span>
+              <span className="font-mono">{dep.to}</span>
+              <span className="text-muted ml-2">{dep.reason}</span>
+            </div>
           ))}
         </div>
       ) : null}
@@ -315,6 +401,9 @@ function PlatformSection({ plan }: { plan: PlanSummary }) {
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 pt-1">
           {sortedCandidates.map((c) => {
             const chosen = c.platform === plan.platform.chosen;
+            const topAdj = ((c as { adjustments?: Array<{ delta: number; label: string }> }).adjustments ?? [])
+              .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+              .slice(0, 3);
             return (
               <div
                 key={c.platform}
@@ -329,7 +418,20 @@ function PlatformSection({ plan }: { plan: PlanSummary }) {
                   <span className="font-mono text-sm font-semibold">{c.platform}</span>
                   <span className="text-xs text-muted font-mono tabular-nums">{c.score}</span>
                 </div>
-                <div className="text-xs text-muted mt-2 line-clamp-3">{c.reason}</div>
+                {topAdj.length > 0 ? (
+                  <ul className="mt-2 space-y-0.5">
+                    {topAdj.map((a, i) => (
+                      <li key={i} className="flex items-baseline gap-1.5 text-[11px]">
+                        <span className={`tabular-nums font-mono shrink-0 ${a.delta > 0 ? 'text-success' : 'text-danger'}`}>
+                          {a.delta > 0 ? '+' : ''}{a.delta}
+                        </span>
+                        <span className="text-muted line-clamp-1">{a.label}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <div className="text-xs text-muted mt-2 line-clamp-3">{c.reason}</div>
+                )}
               </div>
             );
           })}

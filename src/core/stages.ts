@@ -30,6 +30,20 @@ import {
   swapNginxUpstream,
   writeActiveSlot,
 } from '../adapters/vps/runner.js';
+import {
+  buildAndPushGhcr,
+  caddyAvailable,
+  composeDeployViaGhcr,
+  dockerAvailable,
+  ensureCaddyImport,
+  ghcrLogin,
+  httpProbe,
+  readCurrentComposeImage,
+  reloadCaddy,
+  rollbackComposeImage,
+  writeCaddySiteFile,
+  type GhcrDeployTarget,
+} from '../adapters/vps/ghcr-runner.js';
 import type { ConvoyBus } from './bus.js';
 import {
   createPrFromAuthoredFiles,
@@ -94,6 +108,13 @@ export interface OrchestratorOpts {
   realFly?: RealFlyOpt;
   realVercel?: RealVercelOpt;
   realVps?: RealVpsOpt;
+  realVpsGhcr?: RealVpsGhcrOpt;
+  /**
+   * Resolved Anthropic API key for this run. Passed to the medic agent and
+   * enricher so hosted Convoy can inject a team's BYOK key without touching
+   * the server process's own ANTHROPIC_API_KEY env var.
+   */
+  apiKey?: string;
 }
 
 /**
@@ -117,6 +138,61 @@ export interface RealVpsOpt {
   healthPath?: string;
   bakeWindowSeconds?: number;
   thresholdErrorRatePct?: number;
+  thresholdP99Ms?: number;
+  convoyAuthoredFiles?: string[];
+}
+
+/**
+ * GHCR-based VPS deploy configuration.
+ *
+ * Mirrors the ship-to-vps pattern: build the Docker image on the Convoy agent
+ * machine, push to GHCR, then SSH to the box and let Docker pull the exact
+ * SHA-tagged image and roll the compose service. No rsync, no build on box.
+ *
+ * Prefer this over --real-vps when the box is underpowered for Docker builds,
+ * when the deploy must match a GitHub Actions workflow exactly, or when Caddy
+ * is the reverse proxy (rather than nginx).
+ */
+export interface RealVpsGhcrOpt {
+  /** SSH destination — `user@host` or `host`. */
+  host: string;
+  /** Local path for `docker buildx build` context. */
+  cwd: string;
+  /** Base deploy directory on the box, e.g. `/opt/my-app`. */
+  deployRoot: string;
+  /** SSH port. Default 22. */
+  sshPort?: number;
+  /** SSH identity file. */
+  identityFile?: string;
+  /** App name used in log messages and Caddy site file naming. */
+  appName: string;
+  /** GHCR image ref, e.g. `ghcr.io/myorg/my-app`. No tag — we append one. */
+  imageRef: string;
+  /** GitHub username for docker login on both sides. */
+  ghcrUsername: string;
+  /** GitHub token with packages:write (agent side) and packages:read (box side). */
+  ghcrToken: string;
+  /** Docker build args. */
+  buildArgs?: Record<string, string>;
+  /** Compose service name. Default: `web`. */
+  composeService?: string;
+  /** Run Prisma migrations container before rolling the service. Default false. */
+  runMigrations?: boolean;
+  /** Docker network for the migrations one-shot container. Default: appName. */
+  migrationNetwork?: string;
+  /** Write /etc/caddy/sites/<appName>.caddy and reload Caddy. Default false. */
+  manageCaddy?: boolean;
+  /** Domain for the Caddy site file. Required when manageCaddy=true. */
+  domain?: string;
+  /** Port the container serves on. Default 3000. Used in Caddy config. */
+  containerPort?: number;
+  /** Health check path. Default: `/`. */
+  healthPath?: string;
+  /** Bake window in seconds. Default 60. */
+  bakeWindowSeconds?: number;
+  /** Error rate threshold %. Default 5. */
+  thresholdErrorRatePct?: number;
+  /** P99 latency threshold ms. Default 1500. */
   thresholdP99Ms?: number;
   convoyAuthoredFiles?: string[];
 }
@@ -214,6 +290,8 @@ export interface RealRehearsalOpt {
 export type InjectFailureOpt = {
   stage: 'rehearse' | 'canary';
   kind: 'latency' | 'error-rate' | 'build';
+  /** 'concurrency' — serialised-renderer bottleneck (0% errors, catastrophic p99) */
+  scenario?: 'concurrency';
   logsPath?: string;
   repoPath?: string;
   convoyAuthoredFiles?: string[];
@@ -319,6 +397,7 @@ abstract class BaseStage implements Stage {
    */
   protected medicTelemetry(ctx: StageContext): DiagnoseOptions {
     return {
+      ...(ctx.opts.apiKey !== undefined && { apiKey: ctx.opts.apiKey }),
       onToolCall: (call) => {
         this.emit(ctx, 'progress', {
           phase: 'medic.tool_use',
@@ -802,6 +881,7 @@ export class AuthorStage extends BaseStage {
       pr_url: pr.prUrl,
       pr_number: pr.prNumber,
       branch: pr.branch,
+      rehearsal: summarizeRehearsalForApproval(ctx.prior['rehearse']),
       note: sourceForApproval
         ? `This PR is based on local HEAD ${sourceForApproval.head_sha.slice(0, 7)}${sourceForApproval.branch ? ` from \`${sourceForApproval.branch}\`` : ''}. Review the full GitHub diff, including any operator-authored application commits from that snapshot, then approve to merge.`
         : 'Review the full GitHub diff and approve to merge.',
@@ -865,13 +945,15 @@ export class RehearseStage extends BaseStage {
 
       const inject = ctx.opts.injectFailure;
       if (inject && inject.stage === 'rehearse') {
+        const isConcurrency = inject.scenario === 'concurrency';
         this.emit(ctx, 'progress', {
           phase: 'synthetic_load.breach',
-          p99_ms: 494,
-          error_rate_pct: 6.67,
-          threshold_error_rate_pct: 1.0,
+          p99_ms: isConcurrency ? 8740 : 494,
+          error_rate_pct: isConcurrency ? 0.0 : 6.67,
+          threshold_error_rate_pct: isConcurrency ? 0.0 : 1.0,
+          threshold_p99_ms: isConcurrency ? 500 : undefined,
         }, lane.id);
-        const logs = await loadInjectedLogs(inject);
+        const logs = isConcurrency ? defaultConcurrentLogs() : await loadInjectedLogs(inject);
         this.emit(ctx, 'progress', { phase: 'medic.invoked' }, lane.id);
         const diagnosis = await diagnose({
           stage: 'rehearse',
@@ -884,8 +966,12 @@ export class RehearseStage extends BaseStage {
           repoPath: inject.repoPath ?? '.',
           convoyAuthoredFiles: inject.convoyAuthoredFiles ?? [],
           logs,
-          metrics: { p99_ms: 494, p95_ms: 410, error_rate_pct: 6.67, count: 90 },
-          errorMessage: 'synthetic load breached error-rate tolerance (6.67% > 1%)',
+          metrics: isConcurrency
+            ? { p99_ms: 8740, p95_ms: 6210, error_rate_pct: 0.0, count: 300 }
+            : { p99_ms: 494, p95_ms: 410, error_rate_pct: 6.67, count: 90 },
+          errorMessage: isConcurrency
+            ? 'synthetic load breached p99 tolerance (8740ms > 500ms) — all requests succeeded but serialised'
+            : 'synthetic load breached error-rate tolerance (6.67% > 1%)',
         }, this.medicTelemetry(ctx));
         this.emit(ctx, 'diagnosis', diagnosis, lane.id);
         throw new RehearsalBreachError(diagnosis);
@@ -1009,6 +1095,29 @@ function defaultBuggyLogs(): string[] {
   ];
 }
 
+function defaultConcurrentLogs(): string[] {
+  const now = new Date().toISOString();
+  // Simulate 30 concurrent /render requests queuing through a global serialisation
+  // lock. All requests succeed (HTTP 200) but wait times stack up linearly.
+  // The medic should identify renderLock in src/routes/render.ts as the root cause.
+  const entries: string[] = [
+    `{"ts":"${now}","level":"info","message":"server_started","port":8080,"mode":"concurrent"}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-001","waited_ms":0}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-002","waited_ms":301}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-003","waited_ms":604}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-004","waited_ms":906}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-005","waited_ms":1208}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-010","waited_ms":2710}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-020","waited_ms":5720}`,
+    `{"ts":"${now}","level":"info","message":"render_lock_acquired","reportId":"rep-029","waited_ms":8432}`,
+    `{"ts":"${now}","level":"info","message":"render_complete","reportId":"rep-001","pages":1,"render_ms":301,"total_ms":301}`,
+    `{"ts":"${now}","level":"info","message":"render_complete","reportId":"rep-002","pages":1,"render_ms":300,"total_ms":601}`,
+    `{"ts":"${now}","level":"info","message":"render_complete","reportId":"rep-010","pages":1,"render_ms":299,"total_ms":3009}`,
+    `{"ts":"${now}","level":"info","message":"render_complete","reportId":"rep-029","pages":1,"render_ms":301,"total_ms":8733}`,
+  ];
+  return entries;
+}
+
 export class CanaryStage extends BaseStage {
   readonly name = 'canary' as const;
 
@@ -1024,7 +1133,7 @@ export class CanaryStage extends BaseStage {
     // Unlike the first revision, this gate now probes the platform
     // connection read-only so the operator sees the exact missing lane
     // prerequisite before the deploy command fails late.
-    const isRealDeploy = Boolean(ctx.opts.realFly || ctx.opts.realVercel || ctx.opts.realVps);
+    const isRealDeploy = Boolean(ctx.opts.realFly || ctx.opts.realVercel || ctx.opts.realVps || ctx.opts.realVpsGhcr);
     if (isRealDeploy && ctx.opts.plan) {
       const plan = normalizePlan(ctx.opts.plan);
       for (const lane of plan.lanes) {
@@ -1040,6 +1149,9 @@ export class CanaryStage extends BaseStage {
     }
     if (ctx.opts.realVps) {
       return this.#runRealVps(ctx, ctx.opts.realVps);
+    }
+    if (ctx.opts.realVpsGhcr) {
+      return this.#runRealVpsGhcr(ctx, ctx.opts.realVpsGhcr);
     }
 
     this.emit(ctx, 'started', {});
@@ -1340,6 +1452,161 @@ export class CanaryStage extends BaseStage {
   }
 
   /**
+   * GHCR VPS canary path:
+   *   1. Local docker build + push to GHCR
+   *   2. Optional Caddy site file setup (idempotent)
+   *   3. promote gate
+   *   4. SSH: docker login → docker pull → (optional) migrations → compose up
+   *
+   * Pre-staged reverse: we read the currently-running image tag before the
+   * deploy so ObserveStage can roll back to it if the bake window breaches.
+   */
+  async #runRealVpsGhcr(ctx: StageContext, cfg: RealVpsGhcrOpt): Promise<unknown> {
+    this.emit(ctx, 'started', { mode: 'real-vps-ghcr', host: cfg.host, app: cfg.appName });
+
+    const target: GhcrDeployTarget = {
+      host: cfg.host,
+      deployRoot: cfg.deployRoot,
+      ...(cfg.sshPort !== undefined && { port: cfg.sshPort }),
+      ...(cfg.identityFile !== undefined && { identityFile: cfg.identityFile }),
+    };
+
+    // Preflight: local docker + remote SSH
+    const dockerOk = await dockerAvailable();
+    if (!dockerOk) {
+      throw new Error('docker is not installed locally. Convoy uses `docker buildx build` to build and push the image to GHCR before deploying.');
+    }
+
+    const sshOk = await sshAvailable();
+    if (!sshOk) {
+      throw new Error('OpenSSH client (`ssh`) is not installed. On macOS it ships by default; on Debian/Ubuntu run `apt install openssh-client`.');
+    }
+
+    this.emit(ctx, 'progress', { phase: 'vps.ghcr.preflighting' });
+
+    // Caddy setup (idempotent — safe to run on every deploy)
+    if (cfg.manageCaddy) {
+      if (!cfg.domain) {
+        throw new Error('--vps-ghcr-manage-caddy requires --vps-ghcr-domain to be set.');
+      }
+      const hasCaddy = await caddyAvailable(target);
+      if (!hasCaddy) {
+        throw new Error(`Caddy is not installed on ${cfg.host}. Install it first: https://caddyserver.com/docs/install`);
+      }
+      this.emit(ctx, 'progress', { phase: 'caddy.setup' });
+      const importResult = await ensureCaddyImport(target);
+      if (!importResult.ok) {
+        throw new Error(`Failed to ensure Caddy import on ${cfg.host}: ${importResult.stderr.trim().slice(0, 240)}`);
+      }
+      const siteResult = await writeCaddySiteFile(target, cfg.appName, cfg.domain, cfg.containerPort ?? 3000);
+      if (!siteResult.ok) {
+        throw new Error(`Failed to write Caddy site file: ${siteResult.stderr.trim().slice(0, 240)}`);
+      }
+      const reloadResult = await reloadCaddy(target);
+      if (!reloadResult.ok) {
+        throw new Error(`Caddy reload failed: ${reloadResult.stderr.trim().slice(0, 240)}`);
+      }
+      this.emit(ctx, 'progress', { phase: 'caddy.ready', domain: cfg.domain });
+    }
+
+    // Login to GHCR from local side so the build push succeeds
+    this.emit(ctx, 'progress', { phase: 'ghcr.login' });
+    const loginResult = await ghcrLogin('ghcr.io', cfg.ghcrUsername, cfg.ghcrToken);
+    if (!loginResult.ok) {
+      throw new Error(`docker login to ghcr.io failed: ${loginResult.stderr.trim().slice(0, 240)}`);
+    }
+
+    // Build + push — tag with a timestamp-based release id for determinism
+    const tag = `r${Date.now().toString(36)}`;
+    this.emit(ctx, 'progress', { phase: 'ghcr.building', image: cfg.imageRef, tag });
+
+    const buildLogs: string[] = [];
+    const buildResult = await buildAndPushGhcr(cfg.cwd, cfg.imageRef, {
+      tag,
+      extraTags: ['latest'],
+      buildArgs: cfg.buildArgs,
+      onLog: (line) => {
+        buildLogs.push(line);
+        if (/error|failed/i.test(line)) this.emit(ctx, 'log', { line });
+      },
+      timeoutMs: 20 * 60 * 1000,
+    });
+
+    if (!buildResult.ok) {
+      const diagnosis = await diagnose({
+        stage: 'canary',
+        phase: 'ghcr_build',
+        repoPath: cfg.cwd,
+        convoyAuthoredFiles: cfg.convoyAuthoredFiles ?? [],
+        logs: buildLogs.slice(-200),
+        errorMessage: buildResult.error ?? 'docker build failed',
+      }, this.medicTelemetry(ctx));
+      this.emit(ctx, 'diagnosis', diagnosis);
+      throw new Error(`Docker build failed: ${buildResult.error}`);
+    }
+
+    this.emit(ctx, 'progress', { phase: 'ghcr.pushed', image: buildResult.imageRef });
+
+    // Read the currently-running image before deploying so we have the
+    // rollback target ready before any state change.
+    const previousImageRef = await readCurrentComposeImage(target, cfg.deployRoot, cfg.composeService ?? 'web');
+    if (previousImageRef) {
+      this.emit(ctx, 'progress', { phase: 'rollback.prestaged', previous_image: previousImageRef });
+    }
+
+    await this.awaitApproval(ctx, 'promote', {
+      mode: 'real',
+      app: cfg.appName,
+      host: cfg.host,
+      image: buildResult.imageRef,
+      note: `Image built and pushed. Deploy to ${cfg.host} via docker compose?`,
+      ...(previousImageRef ? { rollback_image: previousImageRef } : {}),
+    });
+
+    // Deploy on the box
+    this.emit(ctx, 'progress', { phase: 'vps.ghcr.deploying', image: buildResult.imageRef });
+
+    const deployLogs: string[] = [];
+    const deployResult = await composeDeployViaGhcr(target, {
+      imageRef: buildResult.imageRef,
+      service: cfg.composeService ?? 'web',
+      runMigrations: cfg.runMigrations ?? false,
+      migrationNetwork: cfg.migrationNetwork ?? cfg.appName,
+      ghcrUsername: cfg.ghcrUsername,
+      ghcrToken: cfg.ghcrToken,
+      onLog: (line) => {
+        deployLogs.push(line);
+        if (/error|failed/i.test(line)) this.emit(ctx, 'log', { line });
+      },
+    });
+
+    if (!deployResult.ok) {
+      const diagnosis = await diagnose({
+        stage: 'canary',
+        phase: 'vps_ghcr_deploy',
+        repoPath: cfg.cwd,
+        convoyAuthoredFiles: cfg.convoyAuthoredFiles ?? [],
+        logs: deployLogs.slice(-200),
+        errorMessage: `compose deploy on ${cfg.host} failed: ${deployResult.error ?? ''}`,
+      }, this.medicTelemetry(ctx));
+      this.emit(ctx, 'diagnosis', diagnosis);
+      throw new Error(`VPS GHCR deploy failed: ${deployResult.error}`);
+    }
+
+    this.emit(ctx, 'progress', { phase: 'vps.ghcr.deployed' });
+
+    const result = {
+      healthy: true,
+      host: cfg.host,
+      image: buildResult.imageRef,
+      tag,
+      previous_image: previousImageRef,
+    };
+    this.emit(ctx, 'finished', result);
+    return result;
+  }
+
+  /**
    * Secrets gate. Computes which required keys aren't yet staged and
    * requests a stage_secrets approval if any are missing. The approval's
    * summary carries the missing-key list plus platform/binding context so
@@ -1573,6 +1840,9 @@ export class PromoteStage extends BaseStage {
     if (ctx.opts.realVps) {
       return this.#runRealVps(ctx, ctx.opts.realVps, ctx.prior['canary'] as Record<string, unknown> | undefined);
     }
+    if (ctx.opts.realVpsGhcr) {
+      return this.#runRealVpsGhcr(ctx, ctx.opts.realVpsGhcr, ctx.prior['canary'] as Record<string, unknown> | undefined);
+    }
 
     this.emit(ctx, 'started', { mode: 'scripted' });
 
@@ -1754,6 +2024,104 @@ export class PromoteStage extends BaseStage {
     this.emit(ctx, 'finished', result);
     return result;
   }
+
+  /**
+   * GHCR VPS promote: the compose service is already rolling in CanaryStage.
+   * This stage just probes the live URL 3× in a row to confirm the new image
+   * is serving healthy responses before handing off to the observe window.
+   */
+  async #runRealVpsGhcr(
+    ctx: StageContext,
+    cfg: RealVpsGhcrOpt,
+    canaryResult: Record<string, unknown> | undefined,
+  ): Promise<unknown> {
+    this.emit(ctx, 'started', { mode: 'real-vps-ghcr', phase: 'verify-live' });
+
+    const image = typeof canaryResult?.['image'] === 'string' ? canaryResult['image'] : cfg.imageRef;
+    const liveHost = cfg.host.split('@').pop() ?? cfg.host;
+    const liveUrl = cfg.manageCaddy && cfg.domain
+      ? `https://${cfg.domain}${cfg.healthPath ?? '/'}`
+      : `http://${liveHost}:${cfg.containerPort ?? 3000}${cfg.healthPath ?? '/'}`;
+
+    const verifyWindowMs = 30_000;
+    const deadline = Date.now() + verifyWindowMs;
+    const latencies: number[] = [];
+    let consecutive = 0;
+    let lastFailure: { status?: number; error?: string } | null = null;
+
+    while (Date.now() < deadline && consecutive < 3) {
+      const probe = await httpProbe(liveUrl, 5_000);
+      if (probe.latencyMs !== undefined) latencies.push(probe.latencyMs);
+      this.emit(ctx, 'progress', {
+        phase: 'vps.ghcr.health_probe',
+        url: liveUrl,
+        ok: probe.ok,
+        status: probe.status ?? 0,
+        latency_ms: probe.latencyMs,
+      });
+      if (probe.ok) {
+        consecutive += 1;
+      } else {
+        consecutive = 0;
+        lastFailure = { ...(probe.status !== undefined && { status: probe.status }), ...(probe.error !== undefined && { error: probe.error }) };
+      }
+      if (consecutive < 3) await this.sleep(2_000, ctx.signal);
+    }
+
+    if (consecutive < 3) {
+      const reason = lastFailure
+        ? `${liveUrl} did not return 200 (last probe: status=${lastFailure.status ?? 0}${lastFailure.error ? `, error=${lastFailure.error}` : ''})`
+        : `${liveUrl} did not return 200 three times in a row within ${verifyWindowMs}ms`;
+      const previousImage = typeof canaryResult?.['previous_image'] === 'string' ? canaryResult['previous_image'] : null;
+      await this.#triggerVpsGhcrRollback(ctx, cfg, reason, 'promote', previousImage);
+    }
+
+    ctx.store.updateRun(ctx.run.id, { liveUrl });
+    const updated = ctx.store.getRun(ctx.run.id);
+    if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
+
+    const result = { live_url: liveUrl, image, previous_image: canaryResult?.['previous_image'] ?? null };
+    this.emit(ctx, 'finished', result);
+    return result;
+  }
+
+  async #triggerVpsGhcrRollback(
+    ctx: StageContext,
+    cfg: RealVpsGhcrOpt,
+    reason: string,
+    firedBy: 'promote' | 'observe',
+    previousImage: string | null,
+  ): Promise<never> {
+    const emit = (kind: EventKind, payload: unknown): void => {
+      const event = ctx.store.appendEvent(ctx.run.id, firedBy, kind, payload);
+      ctx.bus.emit({ type: 'event.appended', event });
+    };
+    emit('progress', { phase: 'rollback.starting', reason, previous_image: previousImage });
+
+    const target: GhcrDeployTarget = {
+      host: cfg.host,
+      deployRoot: cfg.deployRoot,
+      ...(cfg.sshPort !== undefined && { port: cfg.sshPort }),
+      ...(cfg.identityFile !== undefined && { identityFile: cfg.identityFile }),
+    };
+
+    if (previousImage) {
+      const rb = await rollbackComposeImage(target, cfg.deployRoot, previousImage, cfg.composeService ?? 'web');
+      if (!rb.ok) {
+        emit('progress', { phase: 'rollback.failed', error: rb.stderr.trim().slice(0, 240) });
+        ctx.store.updateRun(ctx.run.id, { outcomeReason: `${reason}; rollback failed`, completedAt: new Date() });
+        throw new Error(`${firedBy} breach AND rollback failed: ${rb.stderr.trim().slice(0, 240)}`);
+      }
+      emit('progress', { phase: 'rollback.done', restored_image: previousImage });
+    } else {
+      emit('progress', { phase: 'rollback.skipped', reason: 'no previous image recorded — cannot roll back automatically' });
+    }
+
+    ctx.store.updateRun(ctx.run.id, { status: 'rolled_back', completedAt: new Date(), outcomeReason: reason });
+    const updated = ctx.store.getRun(ctx.run.id);
+    if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
+    throw new RollbackTriggeredError(reason, firedBy);
+  }
 }
 
 /**
@@ -1808,6 +2176,9 @@ export class ObserveStage extends BaseStage {
     }
     if (ctx.opts.realVps) {
       return this.#runRealVps(ctx, ctx.opts.realVps, ctx.prior['promote'] as Record<string, unknown> | undefined);
+    }
+    if (ctx.opts.realVpsGhcr) {
+      return this.#runRealVpsGhcr(ctx, ctx.opts.realVpsGhcr, ctx.prior['promote'] as Record<string, unknown> | undefined);
     }
 
     this.emit(ctx, 'started', { bake_window_seconds: 2 });
@@ -2100,6 +2471,95 @@ export class ObserveStage extends BaseStage {
         completedAt: new Date(),
         outcomeReason: reason,
       });
+      const updated = ctx.store.getRun(ctx.run.id);
+      if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
+      throw new RollbackTriggeredError(reason, 'observe');
+    }
+
+    const result = {
+      window_seconds: window,
+      slo_healthy: true,
+      observations: { p99_ms: p99, error_rate_pct: errorRatePct, samples: samples.length },
+    };
+    this.emit(ctx, 'finished', result);
+    return result;
+  }
+
+  /**
+   * GHCR VPS observe: same bake-window polling as the rsync VPS path, but
+   * rollback means re-running compose with the image tag recorded before the
+   * deploy in CanaryStage.
+   */
+  async #runRealVpsGhcr(
+    ctx: StageContext,
+    cfg: RealVpsGhcrOpt,
+    promoteResult: Record<string, unknown> | undefined,
+  ): Promise<unknown> {
+    const window = cfg.bakeWindowSeconds ?? 60;
+    this.emit(ctx, 'started', { bake_window_seconds: window });
+
+    const liveUrl = (typeof promoteResult?.['live_url'] === 'string' ? promoteResult['live_url'] : null)
+      ?? (cfg.manageCaddy && cfg.domain
+        ? `https://${cfg.domain}${cfg.healthPath ?? '/'}`
+        : `http://${cfg.host.split('@').pop()}:${cfg.containerPort ?? 3000}${cfg.healthPath ?? '/'}`);
+    const previousImage = typeof promoteResult?.['previous_image'] === 'string' ? promoteResult['previous_image'] : null;
+
+    const target: GhcrDeployTarget = {
+      host: cfg.host,
+      deployRoot: cfg.deployRoot,
+      ...(cfg.sshPort !== undefined && { port: cfg.sshPort }),
+      ...(cfg.identityFile !== undefined && { identityFile: cfg.identityFile }),
+    };
+
+    const samples: { ok: boolean; ms: number }[] = [];
+    const deadline = Date.now() + window * 1000;
+    while (Date.now() < deadline) {
+      if (ctx.signal.aborted) throw new Error('aborted');
+      const probe = await httpProbe(liveUrl, 5_000);
+      samples.push({ ok: probe.ok, ms: probe.latencyMs ?? 5_000 });
+
+      const errorRatePct = (samples.filter((s) => !s.ok).length / samples.length) * 100;
+      const p99Now = percentile(samples.map((s) => s.ms), 0.99) ?? 0;
+      if (samples.length === 1 || samples.length % 5 === 0) {
+        this.emit(ctx, 'progress', {
+          phase: 'observe.probe',
+          probe_count: samples.length,
+          error_rate_pct: Number(errorRatePct.toFixed(2)),
+          p99_ms: p99Now,
+          ok: probe.ok,
+        });
+      }
+      await this.sleep(5_000, ctx.signal);
+    }
+
+    const failures = samples.filter((s) => !s.ok).length;
+    const errorRatePct = samples.length === 0 ? 0 : (failures / samples.length) * 100;
+    const p99 = percentile(samples.map((s) => s.ms), 0.99) ?? 0;
+    const errorThreshold = cfg.thresholdErrorRatePct ?? 5;
+    const p99Threshold = cfg.thresholdP99Ms ?? 1500;
+
+    this.emit(ctx, 'progress', {
+      phase: 'vps.bake_summary',
+      samples: samples.length,
+      error_rate_pct: errorRatePct,
+      p99_ms: p99,
+    });
+
+    if (errorRatePct > errorThreshold || p99 > p99Threshold) {
+      const reason = `bake breach: error_rate=${errorRatePct.toFixed(1)}% (>${errorThreshold}%) or p99=${p99}ms (>${p99Threshold}ms)`;
+      this.emit(ctx, 'progress', { phase: 'observe.breach', reason });
+      if (previousImage) {
+        this.emit(ctx, 'progress', { phase: 'vps.ghcr.rollback', to_image: previousImage, reason });
+        const rb = await rollbackComposeImage(target, cfg.deployRoot, previousImage, cfg.composeService ?? 'web');
+        if (!rb.ok) {
+          ctx.store.updateRun(ctx.run.id, { outcomeReason: `${reason}; rollback failed: ${rb.stderr.trim().slice(0, 120)}`, completedAt: new Date() });
+          throw new RollbackTriggeredError(reason, 'observe');
+        }
+        this.emit(ctx, 'progress', { phase: 'rollback.done', restored_image: previousImage });
+      } else {
+        this.emit(ctx, 'progress', { phase: 'rollback.skipped', note: 'no previous image recorded' });
+      }
+      ctx.store.updateRun(ctx.run.id, { status: 'rolled_back', completedAt: new Date(), outcomeReason: reason });
       const updated = ctx.store.getRun(ctx.run.id);
       if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
       throw new RollbackTriggeredError(reason, 'observe');

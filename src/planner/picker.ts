@@ -1,4 +1,4 @@
-import type { PlanPlatformDecision, PlanPlatformCandidate } from '../core/plan.js';
+import type { PlanPlatformDecision, PlanPlatformCandidate, PlanPlatformAdjustment } from '../core/plan.js';
 import type { Platform } from '../core/types.js';
 import type { ScanResult, ServiceNode } from './scanner.js';
 
@@ -49,7 +49,12 @@ function scoreAll(scan: ScanResult): PlanPlatformCandidate[] {
 
 function scoreOne(platform: Platform, scan: ScanResult): PlanPlatformCandidate {
   let score = 50;
-  const reasons: string[] = [];
+  const adjustments: PlanPlatformAdjustment[] = [];
+
+  const adj = (delta: number, label: string) => {
+    score += delta;
+    adjustments.push({ delta, label });
+  };
 
   const hasWorker = scan.topology === 'web+worker' || scan.topology === 'worker';
   const isStatic = scan.topology === 'static';
@@ -58,105 +63,73 @@ function scoreOne(platform: Platform, scan: ScanResult): PlanPlatformCandidate {
 
   switch (platform) {
     case 'fly':
-      if (hasWorker) {
-        score += 25;
-        reasons.push('background worker friendly');
-      }
-      if (needsContainer) {
-        score += 15;
-        reasons.push('container-native');
-      }
-      if (hasPostgres) {
-        score += 5;
-        reasons.push('attaches external Postgres cleanly');
-      }
-      if (isStatic) {
-        score -= 20;
-        reasons.push('overkill for a static site');
-      }
+      if (hasWorker)      adj(+25, 'background worker topology');
+      if (needsContainer) adj(+15, 'container-native (Dockerfile / Go / Rust)');
+      if (hasPostgres)    adj(+5,  'attaches external Postgres cleanly');
+      if (isStatic)       adj(-20, 'overkill for a static site');
       break;
 
     case 'railway':
-      if (hasPostgres) {
-        score += 20;
-        reasons.push('managed Postgres in one click');
-      }
-      if (hasWorker) {
-        score += 10;
-        reasons.push('multi-service monorepo support');
-      }
-      if (isStatic) score -= 10;
+      if (hasPostgres) adj(+20, 'managed Postgres in one click');
+      if (hasWorker)   adj(+10, 'multi-service monorepo support');
+      if (isStatic)    adj(-10, 'not optimised for static');
       break;
 
     case 'vercel':
-      if (scan.framework === 'next.js' && !hasWorker) {
-        score += 35;
-        reasons.push('best-in-class for Next.js');
-      }
-      if (isStatic) {
-        score += 25;
-        reasons.push('static sites are free and fast here');
-      }
-      if (hasWorker) {
-        score -= 25;
-        reasons.push('background workers not supported');
-      }
-      if (needsContainer && scan.framework !== 'next.js') {
-        score -= 15;
-        reasons.push('container-first apps fit awkwardly');
-      }
+      if (scan.framework === 'next.js' && !hasWorker) adj(+35, 'best-in-class for Next.js');
+      if (isStatic)                                    adj(+25, 'static sites are free and instant here');
+      if (hasWorker)                                   adj(-25, 'background workers not supported');
+      if (needsContainer && scan.framework !== 'next.js') adj(-15, 'container-first apps fit awkwardly');
       break;
 
     case 'cloudrun':
-      if (needsContainer) {
-        score += 15;
-        reasons.push('container-native');
-      }
-      if (hasPostgres) {
-        score += 5;
-        reasons.push('pairs with Cloud SQL');
-      }
-      if (scan.framework === 'next.js' && !hasWorker) score -= 5;
-      if (isStatic) score -= 20;
-      // GCP onboarding overhead
-      score -= 5;
-      reasons.push('extra GCP setup cost');
+      adj(-5, 'GCP setup overhead');
+      if (needsContainer) adj(+15, 'container-native');
+      if (hasPostgres)    adj(+5,  'pairs with Cloud SQL');
+      if (scan.framework === 'next.js' && !hasWorker) adj(-5, 'Next.js fits Vercel better');
+      if (isStatic) adj(-20, 'static sites belong on a CDN');
       break;
 
-    case 'vps':
-      // VPS is the "I own the box" path. We never *recommend* it over a
-      // managed PaaS unless the operator opts in (CONVOY_VPS_HOST set), or
-      // the repo is already container-shaped enough that VPS is a clean fit
-      // (Dockerfile present, no Next.js Vercel preference). The point isn't
-      // to outscore Fly — it's to be available when an operator says
-      // --platform=vps explicitly without surprising anyone with autopick.
+    case 'vps': {
       if (process.env['CONVOY_VPS_HOST']) {
-        score += 30;
-        reasons.push('CONVOY_VPS_HOST set (operator opted in)');
+        adj(+30, 'CONVOY_VPS_HOST set — operator opted in');
       } else {
-        // Without explicit opt-in, stay below the managed PaaSes by default.
-        score -= 10;
-        reasons.push('opt-in only (set CONVOY_VPS_HOST or pass --platform=vps)');
+        adj(-10, 'opt-in only (set CONVOY_VPS_HOST or --platform=vps)');
       }
-      if (scan.hasDockerfile) {
-        score += 10;
-        reasons.push('repo already ships a Dockerfile');
+
+      if (scan.hasDockerfile) adj(+10, 'repo ships a Dockerfile');
+
+      const hasDockerCompose = scan.topLevelFiles.some(
+        (f) => f === 'docker-compose.yml' || f === 'docker-compose.yaml' ||
+               f === 'compose.yml' || f === 'compose.yaml',
+      );
+      if (hasDockerCompose) adj(+15, 'docker-compose.yml at root');
+
+      if (scan.topLevelFiles.includes('Caddyfile')) adj(+15, 'Caddyfile at root (Caddy reverse proxy)');
+
+      if (scan.topLevelFiles.includes('deploy.yml') || scan.topLevelFiles.includes('deploy.yaml')) {
+        adj(+20, 'deploy.yml — scaffolded for VPS deployment');
       }
-      if (isStatic) {
-        score -= 30;
-        reasons.push('static sites belong on a CDN, not a VPS');
+
+      if (scan.subServices.length >= 3) {
+        adj(+10, `${scan.subServices.length}-service repo — VPS compose avoids per-service PaaS pricing`);
       }
-      if (scan.framework === 'next.js' && !hasWorker) {
-        score -= 10;
-        reasons.push('Next.js fits Vercel better unless you need a box');
-      }
+
+      if (isStatic)                                     adj(-30, 'static sites belong on a CDN');
+      if (scan.framework === 'next.js' && !hasWorker)   adj(-10, 'Next.js fits Vercel better unless you need a box');
       break;
+    }
   }
 
   score = Math.max(0, Math.min(100, score));
+  const reasons = adjustments
+    .filter((a) => a.delta > 0)
+    .map((a) => a.label);
+
   return {
     platform,
     score,
     reason: reasons.join(', ') || 'no strong signal',
+    adjustments,
   };
 }

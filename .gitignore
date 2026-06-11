@@ -30,3 +30,6 @@ demo-output/
 # Local-only prep docs (hackathon submission, video cut, adversarial review)
 docs/adversarial-*.md
 docs/hackathon-*.md
+
+# Claude Code internal tooling (worktrees, session state)
+.claude/

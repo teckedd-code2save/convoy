@@ -19,6 +19,7 @@ import {
   type RealFlyOpt,
   type RealRehearsalOpt,
   type RealVercelOpt,
+  type RealVpsGhcrOpt,
   type RealVpsOpt,
 } from './core/stages.js';
 import { RunStateStore } from './core/state.js';
@@ -26,6 +27,7 @@ import type { Platform, Run, RunEvent, StageName } from './core/types.js';
 import { probePlatformConnection } from './adapters/connections.js';
 import type { ConnectionCheck, ConnectionStatus } from './adapters/types.js';
 import { buildPlan } from './planner/index.js';
+import { loadByokConfig, resolveAnthropicKey } from './core/key-resolver.js';
 import { scanRepository } from './planner/scanner.js';
 import { resolveTarget } from './planner/target-resolver.js';
 
@@ -539,13 +541,14 @@ async function runShip(
 
     const inferredRepoUrl = resolved.repoUrl ?? undefined;
 
+    const byokKey = await resolveAnthropicKey(loadByokConfig(resolved.localPath));
     const { plan, enrichmentSource } = await buildPlan(resolved.localPath, {
       ...(inferredRepoUrl !== undefined && { repoUrl: inferredRepoUrl }),
       ...(resolved.branch !== undefined && { branch: resolved.branch }),
       ...(resolved.sha !== undefined && { sha: resolved.sha }),
       ...(platformOverride !== undefined && { platformOverride }),
       ...(opts.workspace !== undefined && { workspace: opts.workspace }),
-      ai: opts.noAi ? { disable: true } : {},
+      ai: opts.noAi ? { disable: true } : { ...(byokKey && { apiKey: byokKey }) },
     });
     thinking.stop();
 
@@ -627,13 +630,14 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
 
     const inferredRepoUrl = opts.repoUrl ?? resolved.repoUrl ?? undefined;
 
+    const byokKey = await resolveAnthropicKey(loadByokConfig(resolved.localPath));
     const { plan, enrichmentSource } = await buildPlan(resolved.localPath, {
       ...(inferredRepoUrl !== undefined && { repoUrl: inferredRepoUrl }),
       ...(resolved.branch !== undefined && { branch: resolved.branch }),
       ...(resolved.sha !== undefined && { sha: resolved.sha }),
       ...(platformOverride !== undefined && { platformOverride }),
       ...(opts.workspace !== undefined && { workspace: opts.workspace }),
-      ai: opts.noAi ? { disable: true } : {},
+      ai: opts.noAi ? { disable: true } : { ...(byokKey && { apiKey: byokKey }) },
     });
     thinking?.stop();
 
@@ -725,6 +729,17 @@ interface ApplyOpts {
   vpsPort?: number;
   vpsDeployRoot?: string;
   vpsManageNginx?: boolean;
+  // GHCR-based VPS deploy (build+push locally, compose pull+up on box).
+  realVpsGhcr?: boolean;
+  realVpsGhcrConfig?: string;  // path to JSON config file
+  vpsGhcrImage?: string;
+  vpsGhcrUsername?: string;
+  vpsGhcrToken?: string;
+  vpsManageCaddy?: boolean;
+  vpsDomain?: string;
+  vpsContainerPort?: number;
+  vpsRunMigrations?: boolean;
+  vpsBakeWindow?: number;
   /**
    * When set, runApply tells the orchestrator to continue this run row
    * instead of creating a new one. Set programmatically by `convoy resume`,
@@ -1182,7 +1197,11 @@ async function appendLaneConnectionChecks(
   }
 }
 
-async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<PreflightReport> {
+async function preflightApply(
+  plan: ConvoyPlan,
+  opts: ApplyOpts,
+  resolvedApiKey?: string | null,
+): Promise<PreflightReport> {
   plan = normalizePlan(plan);
   const report: PreflightReport = {
     realAuthor: opts.realAuthor,
@@ -1208,7 +1227,7 @@ async function preflightApply(plan: ConvoyPlan, opts: ApplyOpts): Promise<Prefli
   // degrade gracefully on API errors, but silent degradation during the demo
   // would turn the "Claude agent medic" centerpiece into a deterministic
   // fallback card with no warning.
-  const apiKey = process.env['ANTHROPIC_API_KEY'];
+  const apiKey = resolvedApiKey ?? process.env['ANTHROPIC_API_KEY'];
   if (apiKey) {
     const modelCheck = await preflightAnthropicModel(apiKey, MEDIC_MODEL);
     if (modelCheck.ok) {
@@ -1744,6 +1763,13 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     );
   }
 
+  // Resolve the Anthropic key once — BYOK config in .convoy/byok.json wins
+  // over the server's env var. This lets hosted Convoy inject a team's key
+  // without touching the server process's ANTHROPIC_API_KEY.
+  const resolvedApiKey = await resolveAnthropicKey(
+    loadByokConfig(plan.target.localPath),
+  );
+
   const store = new RunStateStore(STATE_PATH);
   const bus = new ConvoyBus();
   const stages = defaultStages();
@@ -1754,7 +1780,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
 
   // Preflight — confirm each real-* stage can actually run. If a hard
   // prereq is missing and the user didn't opt out, fail with a clear remedy.
-  const preflight = await preflightApply(plan, opts);
+  const preflight = await preflightApply(plan, opts, resolvedApiKey);
   renderPreflight(preflight);
   // Persist blockers regardless of outcome — the viewer reads from this.
   // An empty list is a valid state ("we ran preflight, nothing's blocking").
@@ -1776,12 +1802,15 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     alreadySetKeys: opts.alreadySet ?? [],
     ...(platformOverride !== undefined && { platformOverride }),
     ...(opts.continueRunId !== undefined && { continueRunId: opts.continueRunId }),
+    ...(resolvedApiKey !== null && { apiKey: resolvedApiKey }),
   };
 
-  if (opts.injectFailure === 'rehearse' || opts.injectFailure === 'canary') {
+  const injectStage = opts.injectFailure === 'concurrency' ? 'rehearse' : opts.injectFailure;
+  if (injectStage === 'rehearse' || injectStage === 'canary') {
     orchestratorOpts.injectFailure = {
-      stage: opts.injectFailure,
-      kind: 'error-rate',
+      stage: injectStage,
+      kind: opts.injectFailure === 'concurrency' ? 'latency' : 'error-rate',
+      ...(opts.injectFailure === 'concurrency' && { scenario: 'concurrency' as const }),
       repoPath: plan.target.localPath,
       convoyAuthoredFiles: aggregateAuthoredFiles(plan).map((f) => f.path),
       ...(opts.logs !== undefined && { logsPath: opts.logs }),
@@ -1913,6 +1942,70 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     orchestratorOpts.realVps = realVps;
     process.stdout.write(
       `${pc.dim('Real VPS deploy:')} ${pc.bold(host)} ${pc.dim(`→ ${realVps.deployRoot} (bake: ${realVps.bakeWindowSeconds}s, nginx: ${realVps.manageNginx ? 'managed' : 'operator-owned'})`)}\n`,
+    );
+  }
+
+  if (opts.realVpsGhcr === true) {
+    // Config may come from --real-vps-ghcr-config (written by MCP server) or
+    // from individual --vps-* flags. The JSON file wins; flags are the
+    // fallback for direct CLI users.
+    let ghcrOpts: RealVpsGhcrOpt | null = null;
+
+    if (opts.realVpsGhcrConfig) {
+      try {
+        const { readFileSync } = await import('node:fs');
+        ghcrOpts = JSON.parse(readFileSync(opts.realVpsGhcrConfig, 'utf8')) as RealVpsGhcrOpt;
+      } catch (err) {
+        console.error(pc.red(`--real-vps-ghcr-config: failed to read ${opts.realVpsGhcrConfig}: ${err instanceof Error ? err.message : String(err)}`));
+        process.exit(2);
+      }
+    } else {
+      const host = opts.vpsHost ?? process.env['CONVOY_VPS_HOST'];
+      const imageRef = opts.vpsGhcrImage ?? process.env['CONVOY_GHCR_IMAGE'];
+      const ghcrUsername = opts.vpsGhcrUsername ?? process.env['GHCR_USERNAME'] ?? process.env['GITHUB_ACTOR'];
+      const ghcrToken = opts.vpsGhcrToken ?? process.env['GHCR_TOKEN'] ?? process.env['GH_TOKEN'] ?? process.env['GITHUB_TOKEN'];
+
+      if (!host || !imageRef || !ghcrUsername || !ghcrToken) {
+        const missing = [
+          !host && '--vps-host / CONVOY_VPS_HOST',
+          !imageRef && '--vps-ghcr-image / CONVOY_GHCR_IMAGE',
+          !ghcrUsername && '--vps-ghcr-username / GHCR_USERNAME',
+          !ghcrToken && '--vps-ghcr-token / GHCR_TOKEN or GH_TOKEN',
+        ].filter(Boolean);
+        console.error(pc.red(`--real-vps-ghcr missing required values: ${missing.join(', ')}`));
+        process.exit(2);
+      }
+
+      const cwd = plan.target.workspace
+        ? `${plan.target.localPath}/${plan.target.workspace}`
+        : plan.target.localPath;
+      const appName = autoFlyAppName(plan);
+
+      ghcrOpts = {
+        host,
+        cwd,
+        deployRoot: opts.vpsDeployRoot ?? `/opt/${appName}`,
+        appName,
+        imageRef,
+        ghcrUsername,
+        ghcrToken,
+        ...(opts.vpsPort !== undefined && { sshPort: opts.vpsPort }),
+        ...(opts.vpsKey !== undefined && { identityFile: opts.vpsKey }),
+        ...(opts.vpsManageCaddy !== undefined && { manageCaddy: opts.vpsManageCaddy }),
+        ...(opts.vpsDomain !== undefined && { domain: opts.vpsDomain }),
+        ...(opts.vpsContainerPort !== undefined && { containerPort: opts.vpsContainerPort }),
+        ...(opts.vpsRunMigrations !== undefined && { runMigrations: opts.vpsRunMigrations }),
+        healthPath: primaryLane(plan).rehearsal.healthPath ?? '/',
+        thresholdErrorRatePct: 5.0,
+        thresholdP99Ms: 1500,
+        bakeWindowSeconds: opts.vpsBakeWindow ?? opts.flyBakeWindow ?? 60,
+        convoyAuthoredFiles: aggregateAuthoredFiles(plan).map((f) => f.path),
+      };
+    }
+
+    orchestratorOpts.realVpsGhcr = ghcrOpts;
+    process.stdout.write(
+      `${pc.dim('Real VPS GHCR deploy:')} ${pc.bold(ghcrOpts.host)} ${pc.dim(`→ ${ghcrOpts.imageRef} (bake: ${ghcrOpts.bakeWindowSeconds}s, caddy: ${ghcrOpts.manageCaddy ? ghcrOpts.domain ?? 'managed' : 'operator-owned'})`)}\n`,
     );
   }
 
@@ -2215,96 +2308,81 @@ interface PreflightOpts {
 }
 
 interface VpsBootstrapOpts {
-  withNginx?: boolean;
+  deployRoot?: string;
+  sshPort?: string;
+  identityFile?: string;
+  noDocker?: boolean;
+  noCaddy?: boolean;
   yes?: boolean;
 }
 
-/**
- * Install Docker (and optionally nginx) on a fresh VPS over SSH.
- *
- * The contract:
- *  1. Print the exact commands that will run on the remote host.
- *  2. If --yes is not passed, exit without changes (dry-run by default).
- *  3. Use the official get.docker.com convenience script — it's idempotent
- *     and the canonical Docker install path. Skip if docker is already
- *     present.
- *  4. Never bypass sudo prompts. If the operator's SSH user can't sudo
- *     non-interactively, the script fails with a clear remedy.
- *
- * The commands are visible and auditable. Convoy never silently runs
- * privileged commands on a box.
- */
 async function runVpsBootstrap(host: string, opts: VpsBootstrapOpts): Promise<void> {
-  const { sshAvailable, sshExec, probeRemote } = await import('./adapters/vps/runner.js');
+  const { sshAvailable } = await import('./adapters/vps/runner.js');
+  const { bootstrapVps } = await import('./adapters/vps/bootstrap.js');
 
-  const sshOk = await sshAvailable();
-  if (!sshOk) {
+  if (!(await sshAvailable())) {
     console.error(pc.red('ssh is not installed locally. Install OpenSSH and try again.'));
     process.exit(2);
   }
 
-  const target = { host, deployRoot: '/' };
-  const remote = await probeRemote(target);
-  if (!remote.reachable) {
-    console.error(pc.red(`Cannot reach ${host}: ${remote.rawError ?? 'connection refused'}`));
-    process.exit(2);
-  }
-  process.stdout.write(`${pc.dim('Connected as')} ${pc.bold(remote.user ?? '?')} ${pc.dim(`(docker=${remote.hasDocker ? 'yes' : 'no'}, nginx=${remote.hasNginx ? 'yes' : 'no'})`)}\n`);
+  const deployRoot = opts.deployRoot ?? '/opt/convoy';
+  const target = {
+    host,
+    deployRoot,
+    ...(opts.sshPort !== undefined && { port: parseInt(opts.sshPort, 10) }),
+    ...(opts.identityFile !== undefined && { identityFile: opts.identityFile }),
+  };
 
-  const steps: { label: string; command: string; skip: boolean; reason?: string }[] = [];
-  steps.push({
-    label: 'Install Docker (official get.docker.com script)',
-    command: 'curl -fsSL https://get.docker.com | sudo sh',
-    skip: remote.hasDocker,
-    ...(remote.hasDocker ? { reason: 'docker already installed' } : {}),
-  });
-  steps.push({
-    label: `Add ${remote.user ?? 'your user'} to the docker group (avoid needing sudo for docker run)`,
-    command: `sudo usermod -aG docker ${remote.user ?? '$USER'}`,
-    skip: !remote.hasDocker && !opts.yes ? false : false,
-  });
-  if (opts.withNginx) {
-    steps.push({
-      label: 'Install nginx',
-      command: 'sudo apt-get update && sudo apt-get install -y nginx',
-      skip: remote.hasNginx,
-      ...(remote.hasNginx ? { reason: 'nginx already installed' } : {}),
-    });
-  }
-
-  process.stdout.write(`\n${pc.bold('vps bootstrap plan')} for ${pc.bold(host)}\n\n`);
-  for (let i = 0; i < steps.length; i += 1) {
-    const s = steps[i]!;
-    const prefix = s.skip ? pc.dim('  skip') : pc.cyan(`  ${i + 1}.  `);
-    process.stdout.write(`${prefix} ${s.label}\n`);
-    process.stdout.write(`        ${pc.dim('$')} ${pc.cyan(s.command)}\n`);
-    if (s.skip && s.reason) process.stdout.write(`        ${pc.dim(s.reason)}\n`);
-  }
-  process.stdout.write('\n');
+  process.stdout.write(`${pc.dim('Probing')} ${pc.bold(host)} ${pc.dim('...')}\n`);
 
   if (opts.yes !== true) {
-    process.stdout.write(`${pc.yellow('Dry-run.')} ${pc.dim('Re-run with')} ${pc.bold('--yes')} ${pc.dim('to execute the steps above.')}\n`);
+    // Dry-run: show what would happen without executing
+    process.stdout.write(`\n${pc.bold('vps bootstrap plan')} for ${pc.bold(host)}\n`);
+    process.stdout.write(`${pc.dim('deploy root:')} ${deployRoot}\n\n`);
+
+    if (opts.noDocker !== true) {
+      process.stdout.write(`  ${pc.cyan('1.')} Install Docker (get.docker.com — skip if already present)\n`);
+      process.stdout.write(`     ${pc.dim('$ curl -fsSL https://get.docker.com | sudo sh')}\n`);
+      process.stdout.write(`  ${pc.cyan('2.')} Enable Docker service + add user to docker group\n`);
+    }
+    if (opts.noCaddy !== true) {
+      process.stdout.write(`  ${pc.cyan('3.')} Install Caddy (official repo — skip if already present)\n`);
+      process.stdout.write(`  ${pc.cyan('4.')} Create /etc/caddy/sites/ and patch Caddyfile\n`);
+      process.stdout.write(`  ${pc.cyan('5.')} Enable Caddy service\n`);
+    }
+    process.stdout.write(`  ${pc.cyan('6.')} Create deploy root ${deployRoot}\n`);
+    process.stdout.write(`\n${pc.yellow('Dry-run.')} ${pc.dim('Re-run with')} ${pc.bold('--yes')} ${pc.dim('to execute.')}\n`);
     return;
   }
 
-  for (let i = 0; i < steps.length; i += 1) {
-    const s = steps[i]!;
-    if (s.skip) {
-      process.stdout.write(`${pc.dim('skip:')} ${s.label}\n`);
-      continue;
-    }
-    process.stdout.write(`${pc.cyan('▶')} ${s.label}\n`);
-    const result = await sshExec(target, s.command, {
-      timeoutMs: 5 * 60 * 1000,
-      onLog: (line) => process.stdout.write(`  ${pc.dim(line)}\n`),
-    });
-    if (!result.ok) {
-      process.stdout.write(`${pc.red('✗')} step failed: ${result.stderr.trim().slice(0, 240)}\n`);
-      process.exit(2);
-    }
-    process.stdout.write(`${pc.green('✓')} ${s.label}\n`);
+  const report = await bootstrapVps(target, {
+    installDocker: opts.noDocker !== true,
+    installCaddy: opts.noCaddy !== true,
+    onStep: (label, status, detail) => {
+      if (status === 'running') {
+        process.stdout.write(`${pc.cyan('▶')} ${label} ...\n`);
+      } else if (status === 'done') {
+        process.stdout.write(`${pc.green('✓')} ${label}\n`);
+      } else if (status === 'skipped') {
+        process.stdout.write(`${pc.dim('–')} ${label} ${pc.dim(`(${detail ?? 'skipped'})`)}\n`);
+      } else {
+        process.stdout.write(`${pc.red('✗')} ${label}${detail ? `: ${detail}` : ''}\n`);
+      }
+    },
+  });
+
+  if (!report.ok) {
+    const failed = report.steps.filter((s) => s.status === 'failed');
+    process.stdout.write(`\n${pc.red('Bootstrap failed.')} ${failed.map((s) => s.label).join(', ')}\n`);
+    process.exit(2);
   }
-  process.stdout.write(`\n${pc.green('Bootstrap complete.')} ${pc.dim('You may need to log out + back in for docker group membership to take effect.')}\n`);
+
+  process.stdout.write(
+    `\n${pc.green('Bootstrap complete.')} ` +
+    `${pc.dim('OS:')} ${report.osFamily} · ` +
+    `${pc.dim('user:')} ${report.user ?? '?'}\n` +
+    `${pc.dim('You may need to log out and back in for docker group membership to take effect.')}\n`,
+  );
 }
 
 async function runStageSecrets(planId: string): Promise<void> {
@@ -3760,7 +3838,7 @@ program
   .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate (default: canary)')
   .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set` (default: <target>/.env.convoy-secrets)')
   .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds (default: 60)', (v) => Number(v))
-  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary (triggers medic with fixture logs)')
+  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary|concurrency (triggers medic with fixture logs; concurrency = serialised-renderer p99 breach)')
   .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
   .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
   .option(
@@ -3782,6 +3860,16 @@ program
   .option('--vps-port <port>', 'SSH port (default 22)', (v) => Number(v))
   .option('--vps-deploy-root <path>', 'deploy root on the box (default: /srv/<app>)')
   .option('--vps-manage-nginx', 'let Convoy author and reload nginx upstream config (default: leave nginx alone)')
+  .option('--real-vps-ghcr', 'build image locally, push to GHCR, deploy via docker compose on VPS (requires --real-vps-ghcr-config or individual --vps-* flags)')
+  .option('--real-vps-ghcr-config <path>', 'JSON file containing RealVpsGhcrOpt (written by `convoy apply` from MCP; see docs/mcp.md)')
+  .option('--vps-ghcr-image <ref>', 'GHCR image ref without tag, e.g. ghcr.io/myorg/my-app')
+  .option('--vps-ghcr-username <user>', 'GitHub username for docker login (or set GHCR_USERNAME)')
+  .option('--vps-ghcr-token <token>', 'GitHub token with packages:write (or set GHCR_TOKEN / GH_TOKEN)')
+  .option('--vps-manage-caddy', 'write /etc/caddy/sites/<app>.caddy and reload Caddy on the box')
+  .option('--vps-domain <domain>', 'domain for Caddy site file (required with --vps-manage-caddy)')
+  .option('--vps-container-port <port>', 'port the container listens on for Caddy reverse proxy (default 3000)', (v) => Number(v))
+  .option('--vps-run-migrations', 'run Prisma migrate deploy in a one-shot container before rolling the service')
+  .option('--vps-bake-window <seconds>', 'observe-stage bake window in seconds (default 60)', (v) => Number(v))
   .action(async (planId: string, options: ApplyOpts) => {
     await runApply(planId, options);
   });
@@ -3812,7 +3900,7 @@ program
   .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate (default: canary)')
   .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set` (default: <target>/.env.convoy-secrets)')
   .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds (default: 60)', (v) => Number(v))
-  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary (triggers medic with fixture logs)')
+  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary|concurrency (triggers medic with fixture logs; concurrency = serialised-renderer p99 breach)')
   .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
   .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
   .option(
@@ -3881,10 +3969,14 @@ program
 
 program
   .command('vps')
-  .description('VPS-related subcommands. Use `convoy vps bootstrap <host>` to install Docker on a fresh box.')
+  .description('VPS-related subcommands. Use `convoy vps bootstrap <host>` to install Docker + Caddy on a fresh box.')
   .argument('[subcommand]', 'subcommand: bootstrap')
   .argument('[host]', 'SSH destination: user@host')
-  .option('--with-nginx', 'also install nginx (skip if you already manage your own)')
+  .option('--deploy-root <path>', 'base deploy directory on the box (default: /opt/convoy)')
+  .option('--ssh-port <n>', 'SSH port (default: 22)')
+  .option('--identity-file <path>', 'path to SSH private key')
+  .option('--no-docker', 'skip Docker install')
+  .option('--no-caddy', 'skip Caddy install')
   .option('-y, --yes', 'actually run the install commands (otherwise prints what it would do and exits)')
   .action(async (subcommand: string | undefined, host: string | undefined, options: VpsBootstrapOpts) => {
     if (subcommand !== 'bootstrap') {

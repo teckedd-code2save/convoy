@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stable wrapper so Claude Code's plugin system can spawn the Convoy MCP
+# stdio server from plugin/.mcp.json without needing CONVOY_HOME set in the
+# environment. Resolves the repo root from this script's own location and
+# forwards ANTHROPIC_API_KEY + any .env file automatically.
+set -euo pipefail
+CONVOY_HOME="$(cd "$(dirname "$0")/.." && pwd)"
+exec npm --prefix "$CONVOY_HOME" run mcp

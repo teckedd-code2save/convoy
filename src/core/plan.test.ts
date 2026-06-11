@@ -39,7 +39,7 @@ test('normalizePlan migrates legacy single-lane plans into v2', () => {
       chosen: 'fly',
       reason: 'existing config',
       source: 'existing-config',
-      candidates: [{ platform: 'fly', score: 9, reason: 'config present' }],
+      candidates: [{ platform: 'fly', score: 9, reason: 'config present', adjustments: [] }],
     },
     author: {
       convoyAuthoredFiles: [{ path: 'fly.toml', lines: 10, summary: 'fly', contentPreview: 'app = "demo"' }],

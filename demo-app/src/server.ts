@@ -5,6 +5,7 @@ import { metrics } from './lib/metrics.js';
 import healthRouter from './routes/health.js';
 import metricsRouter from './routes/metrics.js';
 import ordersRouter from './routes/orders.js';
+import renderRouter from './routes/render.js';
 
 const PORT = Number(process.env['PORT'] ?? 8080);
 const DEMO_MODE = process.env['DEMO_MODE'] ?? 'stable';
@@ -25,6 +26,7 @@ app.use((req, res, next) => {
 app.use(healthRouter);
 app.use(metricsRouter);
 app.use(ordersRouter);
+app.use(renderRouter);
 
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   log({ level: 'error', message: 'unhandled_error', error: err.message, stack: err.stack });

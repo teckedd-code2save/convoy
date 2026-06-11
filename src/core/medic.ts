@@ -150,8 +150,14 @@ export async function diagnose(
       const response = await client.messages.create({
         model: opts.model ?? MODEL,
         max_tokens: MAX_TOKENS,
-        system: SYSTEM_PROMPT,
-        tools,
+        system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+        tools: [
+          ...tools.slice(0, -1),
+          // cache_control on the last tool marks all preceding tools as cached.
+          // Cast needed because the spread makes input_schema optional in TS.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          { ...tools[tools.length - 1], cache_control: { type: 'ephemeral' } } as any,
+        ],
         messages,
       });
 
