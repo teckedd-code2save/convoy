@@ -61,15 +61,17 @@ touch "$PROFILE"
 HELPERS_START="# >>> Convoy helpers >>>"
 HELPERS_END="# <<< Convoy helpers <<<"
 
-if grep -qE '^\s*(export|set\s+-x)\s+CONVOY_HOME(=|\s)' "$PROFILE"; then
+if grep -qE '^[[:space:]]*(export|set[[:space:]]+-x)[[:space:]]+CONVOY_HOME(=|[[:space:]])' "$PROFILE"; then
   # Update an existing line in place only if the current value is different.
-  current=$(grep -E '^\s*(export|set\s+-x)\s+CONVOY_HOME(=|\s)' "$PROFILE" | tail -1)
+  current=$(grep -E '^[[:space:]]*(export|set[[:space:]]+-x)[[:space:]]+CONVOY_HOME(=|[[:space:]])' "$PROFILE" | tail -1)
   if echo "$current" | grep -qF "$CONVOY_HOME"; then
     echo "  ✓ CONVOY_HOME already points at $CONVOY_HOME in $PROFILE"
   else
-    # Back up, rewrite the line.
+    # Back up, rewrite the line. Use '!' as the sed delimiter because the
+    # regex contains '|' and macOS sed would otherwise parse '|' as the
+    # delimiter instead of the alternation operator.
     cp "$PROFILE" "$PROFILE.convoy-bak.$(date +%s)"
-    sed -i.tmp -E "s|^\s*(export|set\s+-x)\s+CONVOY_HOME(=|\s).*|$EXPORT_LINE|" "$PROFILE"
+    sed -i.tmp -E "s!^[[:space:]]*(export|set[[:space:]]+-x)[[:space:]]+CONVOY_HOME(=|[[:space:]]).*!$EXPORT_LINE!" "$PROFILE"
     rm -f "$PROFILE.tmp"
     echo "  ✓ Updated CONVOY_HOME in $PROFILE (backup: $PROFILE.convoy-bak.*)"
   fi
