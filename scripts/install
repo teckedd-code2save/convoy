@@ -59,18 +59,27 @@ fi
 ENV_FILE="$CONVOY_HOME/.env"
 ENV_EXAMPLE="$CONVOY_HOME/.env.example"
 
-if [ ! -f "$ENV_FILE" ] && [ -f "$ENV_EXAMPLE" ]; then
-  cp "$ENV_EXAMPLE" "$ENV_FILE"
-  echo "  ✓ Created .env from .env.example"
+if [ ! -f "$ENV_FILE" ]; then
+  if [ -f "$ENV_EXAMPLE" ]; then
+    cp "$ENV_EXAMPLE" "$ENV_FILE"
+    echo "  ✓ Created .env from .env.example"
+  else
+    # No example shipped — create a minimal .env so the key prompt below
+    # still fires instead of telling the user to assemble it by hand.
+    printf 'ANTHROPIC_API_KEY=\n' > "$ENV_FILE"
+    echo "  ✓ Created .env"
+  fi
 fi
 
 # Prompt for ANTHROPIC_API_KEY if the file exists but the key is still a placeholder.
+# Read from /dev/tty, not stdin — under `curl | bash` stdin is the script
+# itself, so a plain `read` would either eat script text or hit EOF.
 if [ -f "$ENV_FILE" ] && grep -qE '^ANTHROPIC_API_KEY=(your[_-]|sk-placeholder|$)' "$ENV_FILE"; then
-  if [ -t 0 ]; then
+  if [ -e /dev/tty ] && (exec < /dev/tty) 2>/dev/null; then
     echo
     echo "Convoy uses Claude for enrichment and diagnosis."
-    printf "  Enter your Anthropic API key (sk-ant-...): "
-    read -r API_KEY
+    printf "  Enter your Anthropic API key (sk-ant-..., or press Enter to skip): "
+    read -r API_KEY < /dev/tty
     if [ -n "$API_KEY" ]; then
       sed -i.bak "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=$API_KEY|" "$ENV_FILE"
       rm -f "$ENV_FILE.bak"

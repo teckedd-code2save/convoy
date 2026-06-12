@@ -578,6 +578,65 @@ export function registerConvoyTools(server: McpServer): void {
         withStore((store) => ok(store.listRecentRuns(limit ?? 10).map(runSummary))),
       ),
   );
+
+  server.registerTool(
+    'convoy_orient',
+    {
+      description: 'Discover what platforms, CI/CD, secrets, and observability a repo already uses. Run this before convoy_plan on an unfamiliar repo.',
+      inputSchema: {
+        path: z.string().describe('Absolute path to the repo root'),
+        live: z.boolean().optional().describe('Probe live platform APIs (requires auth)'),
+      },
+    },
+    async ({ path: localPath }) =>
+      guarded(async () => {
+        const { orientRepo } = await import('../orient/index.js');
+        try {
+          const result = await orientRepo(localPath);
+          return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return { content: [{ type: 'text' as const, text: `orient failed: ${msg}` }], isError: true };
+        }
+      }),
+  );
+
+  server.registerTool(
+    'convoy_onboard',
+    {
+      description: 'Capture team deployment preferences for a repo. Call before convoy_plan on a new project. Results persist to .convoy/preferences.json.',
+      inputSchema: {
+        path: z.string().describe('Absolute path to the repo root'),
+        answers: z.object({
+          mode: z.enum(['first', 'update']).optional(),
+          approvers: z.array(z.string()).optional(),
+          canaryStrategy: z.enum(['skip', 'canary', 'bluegreen']).optional(),
+          bakeWindowSeconds: z.number().optional(),
+          autoRollback: z.boolean().optional(),
+          platformMandate: z.string().nullable().optional(),
+          budgetTier: z.enum(['hobby', 'startup', 'growth', 'unconstrained']).optional(),
+          releaseCadence: z.enum(['many-per-day', 'daily', 'weekly', 'infrequent']).optional(),
+          releaseGate: z.enum(['pr-merged', 'pr-staging', 'pr-staging-approver', 'change-ticket']).optional(),
+          secretsManager: z.string().optional(),
+          compliance: z.array(z.enum(['soc2', 'hipaa', 'pci', 'gdpr'])).optional(),
+          dataResidency: z.string().optional(),
+          errorTracking: z.string().nullable().optional(),
+          prComments: z.boolean().optional(),
+        }).optional().describe('Pre-filled answers (from conversational collection). Omit fields to use defaults.'),
+      },
+    },
+    async ({ path: localPath, answers }) =>
+      guarded(async () => {
+        const { runOnboard } = await import('../onboard/index.js');
+        try {
+          const prefs = await runOnboard(localPath, answers ?? {});
+          return { content: [{ type: 'text' as const, text: JSON.stringify(prefs, null, 2) }] };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return { content: [{ type: 'text' as const, text: `onboard failed: ${msg}` }], isError: true };
+        }
+      }),
+  );
 }
 
 export function createConvoyServer(): McpServer {
