@@ -443,11 +443,13 @@ function attachRenderer(bus: ConvoyBus, startedAt: Date, openInUI = false): () =
   return bus.subscribe((e: ConvoyBusEvent) => {
     switch (e.type) {
       case 'run.created': {
+        // URL first (issue #30): the very first line a run prints is where
+        // to watch it — before the banner, before any stage output.
         const url = webUrl(`/runs/${e.run.id}`);
+        process.stdout.write(`\n${pc.bold(`Run ${e.run.id.slice(0, 8)}`)} ${pc.dim('—')} watch live: ${pc.cyan(url)}\n`);
         const title = `${pc.bold(pc.cyan('▲ CONVOY'))}  ${pc.dim('·')}  run ${pc.bold(e.run.id.slice(0, 8))}`;
         const subtitle = `${pc.dim('target:')} ${e.run.repoUrl}`;
-        process.stdout.write(`\n${convoyBanner(title, subtitle)}\n`);
-        process.stdout.write(`${CONVOY_RULE}${pc.cyan('▶')} ${pc.dim('Watch live:')} ${pc.cyan(url)}\n`);
+        process.stdout.write(`${convoyBanner(title, subtitle)}\n`);
         if (openInUI) void openInBrowser(url);
         return;
       }
@@ -487,7 +489,7 @@ function attachRenderer(bus: ConvoyBus, startedAt: Date, openInUI = false): () =
         return;
       case 'approval.requested':
         process.stdout.write(
-          `${CONVOY_RULE}${pc.yellow(SYMBOL.pause)} ${pc.yellow(`awaiting ${e.approval.kind} approval`)}\n`,
+          `${CONVOY_RULE}${pc.yellow(SYMBOL.pause)} ${pc.yellow(`awaiting ${e.approval.kind}`)} ${pc.dim('—')} approve at ${pc.cyan(webUrl(`/runs/${e.approval.runId}`))}\n`,
         );
         return;
       case 'approval.decided': {
@@ -787,6 +789,11 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
     if (opts.json) {
       process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
     } else {
+      // URL first (issue #30): the moment the plan exists, say where to
+      // follow it — before the long render scrolls the terminal.
+      process.stdout.write(
+        `${pc.bold(`Plan ${plan.id.slice(0, 8)}`)} ${pc.dim('—')} follow along: ${pc.cyan(webUrl(`/plans/${plan.id}`))}\n\n`,
+      );
       process.stdout.write(`${renderPlan(plan)}\n`);
       process.stdout.write(`\n${pc.dim(`Narrative source: ${enrichmentSource}`)}\n`);
     }
