@@ -48,6 +48,27 @@ export default async function PlanPage({ params }: { params: Promise<{ id: strin
         {plan.target.readmeTitle ? (
           <p className="text-muted italic">&quot;{plan.target.readmeTitle}&quot;</p>
         ) : null}
+        {plan.supersededBy ? (
+          <div className="flex items-center gap-2 text-sm text-warning bg-warning/10 border border-warning/30 rounded-lg px-4 py-2">
+            <span>⚠</span>
+            <span>
+              This plan was superseded by{' '}
+              <a href={`/plans/${plan.supersededBy}`} className="font-mono underline">
+                {plan.supersededBy.slice(0, 8)}
+              </a>
+              {plan.supersedes ? (
+                <> (replaced <a href={`/plans/${plan.supersedes}`} className="font-mono underline">{plan.supersedes.slice(0, 8)}</a>)</>
+              ) : null}
+            </span>
+          </div>
+        ) : plan.supersedes ? (
+          <p className="text-xs text-muted">
+            Superseded{' '}
+            <a href={`/plans/${plan.supersedes}`} className="font-mono underline">
+              {plan.supersedes.slice(0, 8)}
+            </a>
+          </p>
+        ) : null}
       </header>
 
       {blockers.length > 0 ? (

@@ -31,7 +31,7 @@ export default function PlansPage() {
       ) : (
         <ul className="divide-y divide-rule border border-rule rounded-lg overflow-hidden bg-card">
           {plans.map((plan) => (
-            <li key={plan.id}>
+            <li key={plan.id} className={plan.supersededBy ? 'opacity-50' : ''}>
               <a
                 href={`/plans/${plan.id}`}
                 className="flex items-center gap-6 px-5 py-4 hover:bg-rule/40 transition-colors"
@@ -44,6 +44,11 @@ export default function PlansPage() {
                     <span className="font-medium truncate">{plan.target.name}</span>
                     <Tag>{plan.target.ecosystem}</Tag>
                     {plan.target.framework ? <Tag>{plan.target.framework}</Tag> : null}
+                    {plan.supersededBy ? (
+                      <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-rule text-muted font-medium">
+                        superseded → {plan.supersededBy.slice(0, 8)}
+                      </span>
+                    ) : null}
                   </div>
                   {plan.target.readmeTitle ? (
                     <p className="text-sm text-muted truncate mt-0.5">

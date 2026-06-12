@@ -14,6 +14,10 @@ export interface ConvoyPlan {
   version: 2;
   id: string;
   createdAt: string;
+  /** Id of an older plan for the same target that this plan replaces. */
+  supersedes?: string;
+  /** Id of the newer plan that superseded this one (set when superseded). */
+  supersededBy?: string;
   repo: PlanRepo;
   lanes: DeploymentLane[];
   dependencies: PlanLaneDependency[];
@@ -330,6 +334,51 @@ export class PlanStore {
     if (matches.length === 0) return { kind: 'none' };
     if (matches.length === 1 && matches[0]) return { kind: 'prefix', id: matches[0] };
     return { kind: 'ambiguous', ids: matches.slice(0, limit) };
+  }
+
+  /**
+   * Mark `oldId` as superseded by `newId`. Rewrites the old plan's envelope
+   * in-place to set `supersededBy`; rewrites the new plan's envelope to set
+   * `supersedes`. Safe to call multiple times (idempotent on the same pair).
+   */
+  markSuperseded(oldId: string, newId: string): void {
+    const oldRecord = this.inspect(oldId);
+    const newRecord = this.inspect(newId);
+    if (!oldRecord || !newRecord) return;
+
+    const oldPlan = { ...oldRecord.plan, supersededBy: newId };
+    const newPlan = { ...newRecord.plan, supersedes: oldId };
+    this.#rewrite(oldId, oldPlan);
+    this.#rewrite(newId, newPlan);
+  }
+
+  /**
+   * Return ALL active (not-yet-superseded) plans for a given local target
+   * path, most-recently-created first. Returns [] when none exist.
+   */
+  findAllActiveForTarget(localPath: string): ConvoyPlan[] {
+    const results: ConvoyPlan[] = [];
+    for (const id of this.listAll()) {
+      const record = this.inspect(id);
+      if (!record) continue;
+      const plan = record.plan;
+      if (plan.target.localPath === localPath && !plan.supersededBy) {
+        results.push(plan);
+      }
+    }
+    return results;
+  }
+
+  #rewrite(id: string, plan: ConvoyPlan): void {
+    const path = join(this.#dir, `${id}.json`);
+    const normalized = normalizePlan(plan);
+    const envelope: StoredPlanEnvelope = {
+      format: 'convoy-plan-v1',
+      savedAt: new Date().toISOString(),
+      sha256: digestPlan(normalized),
+      plan: normalized,
+    };
+    writeFileSync(path, `${JSON.stringify(envelope, null, 2)}\n`, 'utf8');
   }
 }
 

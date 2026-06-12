@@ -26,6 +26,8 @@ export interface PlanSummary {
   version?: number;
   id: string;
   createdAt: string;
+  supersedes?: string;
+  supersededBy?: string;
   repo?: {
     name: string;
     repoUrl: string | null;

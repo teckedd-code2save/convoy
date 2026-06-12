@@ -679,7 +679,11 @@ async function runShip(
     thinking.stop();
 
     const planStore = new PlanStore(PLANS_DIR);
+    const priorShipPlans = planStore.findAllActiveForTarget(plan.target.localPath);
     planStore.save(plan);
+    for (const prior of priorShipPlans) {
+      if (prior.id !== plan.id) planStore.markSuperseded(prior.id, plan.id);
+    }
 
     const planUrl = webUrl(`/plans/${plan.id}`);
     process.stdout.write(
@@ -815,7 +819,21 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
 
     if (opts.save) {
       const store = new PlanStore(PLANS_DIR);
+      // Supersede all prior active plans for the same target so the project
+      // page doesn't accumulate unexplained peer plans (#31).
+      const priorPlans = store.findAllActiveForTarget(plan.target.localPath);
       const saved = store.save(plan);
+      const mostRecent = priorPlans[0];
+      for (const prior of priorPlans) {
+        if (prior.id !== plan.id) {
+          store.markSuperseded(prior.id, plan.id);
+        }
+      }
+      if (mostRecent && mostRecent.id !== plan.id) {
+        process.stdout.write(
+          `${pc.dim('Superseded plan')} ${pc.bold(mostRecent.id.slice(0, 8))}${priorPlans.length > 1 ? pc.dim(` + ${priorPlans.length - 1} more`) : ''} ${pc.dim('— prior plans are now history.')}\n`,
+        );
+      }
       const url = webUrl(`/plans/${plan.id}`);
       process.stdout.write(`\n${pc.dim('Saved plan to')} ${saved}\n`);
       process.stdout.write(
@@ -2888,7 +2906,10 @@ function runListPlans(): void {
     const name = plan.target.name;
     const platform = plan.platform.chosen;
     const verdict = plan.deployability.verdict === 'not-cloud-deployable' ? pc.red('refused') : pc.green(platform);
-    process.stdout.write(`  ${pc.bold(short)}  ${name.padEnd(22)}  ${verdict}  ${pc.dim(plan.createdAt)}\n`);
+    const status = plan.supersededBy
+      ? pc.dim(`superseded → ${plan.supersededBy.slice(0, 8)}`)
+      : pc.bold('active');
+    process.stdout.write(`  ${pc.bold(short)}  ${name.padEnd(22)}  ${verdict}  ${status}  ${pc.dim(plan.createdAt)}\n`);
   }
 }
 
