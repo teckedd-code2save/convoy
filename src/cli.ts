@@ -648,6 +648,20 @@ async function runShip(
       ...(opts.strictDrift !== undefined && { strictDrift: opts.strictDrift }),
       interactive: true,
     });
+
+    // `ship --platform=vps` without --vps-host: default the host from team
+    // preferences captured at onboard, so the operator's onboarding answer
+    // is honored instead of failing preflight on a host they already told us.
+    if (platformOverride === 'vps' && !opts.vpsHost) {
+      const { loadPreferences } = await import('./onboard/preferences.js');
+      const prefHost = loadPreferences(resolved.localPath)?.deployment.vpsHost;
+      if (prefHost) {
+        opts.vpsHost = prefHost;
+        process.stdout.write(
+          `${pc.dim('Using VPS host from team preferences:')} ${pc.bold(prefHost)}\n`,
+        );
+      }
+    }
     thinking = startThinking();
 
     const byokKey = await resolveAnthropicKey(loadByokConfig(resolved.localPath));
@@ -4008,53 +4022,90 @@ const program = new Command()
   .description('Deployment agent that rehearses, ships, and observes — without touching your code.')
   .version('0.0.1');
 
-program
-  .command('ship <target>')
-  .description('Plan + apply end-to-end. Real by default. Accepts a local path or a GitHub URL / owner/repo.')
-  .option('--platform <platform>', 'explicit platform choice: fly | railway | vercel | cloudrun | vps')
-  .option('--workspace <subdir>', 'target a specific subdirectory (e.g. backend, apps/web)')
-  .option('--skip-onboard', 'skip the first-contact onboarding gate (CI: proceeds with defaults)')
-  .option('--skip-orient', 'skip per-run drift detection between preferences and repo artifacts')
-  .option('--strict-drift', 'turn drift warnings into a hard pause (exit 2 with a blocker message)')
-  .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
-  .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
-  .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
-  .option(
-    '--already-set <keys>',
-    'comma-separated env var names the operator declares are already set on the deploy target (no platform queries). Example: --already-set=DATABASE_URL,CLERK_SECRET_KEY',
-    (value: string) => value.split(',').map((k) => k.trim()).filter((k) => k.length > 0),
-  )
-  .option('--recurring', 'declare this as an update to an already-live service (adjusts preflight tone; no platform probing)')
-  .option('--no-ai', 'skip the Opus narrative pass')
-  .option('--demo', 'scripted pipeline — no PR, no subprocess, no Fly deploy')
-  .option('--no-real-author', 'stub the author stage instead of opening a real PR')
-  .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
-  .option('--no-real-fly', 'stub the deploy stages instead of deploying to Fly')
-  .option('--no-auto-merge', 'on approval, wait for you to merge the PR on GitHub instead of merging automatically')
-  .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
-  .option('--fly-app <name>', 'Fly.io app name (auto-generated from target if omitted)')
-  .option('--fly-org <org>', 'Fly.io organization (default: personal)')
-  .option('--no-fly-create-app', 'do NOT create the Fly app if it does not exist')
-  .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate')
-  .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set`')
-  .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds', (v) => Number(v))
-  .option('--env-file <path>', 'env file for --real-rehearsal subprocess')
-  .option(
-    '--probe-path <path>',
-    'probe path for real rehearsal load (repeatable)',
-    (value: string, acc: string[]) => [...acc, value],
-    [] as string[],
-  )
-  .option('--probe-requests <n>', 'number of requests in the real rehearsal probe', (v) => Number(v))
-  .option('--probe-concurrency <n>', 'concurrency', (v) => Number(v))
-  .option('--env <kv>', 'env var to pass to the subprocess, KEY=VALUE (repeatable)', (value: string, acc: Record<string, string>) => {
-    const idx = value.indexOf('=');
-    if (idx > 0) acc[value.slice(0, idx)] = value.slice(idx + 1);
-    return acc;
-  }, {} as Record<string, string>)
-  .action(async (target: string, options: ShipOpts) => {
-    await runShip(target, options);
-  });
+/**
+ * Shared deploy option set, registered identically on `ship`, `apply`, and
+ * `resume` (issue #32). Single definition — the --real-vps*, --real-railway,
+ * and --real-cloudrun* families used to exist on `apply` only, so `ship`
+ * rejected the very flags its own apply phase understood. Any new deploy
+ * flag belongs here, not on an individual command.
+ */
+function registerDeployFlags(cmd: Command): Command {
+  return cmd
+    .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
+    .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
+    .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
+    .option(
+      '--already-set <keys>',
+      'comma-separated env var names the operator declares are already set on the deploy target (no platform queries). Example: --already-set=DATABASE_URL,CLERK_SECRET_KEY',
+      (value: string) => value.split(',').map((k) => k.trim()).filter((k) => k.length > 0),
+    )
+    .option('--recurring', 'declare this as an update to an already-live service (adjusts preflight tone; no platform probing)')
+    .option('--demo', 'scripted pipeline (no PR, no subprocess, no real deploy)')
+    .option('--no-real-author', 'stub the author stage instead of opening a real PR')
+    .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
+    .option('--no-real-fly', 'stub the deploy stages instead of deploying to Fly')
+    .option('--no-auto-merge', 'on approval, wait for you to merge the PR on GitHub instead of merging automatically')
+    .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
+    .option('--fly-app <name>', 'Fly.io app name (auto-generated from target if omitted)')
+    .option('--fly-org <org>', 'Fly.io organization (default: personal)')
+    .option('--no-fly-create-app', 'do NOT create the Fly app if it does not exist (default: create)')
+    .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate (default: canary)')
+    .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set` (default: <target>/.env.convoy-secrets)')
+    .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds (default: 60)', (v) => Number(v))
+    .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary|concurrency (triggers medic with fixture logs; concurrency = serialised-renderer p99 breach)')
+    .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
+    .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
+    .option(
+      '--probe-path <path>',
+      'probe path for real rehearsal load (repeatable; default: the detected health path)',
+      (value: string, acc: string[]) => [...acc, value],
+      [] as string[],
+    )
+    .option('--probe-requests <n>', 'number of requests in the real rehearsal probe', (v) => Number(v))
+    .option('--probe-concurrency <n>', 'concurrency in the real rehearsal probe', (v) => Number(v))
+    .option('--env <kv>', 'env var to pass to the subprocess, KEY=VALUE (repeatable)', (value: string, acc: Record<string, string>) => {
+      const idx = value.indexOf('=');
+      if (idx > 0) acc[value.slice(0, idx)] = value.slice(idx + 1);
+      return acc;
+    }, {} as Record<string, string>)
+    .option('--real-vps', 'deploy to a VPS over SSH (rsync source, build on the box, blue/green slots)')
+    .option('--vps-host <host>', 'SSH destination: user@host (or set CONVOY_VPS_HOST)')
+    .option('--vps-key <path>', 'SSH private key path (default: ~/.ssh/config / agent)')
+    .option('--vps-port <port>', 'SSH port (default 22)', (v) => Number(v))
+    .option('--vps-deploy-root <path>', 'deploy root on the box (default: /srv/<app>)')
+    .option('--vps-manage-nginx', 'let Convoy author and reload nginx upstream config (default: leave nginx alone)')
+    .option('--real-vps-ghcr', 'build image locally, push to GHCR, deploy via docker compose on VPS (requires --real-vps-ghcr-config or individual --vps-* flags)')
+    .option('--real-vps-ghcr-config <path>', 'JSON file containing RealVpsGhcrOpt (written by `convoy apply` from MCP; see docs/mcp.md)')
+    .option('--vps-ghcr-image <ref>', 'GHCR image ref without tag, e.g. ghcr.io/myorg/my-app')
+    .option('--vps-ghcr-username <user>', 'GitHub username for docker login (or set GHCR_USERNAME)')
+    .option('--vps-ghcr-token <token>', 'GitHub token with packages:write (or set GHCR_TOKEN / GH_TOKEN)')
+    .option('--vps-manage-caddy', 'write /etc/caddy/sites/<app>.caddy and reload Caddy on the box')
+    .option('--vps-domain <domain>', 'domain for Caddy site file (required with --vps-manage-caddy)')
+    .option('--vps-container-port <port>', 'port the container listens on for Caddy reverse proxy (default 3000)', (v) => Number(v))
+    .option('--vps-run-migrations', 'run Prisma migrate deploy in a one-shot container before rolling the service')
+    .option('--vps-bake-window <seconds>', 'observe-stage bake window in seconds (default 60)', (v) => Number(v))
+    .option('--real-railway', 'deploy via Railway CLI')
+    .option('--railway-project <id>', 'Railway project ID')
+    .option('--real-cloudrun', 'deploy via gcloud run deploy')
+    .option('--cloudrun-service <name>', 'Cloud Run service name')
+    .option('--cloudrun-image <ref>', 'Container image ref (e.g. gcr.io/proj/app:latest)')
+    .option('--cloudrun-region <region>', 'GCP region (default: us-central1)')
+    .option('--cloudrun-project <id>', 'GCP project ID (reads gcloud config if omitted)');
+}
+
+registerDeployFlags(
+  program
+    .command('ship <target>')
+    .description('Plan + apply end-to-end. Real by default. Accepts a local path or a GitHub URL / owner/repo.')
+    .option('--platform <platform>', 'explicit platform choice: fly | railway | vercel | cloudrun | vps')
+    .option('--workspace <subdir>', 'target a specific subdirectory (e.g. backend, apps/web)')
+    .option('--skip-onboard', 'skip the first-contact onboarding gate (CI: proceeds with defaults)')
+    .option('--skip-orient', 'skip per-run drift detection between preferences and repo artifacts')
+    .option('--strict-drift', 'turn drift warnings into a hard pause (exit 2 with a blocker message)')
+    .option('--no-ai', 'skip the Opus narrative pass'),
+).action(async (target: string, options: ShipOpts) => {
+  await runShip(target, options);
+});
 
 program
   .command('plan <path>')
@@ -4081,119 +4132,24 @@ program
     await runStatus(runId);
   });
 
-program
-  .command('apply <planId>')
-  .description('Execute a saved plan. Real by default — opens a real PR, rehearses locally, deploys to Fly. Use --demo for a scripted pipeline.')
-  .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
-  .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
-  .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
-  .option(
-    '--already-set <keys>',
-    'comma-separated env var names the operator declares are already set on the deploy target (no platform queries). Example: --already-set=DATABASE_URL,CLERK_SECRET_KEY',
-    (value: string) => value.split(',').map((k) => k.trim()).filter((k) => k.length > 0),
-  )
-  .option('--recurring', 'declare this as an update to an already-live service (adjusts preflight tone; no platform probing)')
-  .option('--platform <platform>', 'override the plan\'s chosen platform: fly | railway | vercel | cloudrun — re-scored at apply time')
-  .option('--demo', 'scripted pipeline (no PR, no subprocess, no Fly deploy)')
-  .option('--no-real-author', 'stub the author stage instead of opening a real PR')
-  .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
-  .option('--no-real-fly', 'stub the deploy stages instead of deploying to Fly')
-  .option('--no-auto-merge', 'on approval, wait for you to merge the PR on GitHub instead of merging automatically')
-  .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
-  .option('--fly-app <name>', 'Fly.io app name (auto-generated from target if omitted)')
-  .option('--fly-org <org>', 'Fly.io organization (default: personal)')
-  .option('--no-fly-create-app', 'do NOT create the Fly app if it does not exist (default: create)')
-  .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate (default: canary)')
-  .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set` (default: <target>/.env.convoy-secrets)')
-  .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds (default: 60)', (v) => Number(v))
-  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary|concurrency (triggers medic with fixture logs; concurrency = serialised-renderer p99 breach)')
-  .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
-  .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
-  .option(
-    '--probe-path <path>',
-    'probe path for real rehearsal load (repeatable; default: the detected health path)',
-    (value: string, acc: string[]) => [...acc, value],
-    [] as string[],
-  )
-  .option('--probe-requests <n>', 'number of requests in the real rehearsal probe', (v) => Number(v))
-  .option('--probe-concurrency <n>', 'concurrency in the real rehearsal probe', (v) => Number(v))
-  .option('--env <kv>', 'env var to pass to the subprocess, KEY=VALUE (repeatable)', (value: string, acc: Record<string, string>) => {
-    const idx = value.indexOf('=');
-    if (idx > 0) acc[value.slice(0, idx)] = value.slice(idx + 1);
-    return acc;
-  }, {} as Record<string, string>)
-  .option('--real-vps', 'deploy to a VPS over SSH (rsync source, build on the box, blue/green slots)')
-  .option('--vps-host <host>', 'SSH destination: user@host (or set CONVOY_VPS_HOST)')
-  .option('--vps-key <path>', 'SSH private key path (default: ~/.ssh/config / agent)')
-  .option('--vps-port <port>', 'SSH port (default 22)', (v) => Number(v))
-  .option('--vps-deploy-root <path>', 'deploy root on the box (default: /srv/<app>)')
-  .option('--vps-manage-nginx', 'let Convoy author and reload nginx upstream config (default: leave nginx alone)')
-  .option('--real-vps-ghcr', 'build image locally, push to GHCR, deploy via docker compose on VPS (requires --real-vps-ghcr-config or individual --vps-* flags)')
-  .option('--real-vps-ghcr-config <path>', 'JSON file containing RealVpsGhcrOpt (written by `convoy apply` from MCP; see docs/mcp.md)')
-  .option('--vps-ghcr-image <ref>', 'GHCR image ref without tag, e.g. ghcr.io/myorg/my-app')
-  .option('--vps-ghcr-username <user>', 'GitHub username for docker login (or set GHCR_USERNAME)')
-  .option('--vps-ghcr-token <token>', 'GitHub token with packages:write (or set GHCR_TOKEN / GH_TOKEN)')
-  .option('--vps-manage-caddy', 'write /etc/caddy/sites/<app>.caddy and reload Caddy on the box')
-  .option('--vps-domain <domain>', 'domain for Caddy site file (required with --vps-manage-caddy)')
-  .option('--vps-container-port <port>', 'port the container listens on for Caddy reverse proxy (default 3000)', (v) => Number(v))
-  .option('--vps-run-migrations', 'run Prisma migrate deploy in a one-shot container before rolling the service')
-  .option('--vps-bake-window <seconds>', 'observe-stage bake window in seconds (default 60)', (v) => Number(v))
-  .option('--real-railway', 'deploy via Railway CLI')
-  .option('--railway-project <id>', 'Railway project ID')
-  .option('--real-cloudrun', 'deploy via gcloud run deploy')
-  .option('--cloudrun-service <name>', 'Cloud Run service name')
-  .option('--cloudrun-image <ref>', 'Container image ref (e.g. gcr.io/proj/app:latest)')
-  .option('--cloudrun-region <region>', 'GCP region (default: us-central1)')
-  .option('--cloudrun-project <id>', 'GCP project ID (reads gcloud config if omitted)')
-  .action(async (planId: string, options: ApplyOpts) => {
-    await runApply(planId, options);
-  });
+registerDeployFlags(
+  program
+    .command('apply <planId>')
+    .description('Execute a saved plan. Real by default — opens a real PR, rehearses locally, deploys to Fly. Use --demo for a scripted pipeline.')
+    .option('--platform <platform>', 'override the plan\'s chosen platform: fly | railway | vercel | cloudrun | vps — re-scored at apply time'),
+).action(async (planId: string, options: ApplyOpts) => {
+  await runApply(planId, options);
+});
 
-program
-  .command('resume [runId]')
-  .description('Continue a paused or failed run after fixing the code. Defaults to the most recent run. Skips stages already finished; replays from the first incomplete stage.')
-  .option('--fresh', 'create a new run row and replay every stage from scratch (default: continue the same run row, skip already-finished stages)')
-  .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
-  .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
-  .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
-  .option(
-    '--already-set <keys>',
-    'comma-separated env var names the operator declares are already set on the deploy target (no platform queries). Example: --already-set=DATABASE_URL,CLERK_SECRET_KEY',
-    (value: string) => value.split(',').map((k) => k.trim()).filter((k) => k.length > 0),
-  )
-  .option('--recurring', 'declare this as an update to an already-live service (adjusts preflight tone; no platform probing)')
-  .option('--platform <platform>', 'override the plan\'s chosen platform: fly | railway | vercel | cloudrun — re-scored at apply time')
-  .option('--demo', 'scripted pipeline (no PR, no subprocess, no Fly deploy)')
-  .option('--no-real-author', 'stub the author stage instead of opening a real PR')
-  .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
-  .option('--no-real-fly', 'stub the deploy stages instead of deploying to Fly')
-  .option('--no-auto-merge', 'on approval, wait for you to merge the PR on GitHub instead of merging automatically')
-  .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
-  .option('--fly-app <name>', 'Fly.io app name (auto-generated from target if omitted)')
-  .option('--fly-org <org>', 'Fly.io organization (default: personal)')
-  .option('--no-fly-create-app', 'do NOT create the Fly app if it does not exist (default: create)')
-  .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate (default: canary)')
-  .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set` (default: <target>/.env.convoy-secrets)')
-  .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds (default: 60)', (v) => Number(v))
-  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary|concurrency (triggers medic with fixture logs; concurrency = serialised-renderer p99 breach)')
-  .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
-  .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
-  .option(
-    '--probe-path <path>',
-    'probe path for real rehearsal load (repeatable; default: the detected health path)',
-    (value: string, acc: string[]) => [...acc, value],
-    [] as string[],
-  )
-  .option('--probe-requests <n>', 'number of requests in the real rehearsal probe', (v) => Number(v))
-  .option('--probe-concurrency <n>', 'concurrency in the real rehearsal probe', (v) => Number(v))
-  .option('--env <kv>', 'env var to pass to the subprocess, KEY=VALUE (repeatable)', (value: string, acc: Record<string, string>) => {
-    const idx = value.indexOf('=');
-    if (idx > 0) acc[value.slice(0, idx)] = value.slice(idx + 1);
-    return acc;
-  }, {} as Record<string, string>)
-  .action(async (runId: string | undefined, options: ApplyOpts) => {
-    await runResume(runId, options);
-  });
+registerDeployFlags(
+  program
+    .command('resume [runId]')
+    .description('Continue a paused or failed run after fixing the code. Defaults to the most recent run. Skips stages already finished; replays from the first incomplete stage.')
+    .option('--fresh', 'create a new run row and replay every stage from scratch (default: continue the same run row, skip already-finished stages)')
+    .option('--platform <platform>', 'override the plan\'s chosen platform: fly | railway | vercel | cloudrun | vps — re-scored at apply time'),
+).action(async (runId: string | undefined, options: ApplyOpts) => {
+  await runResume(runId, options);
+});
 
 program
   .command('replay [runId]')
