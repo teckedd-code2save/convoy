@@ -1722,6 +1722,28 @@ async function preflightApply(
     }
   }
 
+  // Secrets manager health check (#36): when preferences name a manager,
+  // probe it before the deploy starts so the operator knows early if it's
+  // unreachable. Best-effort: if the probe itself fails, emit advisory only.
+  const { loadPreferences: loadPrefs36 } = await import('./onboard/preferences.js');
+  const prefs = loadPrefs36(plan.target.localPath);
+  const mgr = prefs?.secrets.manager;
+  if (mgr && mgr !== 'env-file' && mgr !== 'platform-native' && mgr !== 'unknown') {
+    try {
+      const { healthCheckManager } = await import('./core/secrets-manager.js');
+      const health = await healthCheckManager(mgr as import('./core/secrets-manager.js').SecretsManagerKind);
+      report.checks.push({
+        name: `secrets manager (${mgr})`,
+        ok: health.reachable,
+        detail: health.reachable
+          ? `reachable${health.url ? ` at ${health.url}` : ''} — source of truth for secrets`
+          : `unreachable${health.error ? `: ${health.error}` : ''} — staged file values will be used; re-sync once it's back with convoy secrets push ${plan.id.slice(0, 8)}`,
+      });
+    } catch {
+      // Probe failure is non-blocking — secrets gate catches real issues.
+    }
+  }
+
   return report;
 }
 
@@ -2778,7 +2800,7 @@ async function runStageSecrets(planId: string): Promise<void> {
   const { staged, secretsPath, alreadySetFilePath, fromFile, alreadySet } =
     computeStagedKeys(plan, emptyOpts);
 
-  const missing = [...expected].filter((k) => !staged.has(k));
+  let missing = [...expected].filter((k) => !staged.has(k));
 
   process.stdout.write(
     `${pc.bold(plan.target.name)} ${pc.dim('·')} ${pc.cyan(plan.platform.chosen)}\n`,
@@ -2792,6 +2814,48 @@ async function runStageSecrets(planId: string): Promise<void> {
 
   if (missing.length === 0) {
     process.stdout.write(`${pc.green('✓')} Nothing to do — all ${expected.size} expected vars are staged.\n`);
+    return;
+  }
+
+  // Offer secrets manager pull if one is configured (#36).
+  const { loadPreferences: loadPrefsStage } = await import('./onboard/preferences.js');
+  const prefs = loadPrefsStage(plan.target.localPath);
+  const managerKind = prefs?.secrets.manager;
+  if (managerKind && managerKind !== 'env-file' && managerKind !== 'platform-native' && managerKind !== 'unknown' && stdin.isTTY) {
+    const rlPull = readline.createInterface({ input: stdin, output: stdout });
+    try {
+      const answer = await rlPull.question(
+        `${pc.cyan(`${managerKind} detected`)} — pull ${missing.length} expected key${missing.length === 1 ? '' : 's'} from ${managerKind}? [Y/n] `,
+      );
+      if (answer.trim().toLowerCase() !== 'n') {
+        process.stdout.write(`${pc.dim('Pulling from')} ${managerKind}...\n`);
+        const { pullFromManager } = await import('./core/secrets-manager.js');
+        const result = await pullFromManager(managerKind as import('./core/secrets-manager.js').SecretsManagerKind, missing);
+        if (result.ok && result.secrets) {
+          const pulled = result.secrets;
+          const matched = Object.keys(pulled).filter((k) => missing.includes(k));
+          if (matched.length > 0) {
+            const prior = existsSync(secretsPath) ? readFileSync(secretsPath, 'utf8') : '';
+            const sep = prior.length > 0 && !prior.endsWith('\n') ? '\n' : '';
+            appendFileSync(secretsPath, `${sep}${matched.map((k) => `${k}=${pulled[k]}`).join('\n')}\n`, 'utf8');
+            process.stdout.write(`${pc.green('✓')} Pulled ${matched.length} key${matched.length === 1 ? '' : 's'} from ${managerKind} → ${secretsPath}\n`);
+            // Recalculate missing after pull
+            missing = missing.filter((k) => !matched.includes(k));
+          } else {
+            process.stdout.write(`${pc.yellow('!')} ${managerKind} didn't have any of the expected keys — continuing manually.\n`);
+          }
+        } else {
+          process.stdout.write(`${pc.yellow('!')} Pull failed: ${result.error ?? 'unknown error'} — continuing manually.\n`);
+        }
+      }
+    } finally {
+      rlPull.close();
+    }
+    process.stdout.write('\n');
+  }
+
+  if (missing.length === 0) {
+    process.stdout.write(`${pc.green('✓')} All expected vars are now staged.\n`);
     return;
   }
 
@@ -2888,6 +2952,143 @@ async function runStageSecrets(planId: string): Promise<void> {
   process.stdout.write(
     `\n${pc.dim('Next:')} ${pc.bold(`npm run convoy -- apply ${plan.id.slice(0, 8)}`)}\n`,
   );
+}
+
+async function runSecretsCommand(
+  subcommand: string,
+  planIdArg: string | undefined,
+  opts: { manager?: string; env?: string },
+): Promise<void> {
+  const { pullFromManager, healthCheckManager } = await import('./core/secrets-manager.js');
+
+  if (subcommand === 'pull') {
+    // Resolve which manager to use.
+    let manager = opts.manager;
+    let expectedKeys: string[] | undefined;
+
+    if (!manager && planIdArg) {
+      const plans = new PlanStore(PLANS_DIR);
+      const resolved = resolvePlan(plans, planIdArg);
+      if (!('error' in resolved)) {
+        const { loadPreferences: loadPrefsSecretsCmd } = await import('./onboard/preferences.js');
+        const prefs = loadPrefsSecretsCmd(resolved.plan.target.localPath);
+        manager = prefs?.secrets.manager;
+        const { keys } = computeExpectedKeys(resolved.plan);
+        expectedKeys = [...keys];
+        process.stdout.write(
+          `${pc.bold(resolved.plan.target.name)} ${pc.dim('·')} ${expectedKeys.length} expected keys\n`,
+        );
+      }
+    }
+
+    if (!manager || manager === 'env-file' || manager === 'platform-native' || manager === 'unknown') {
+      console.error(pc.red('No secrets manager configured. Set preferences via `convoy onboard` or pass --manager=infisical|doppler|vault.'));
+      process.exitCode = 1;
+      return;
+    }
+
+    process.stdout.write(`${pc.dim('Pulling from')} ${manager}...\n`);
+    const result = await pullFromManager(manager as import('./core/secrets-manager.js').SecretsManagerKind, expectedKeys);
+    if (!result.ok) {
+      console.error(pc.red(`Pull failed: ${result.error}`));
+      process.exitCode = 1;
+      return;
+    }
+
+    const secretsPath = resolve('.convoy', 'secrets.env');
+    const lines = Object.entries(result.secrets ?? {}).map(([k, v]) => `${k}=${v}`).join('\n');
+    const { appendFileSync } = await import('node:fs');
+    appendFileSync(secretsPath, `${lines}\n`, 'utf8');
+    process.stdout.write(
+      `${pc.green('✓')} Pulled ${result.count ?? 0} key${(result.count ?? 0) === 1 ? '' : 's'} from ${manager} → ${secretsPath}\n`,
+    );
+    process.stdout.write(`${pc.dim('Key names:')} ${Object.keys(result.secrets ?? {}).join(', ')}\n`);
+    return;
+  }
+
+  if (subcommand === 'push') {
+    let manager = opts.manager;
+    if (!manager && planIdArg) {
+      const plans = new PlanStore(PLANS_DIR);
+      const resolved = resolvePlan(plans, planIdArg);
+      if (!('error' in resolved)) {
+        const { loadPreferences: loadPrefsPush } = await import('./onboard/preferences.js');
+        const prefs = loadPrefsPush(resolved.plan.target.localPath);
+        manager = prefs?.secrets.manager;
+      }
+    }
+    if (!manager || manager === 'env-file' || manager === 'platform-native' || manager === 'unknown') {
+      console.error(pc.red('No secrets manager configured. Pass --manager=infisical|doppler|vault or set preferences via `convoy onboard`.'));
+      process.exitCode = 1;
+      return;
+    }
+    // convoy secrets push reads from .env.convoy-secrets and pushes back.
+    const secretsPath = resolve(process.env['CONVOY_REPO_PATH'] ?? '.', '.env.convoy-secrets');
+    let raw = '';
+    try {
+      const { readFileSync } = await import('node:fs');
+      raw = readFileSync(secretsPath, 'utf8');
+    } catch {
+      console.error(pc.red(`No staged secrets found at ${secretsPath}. Run \`convoy stage-secrets\` first.`));
+      process.exitCode = 1;
+      return;
+    }
+    const entries = raw.split('\n')
+      .filter((line) => line.includes('=') && !line.startsWith('#'))
+      .map((line) => {
+        const idx = line.indexOf('=');
+        return [line.slice(0, idx).trim(), line.slice(idx + 1).trim()] as [string, string];
+      })
+      .filter(([k, v]) => k.length > 0 && v.length > 0);
+
+    if (entries.length === 0) {
+      process.stdout.write(`${pc.dim('No non-empty key=value pairs found in')} ${secretsPath}\n`);
+      return;
+    }
+
+    process.stdout.write(
+      `${pc.yellow('!')} About to push ${entries.length} key${entries.length === 1 ? '' : 's'} to ${manager}.\n`,
+    );
+    process.stdout.write(`${pc.dim('Keys:')} ${entries.map(([k]) => k).join(', ')}\n`);
+
+    if (stdin.isTTY) {
+      const rl = readline.createInterface({ input: stdin, output: stdout });
+      const confirm = await rl.question('Confirm push? [y/N] ');
+      rl.close();
+      if (confirm.trim().toLowerCase() !== 'y') {
+        process.stdout.write(`${pc.dim('Cancelled.')}\n`);
+        return;
+      }
+    }
+
+    // Push is manager-specific. For now, surface a clear "not yet implemented"
+    // for push paths that need CLI tooling, since push is harder to generalize.
+    process.stdout.write(
+      `${pc.yellow('!')} convoy secrets push for ${manager} is not yet fully automated.\n`,
+    );
+    process.stdout.write(`${pc.dim('To push manually:')}\n`);
+    if (manager === 'doppler') {
+      process.stdout.write(`  doppler secrets upload ${secretsPath}\n`);
+    } else if (manager === 'infisical') {
+      process.stdout.write(`  infisical secrets set ${entries.map(([k, v]) => `${k}="${v}"`).join(' ')}\n`);
+    } else if (manager === 'vault') {
+      const kv = entries.map(([k, v]) => `${k}=${v}`).join(' ');
+      process.stdout.write(`  vault kv put secret/convoy/app ${kv}\n`);
+    }
+    return;
+  }
+
+  if (subcommand === 'health') {
+    const mgr = opts.manager ?? 'infisical';
+    const health = await healthCheckManager(mgr as import('./core/secrets-manager.js').SecretsManagerKind);
+    const mark = health.reachable ? pc.green('✓') : pc.red('✗');
+    process.stdout.write(`  ${mark} ${health.manager}${health.url ? ` (${health.url})` : ''}${health.error ? ` — ${health.error}` : ''}\n`);
+    if (!health.reachable) process.exitCode = 1;
+    return;
+  }
+
+  console.error(pc.red(`Unknown secrets subcommand: ${subcommand}. Use: pull | push | health`));
+  process.exitCode = 2;
 }
 
 function runListPlans(): void {
@@ -4302,6 +4503,17 @@ program
   )
   .action(async (planId: string) => {
     await runStageSecrets(planId);
+  });
+
+program
+  .command('secrets')
+  .description('Secrets manager integration — pull secrets from Infisical/Doppler/Vault, push staged secrets back.')
+  .argument('<subcommand>', 'pull | push')
+  .argument('[planId]', 'plan id (or prefix) to identify expected keys')
+  .option('--manager <m>', 'override secrets manager (infisical | doppler | vault)')
+  .option('--env <e>', 'environment to pull from (default: dev)')
+  .action(async (subcommand: string, planIdArg: string | undefined, opts: { manager?: string; env?: string }) => {
+    await runSecretsCommand(subcommand, planIdArg, opts);
   });
 
 program
