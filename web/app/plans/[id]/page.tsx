@@ -1,7 +1,9 @@
 import { notFound } from 'next/navigation';
 
 import { loadPreferences } from '../../../../src/onboard/preferences.js';
+import { classifyEnvKey } from '@/lib/env-classify';
 import {
+  computeExampleDefaults,
   computeExpectedKeys,
   computeStagedState,
   readRecurringPref,
@@ -114,6 +116,9 @@ function LaneSection({ plan }: { plan: PlanSummary }) {
                   {lane.scan.healthPath ? <span className="ml-1 font-mono text-xs">health={lane.scan.healthPath}</span> : null}
                   {lane.scan.port ? <span className="ml-1 font-mono text-xs">:{lane.scan.port}</span> : null}
                 </div>
+                {lane.platformDecision.advisory ? (
+                  <div className="text-xs text-muted/80 italic">{lane.platformDecision.advisory}</div>
+                ) : null}
               </div>
 
               {/* Per-lane risks */}
@@ -143,43 +148,67 @@ function LaneSection({ plan }: { plan: PlanSummary }) {
                 </div>
               ) : null}
 
-              {/* Per-lane secrets */}
-              {expectedKeys.length > 0 ? (
-                <div className="border-t border-rule/60 px-4 py-3">
-                  <div className="text-[10px] uppercase tracking-wider text-muted font-semibold mb-2">
-                    Required secrets ({expectedKeys.length})
+              {/* Per-lane secrets + config (issue #34: classified, secrets first) */}
+              {expectedKeys.length > 0 ? (() => {
+                const classified: Array<{ key: string; kind: 'secret' | 'config'; defaultValue?: string }> =
+                  lane.secrets?.keys ?? expectedKeys.map((key) => ({ key, kind: classifyEnvKey(key) }));
+                const secretRows = classified.filter((k) => k.kind === 'secret');
+                const configRows = classified.filter((k) => k.kind === 'config');
+                const renderRow = (
+                  entry: { key: string; kind: 'secret' | 'config'; defaultValue?: string },
+                  dim: boolean,
+                ) => {
+                  const staged = stagedLocally.has(entry.key);
+                  const declared = markedAlreadySet.has(entry.key);
+                  const prefilled = !staged && !declared && entry.kind === 'config' && !!entry.defaultValue;
+                  const state = staged ? 'staged' : declared ? 'declared' : prefilled ? 'prefilled' : 'missing';
+                  return (
+                    <li key={entry.key} className={`flex items-center gap-2 text-xs ${dim ? 'opacity-70' : ''}`}>
+                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                        state === 'staged' ? 'bg-success' :
+                        state === 'declared' ? 'bg-accent' :
+                        state === 'prefilled' ? 'bg-muted' :
+                        'bg-warn animate-pulse'
+                      }`} />
+                      <span className="font-mono text-ink/90">{entry.key}</span>
+                      {state === 'staged' ? (
+                        <span className="text-success text-[9px]">staged</span>
+                      ) : state === 'declared' ? (
+                        <span className="text-accent text-[9px]">already-set</span>
+                      ) : state === 'prefilled' ? (
+                        <span className="text-muted text-[9px]">from example — confirm for production</span>
+                      ) : (
+                        <span className="text-warn text-[9px]">missing</span>
+                      )}
+                    </li>
+                  );
+                };
+                return (
+                  <div className="border-t border-rule/60 px-4 py-3 space-y-3">
+                    {secretRows.length > 0 ? (
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wider text-muted font-semibold mb-2">
+                          Secrets ({secretRows.length})
+                        </div>
+                        <ul className="space-y-1">{secretRows.map((entry) => renderRow(entry, false))}</ul>
+                      </div>
+                    ) : null}
+                    {configRows.length > 0 ? (
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wider text-muted/70 font-semibold mb-2">
+                          Config ({configRows.length})
+                        </div>
+                        <ul className="space-y-1">{configRows.map((entry) => renderRow(entry, true))}</ul>
+                      </div>
+                    ) : null}
+                    {classified.some((k) => !stagedLocally.has(k.key) && !markedAlreadySet.has(k.key) && !(k.kind === 'config' && k.defaultValue)) ? (
+                      <p className="text-[10px] text-muted">
+                        Stage missing vars via <code className="font-mono bg-rule/60 rounded px-0.5">convoy stage-secrets {plan.id.slice(0, 8)}</code> or the panel below.
+                      </p>
+                    ) : null}
                   </div>
-                  <ul className="space-y-1">
-                    {expectedKeys.map((key) => {
-                      const staged = stagedLocally.has(key);
-                      const declared = markedAlreadySet.has(key);
-                      const state = staged ? 'staged' : declared ? 'declared' : 'missing';
-                      return (
-                        <li key={key} className="flex items-center gap-2 text-xs">
-                          <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                            state === 'staged' ? 'bg-success' :
-                            state === 'declared' ? 'bg-accent' :
-                            'bg-warn animate-pulse'
-                          }`} />
-                          <span className="font-mono text-ink/90">{key}</span>
-                          {state === 'staged' ? (
-                            <span className="text-success text-[9px]">staged</span>
-                          ) : state === 'declared' ? (
-                            <span className="text-accent text-[9px]">already-set</span>
-                          ) : (
-                            <span className="text-warn text-[9px]">missing</span>
-                          )}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                  {expectedKeys.some((k) => !stagedLocally.has(k) && !markedAlreadySet.has(k)) ? (
-                    <p className="text-[10px] text-muted mt-2">
-                      Stage missing vars via <code className="font-mono bg-rule/60 rounded px-0.5">convoy stage-secrets {plan.id.slice(0, 8)}</code> or the panel below.
-                    </p>
-                  ) : null}
-                </div>
-              ) : null}
+                );
+              })() : null}
             </div>
           );
         })}
@@ -549,15 +578,25 @@ function ConfigPanelSection({ plan }: { plan: PlanSummary }) {
     // preferences unreadable — leave blank
   }
 
-  const rows: PanelRow[] = expected.map((e) => ({
-    key: e.key,
-    source: e.source,
-    state: stagedLocally.has(e.key)
-      ? ('staged' as const)
-      : markedAlreadySet.has(e.key)
-        ? ('already-set' as const)
-        : ('missing' as const),
-  }));
+  const defaults = computeExampleDefaults(plan);
+  const rows: PanelRow[] = expected
+    .map((e) => {
+      const kind = classifyEnvKey(e.key);
+      const defaultValue = kind === 'config' ? defaults[e.key] : undefined;
+      return {
+        key: e.key,
+        source: e.source,
+        kind,
+        ...(defaultValue !== undefined && { defaultValue }),
+        state: stagedLocally.has(e.key)
+          ? ('staged' as const)
+          : markedAlreadySet.has(e.key)
+            ? ('already-set' as const)
+            : ('missing' as const),
+      };
+    })
+    // Secret group first; config follows, visually dimmer in the panel.
+    .sort((a, b) => (a.kind === b.kind ? 0 : a.kind === 'secret' ? -1 : 1));
 
   return (
     <ConfigPanel

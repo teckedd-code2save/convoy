@@ -51,6 +51,7 @@ export interface PlanSummary {
       source: string;
       reason: string;
       candidates: PlanPlatformCandidate[];
+      advisory?: string;
     };
     author: {
       convoyAuthoredFiles: PlanAuthoredFile[];
@@ -72,6 +73,7 @@ export interface PlanSummary {
     secrets: {
       expectedKeys: string[];
       sources: string[];
+      keys?: Array<{ key: string; kind: 'secret' | 'config'; defaultValue?: string }>;
     };
   }>;
   dependencies?: Array<{ from: string; to: string; reason: string }>;

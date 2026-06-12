@@ -30,6 +30,7 @@ import { probePlatformConnection } from './adapters/connections.js';
 import type { ConnectionCheck, ConnectionStatus } from './adapters/types.js';
 import { buildPlan } from './planner/index.js';
 import type { PlatformAdjustments } from './planner/picker.js';
+import { classifyEnvKey } from './core/env-classify.js';
 import { loadByokConfig, resolveAnthropicKey } from './core/key-resolver.js';
 import { scanRepository } from './planner/scanner.js';
 import { resolveTarget } from './planner/target-resolver.js';
@@ -443,11 +444,13 @@ function attachRenderer(bus: ConvoyBus, startedAt: Date, openInUI = false): () =
   return bus.subscribe((e: ConvoyBusEvent) => {
     switch (e.type) {
       case 'run.created': {
+        // URL first (issue #30): the very first line a run prints is where
+        // to watch it — before the banner, before any stage output.
         const url = webUrl(`/runs/${e.run.id}`);
+        process.stdout.write(`\n${pc.bold(`Run ${e.run.id.slice(0, 8)}`)} ${pc.dim('—')} watch live: ${pc.cyan(url)}\n`);
         const title = `${pc.bold(pc.cyan('▲ CONVOY'))}  ${pc.dim('·')}  run ${pc.bold(e.run.id.slice(0, 8))}`;
         const subtitle = `${pc.dim('target:')} ${e.run.repoUrl}`;
-        process.stdout.write(`\n${convoyBanner(title, subtitle)}\n`);
-        process.stdout.write(`${CONVOY_RULE}${pc.cyan('▶')} ${pc.dim('Watch live:')} ${pc.cyan(url)}\n`);
+        process.stdout.write(`${convoyBanner(title, subtitle)}\n`);
         if (openInUI) void openInBrowser(url);
         return;
       }
@@ -487,7 +490,7 @@ function attachRenderer(bus: ConvoyBus, startedAt: Date, openInUI = false): () =
         return;
       case 'approval.requested':
         process.stdout.write(
-          `${CONVOY_RULE}${pc.yellow(SYMBOL.pause)} ${pc.yellow(`awaiting ${e.approval.kind} approval`)}\n`,
+          `${CONVOY_RULE}${pc.yellow(SYMBOL.pause)} ${pc.yellow(`awaiting ${e.approval.kind}`)} ${pc.dim('—')} approve at ${pc.cyan(webUrl(`/runs/${e.approval.runId}`))}\n`,
         );
         return;
       case 'approval.decided': {
@@ -646,8 +649,19 @@ async function runShip(
       ...(opts.strictDrift !== undefined && { strictDrift: opts.strictDrift }),
       interactive: true,
     });
-    if (mandate && platformOverride === undefined) {
-      platformOverride = mandate;
+
+    // `ship --platform=vps` without --vps-host: default the host from team
+    // preferences captured at onboard, so the operator's onboarding answer
+    // is honored instead of failing preflight on a host they already told us.
+    if (platformOverride === 'vps' && !opts.vpsHost) {
+      const { loadPreferences } = await import('./onboard/preferences.js');
+      const prefHost = loadPreferences(resolved.localPath)?.deployment.vpsHost;
+      if (prefHost) {
+        opts.vpsHost = prefHost;
+        process.stdout.write(
+          `${pc.dim('Using VPS host from team preferences:')} ${pc.bold(prefHost)}\n`,
+        );
+      }
     }
     thinking = startThinking();
 
@@ -657,6 +671,7 @@ async function runShip(
       ...(resolved.branch !== undefined && { branch: resolved.branch }),
       ...(resolved.sha !== undefined && { sha: resolved.sha }),
       ...(platformOverride !== undefined && { platformOverride }),
+      ...(mandate !== null && { platformMandate: mandate }),
       ...(opts.workspace !== undefined && { workspace: opts.workspace }),
       ...(adjustments !== undefined && { platformAdjustments: adjustments }),
       ai: opts.noAi ? { disable: true } : { ...(byokKey && { apiKey: byokKey }) },
@@ -761,9 +776,6 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
       ...(opts.strictDrift !== undefined && { strictDrift: opts.strictDrift }),
       interactive: !opts.json,
     });
-    if (mandate && !opts.platform) {
-      platformOverride = mandate;
-    }
     if (opts.vpsHost) {
       const { loadPreferences, mergePreferences, savePreferences } = await import('./onboard/preferences.js');
       const current = loadPreferences(resolved.localPath);
@@ -782,6 +794,7 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
       ...(resolved.branch !== undefined && { branch: resolved.branch }),
       ...(resolved.sha !== undefined && { sha: resolved.sha }),
       ...(platformOverride !== undefined && { platformOverride }),
+      ...(mandate !== null && { platformMandate: mandate }),
       ...(opts.workspace !== undefined && { workspace: opts.workspace }),
       ...(adjustments !== undefined && { platformAdjustments: adjustments }),
       ai: opts.noAi ? { disable: true } : { ...(byokKey && { apiKey: byokKey }) },
@@ -791,6 +804,11 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
     if (opts.json) {
       process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
     } else {
+      // URL first (issue #30): the moment the plan exists, say where to
+      // follow it — before the long render scrolls the terminal.
+      process.stdout.write(
+        `${pc.bold(`Plan ${plan.id.slice(0, 8)}`)} ${pc.dim('—')} follow along: ${pc.cyan(webUrl(`/plans/${plan.id}`))}\n\n`,
+      );
       process.stdout.write(`${renderPlan(plan)}\n`);
       process.stdout.write(`\n${pc.dim(`Narrative source: ${enrichmentSource}`)}\n`);
     }
@@ -1069,9 +1087,12 @@ function extractEnvKeys(content: string): string[] {
 export function computeExpectedKeys(plan: ConvoyPlan): {
   keys: Set<string>;
   sources: string[];
+  /** Non-empty example-file values, keyed by env var (issue #34). */
+  defaults: Record<string, string>;
 } {
   const expected = new Set<string>();
   const sources: string[] = [];
+  const defaults: Record<string, string> = {};
 
   const schemaFile = plan.author.convoyAuthoredFiles.find((f) => f.path === '.env.schema');
   if (schemaFile) {
@@ -1090,9 +1111,12 @@ export function computeExpectedKeys(plan: ConvoyPlan): {
       if (existsSync(p)) {
         try {
           const content = readFileSync(p, 'utf8');
-          const keys = extractEnvKeys(content);
-          keys.forEach((k) => expected.add(k));
-          if (keys.length > 0) sources.push(`${cand} (${keys.length})`);
+          const entries = parseEnvFileContent(content);
+          for (const [key, value] of Object.entries(entries)) {
+            expected.add(key);
+            if (value.length > 0) defaults[key] = value;
+          }
+          if (Object.keys(entries).length > 0) sources.push(`${cand} (${Object.keys(entries).length})`);
           break;
         } catch {
           // unreadable, skip
@@ -1101,7 +1125,7 @@ export function computeExpectedKeys(plan: ConvoyPlan): {
     }
   }
 
-  return { keys: expected, sources };
+  return { keys: expected, sources, defaults };
 }
 
 /**
@@ -1163,7 +1187,7 @@ function appendEnvStagingChecks(
   opts: ApplyOpts,
   report: PreflightReport,
 ): void {
-  const { keys: expectedRaw, sources } = computeExpectedKeys(plan);
+  const { keys: expectedRaw, sources, defaults } = computeExpectedKeys(plan);
   if (expectedRaw.size === 0) return;
 
   // Strip keys the platform injects itself (e.g. PORT on Vercel/Cloud Run/Fly).
@@ -1178,15 +1202,32 @@ function appendEnvStagingChecks(
 
   const { staged, secretsPath } = computeStagedKeys(plan, opts);
 
-  const missing = [...expected].filter((k) => !staged.has(k));
+  // Secret vs config (issue #34): config keys with a non-empty value in the
+  // example file are prefilled defaults, not missing — the operator just
+  // confirms them for production.
+  const unstaged = [...expected].filter((k) => !staged.has(k));
+  const missingSecrets = unstaged.filter((k) => classifyEnvKey(k) === 'secret');
+  const missingConfig = unstaged.filter(
+    (k) => classifyEnvKey(k) === 'config' && !(defaults[k] && defaults[k].length > 0),
+  );
+  const prefilledConfig = unstaged.filter(
+    (k) => classifyEnvKey(k) === 'config' && defaults[k] && defaults[k].length > 0,
+  );
+  const missing = [...missingSecrets, ...missingConfig];
   const have = expected.size - missing.length;
+  const secretCount = [...expected].filter((k) => classifyEnvKey(k) === 'secret').length;
+  const configCount = expected.size - secretCount;
+  const splitStr = ` — secrets (${secretCount}), config (${configCount})`;
   const sourcesStr = sources.length > 0 ? ` (sources: ${sources.join(', ')})` : '';
+  const prefilledStr = prefilledConfig.length > 0
+    ? ` · ${prefilledConfig.length} config default${prefilledConfig.length === 1 ? '' : 's'} from example — confirm for production: ${prefilledConfig.join(', ')}`
+    : '';
 
   if (missing.length === 0) {
     report.checks.push({
       name: 'env staging',
       ok: true,
-      detail: `${have}/${expected.size} expected vars staged or declared already-set${sourcesStr}`,
+      detail: `${have}/${expected.size} expected vars staged or declared already-set${splitStr}${sourcesStr}${prefilledStr}`,
     });
     return;
   }
@@ -1216,10 +1257,13 @@ function appendEnvStagingChecks(
       ? `${dataHints.join(' · ')} · OR ${remedyParts.join(' · ')}`
       : remedyParts.join(' · ');
 
+  const missingParts: string[] = [];
+  if (missingSecrets.length > 0) missingParts.push(`secrets missing: ${missingSecrets.join(', ')}`);
+  if (missingConfig.length > 0) missingParts.push(`config missing: ${missingConfig.join(', ')}`);
   report.checks.push({
     name: 'env staging',
     ok: false,
-    detail: `${have}/${expected.size} vars staged${sourcesStr} — missing: ${missing.join(', ')}`,
+    detail: `${have}/${expected.size} vars staged${splitStr}${sourcesStr} — ${missingParts.join(' · ')}${prefilledStr}`,
     remedy,
   });
 }
@@ -1556,9 +1600,17 @@ async function preflightApply(
       // Surface detected sub-services as remediation — the common case is a
       // monorepo where the start command lives inside apps/* or packages/*.
       const subPaths = extractMonorepoSuggestions(plan);
+      const ecosystem = primaryLane(plan).scan.ecosystem;
+      const checkedSources =
+        'I checked, in order: package.json scripts.start, Dockerfile CMD/ENTRYPOINT, ' +
+        'Procfile `web:`, Python entrypoints (uvicorn/gunicorn/fastapi + main.py/app.py), ' +
+        'and docker-compose service `command:` — none yielded a start command.';
+      const ecosystemHint = ecosystem === 'node'
+        ? 'Add a `start` script to package.json, or pass --no-real-rehearsal.'
+        : 'Add a Dockerfile CMD, a Procfile `web:` line, or (Python) a main.py/app.py with uvicorn in the manifest — or pass --no-real-rehearsal.';
       const workspaceHint = subPaths.length > 0
         ? `This looks like a monorepo. Try --workspace=${subPaths[0]}${subPaths.length > 1 ? ` (other services: ${subPaths.slice(1).join(', ')})` : ''}.`
-        : 'Add a \`start\` script to the target, or pass --no-real-rehearsal.';
+        : ecosystemHint;
       const fixes: BlockerFix[] = [];
       if (subPaths.length > 0) {
         fixes.push({
@@ -1567,10 +1619,16 @@ async function preflightApply(
           flag: `--workspace=${subPaths[0]}`,
           autoFixable: true,
         });
-      } else {
+      } else if (ecosystem === 'node') {
         fixes.push({
           kind: 'edit-file',
           label: 'Add a "start" script to package.json',
+          autoFixable: false,
+        });
+      } else {
+        fixes.push({
+          kind: 'edit-file',
+          label: 'Declare the start command via Dockerfile CMD or a Procfile web: line',
           autoFixable: false,
         });
       }
@@ -1583,14 +1641,14 @@ async function preflightApply(
       report.blockers.push({
         id: 'real-rehearsal.no-start-command',
         title: 'No start command detected',
-        detail: `Convoy needs a start command to spawn the target locally. ${workspaceHint}`,
+        detail: `Convoy needs a start command to spawn the target locally. ${checkedSources} ${workspaceHint}`,
         severity: 'hard',
         fixes,
       });
       report.checks.push({
         name: 'real rehearsal',
         ok: false,
-        detail: 'no start command detected',
+        detail: 'no start command detected (checked package.json, Dockerfile, Procfile, Python signals, docker-compose)',
         remedy: workspaceHint,
       });
     } else {
@@ -2346,7 +2404,10 @@ function detectInstallCommand(plan: ConvoyPlan): string | null {
 }
 
 function parseEnvFile(path: string): Record<string, string> {
-  const raw = readFileSync(path, 'utf8');
+  return parseEnvFileContent(readFileSync(path, 'utf8'));
+}
+
+function parseEnvFileContent(raw: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
@@ -4005,53 +4066,90 @@ const program = new Command()
   .description('Deployment agent that rehearses, ships, and observes — without touching your code.')
   .version('0.0.1');
 
-program
-  .command('ship <target>')
-  .description('Plan + apply end-to-end. Real by default. Accepts a local path or a GitHub URL / owner/repo.')
-  .option('--platform <platform>', 'explicit platform choice: fly | railway | vercel | cloudrun | vps')
-  .option('--workspace <subdir>', 'target a specific subdirectory (e.g. backend, apps/web)')
-  .option('--skip-onboard', 'skip the first-contact onboarding gate (CI: proceeds with defaults)')
-  .option('--skip-orient', 'skip per-run drift detection between preferences and repo artifacts')
-  .option('--strict-drift', 'turn drift warnings into a hard pause (exit 2 with a blocker message)')
-  .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
-  .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
-  .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
-  .option(
-    '--already-set <keys>',
-    'comma-separated env var names the operator declares are already set on the deploy target (no platform queries). Example: --already-set=DATABASE_URL,CLERK_SECRET_KEY',
-    (value: string) => value.split(',').map((k) => k.trim()).filter((k) => k.length > 0),
-  )
-  .option('--recurring', 'declare this as an update to an already-live service (adjusts preflight tone; no platform probing)')
-  .option('--no-ai', 'skip the Opus narrative pass')
-  .option('--demo', 'scripted pipeline — no PR, no subprocess, no Fly deploy')
-  .option('--no-real-author', 'stub the author stage instead of opening a real PR')
-  .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
-  .option('--no-real-fly', 'stub the deploy stages instead of deploying to Fly')
-  .option('--no-auto-merge', 'on approval, wait for you to merge the PR on GitHub instead of merging automatically')
-  .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
-  .option('--fly-app <name>', 'Fly.io app name (auto-generated from target if omitted)')
-  .option('--fly-org <org>', 'Fly.io organization (default: personal)')
-  .option('--no-fly-create-app', 'do NOT create the Fly app if it does not exist')
-  .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate')
-  .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set`')
-  .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds', (v) => Number(v))
-  .option('--env-file <path>', 'env file for --real-rehearsal subprocess')
-  .option(
-    '--probe-path <path>',
-    'probe path for real rehearsal load (repeatable)',
-    (value: string, acc: string[]) => [...acc, value],
-    [] as string[],
-  )
-  .option('--probe-requests <n>', 'number of requests in the real rehearsal probe', (v) => Number(v))
-  .option('--probe-concurrency <n>', 'concurrency', (v) => Number(v))
-  .option('--env <kv>', 'env var to pass to the subprocess, KEY=VALUE (repeatable)', (value: string, acc: Record<string, string>) => {
-    const idx = value.indexOf('=');
-    if (idx > 0) acc[value.slice(0, idx)] = value.slice(idx + 1);
-    return acc;
-  }, {} as Record<string, string>)
-  .action(async (target: string, options: ShipOpts) => {
-    await runShip(target, options);
-  });
+/**
+ * Shared deploy option set, registered identically on `ship`, `apply`, and
+ * `resume` (issue #32). Single definition — the --real-vps*, --real-railway,
+ * and --real-cloudrun* families used to exist on `apply` only, so `ship`
+ * rejected the very flags its own apply phase understood. Any new deploy
+ * flag belongs here, not on an individual command.
+ */
+function registerDeployFlags(cmd: Command): Command {
+  return cmd
+    .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
+    .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
+    .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
+    .option(
+      '--already-set <keys>',
+      'comma-separated env var names the operator declares are already set on the deploy target (no platform queries). Example: --already-set=DATABASE_URL,CLERK_SECRET_KEY',
+      (value: string) => value.split(',').map((k) => k.trim()).filter((k) => k.length > 0),
+    )
+    .option('--recurring', 'declare this as an update to an already-live service (adjusts preflight tone; no platform probing)')
+    .option('--demo', 'scripted pipeline (no PR, no subprocess, no real deploy)')
+    .option('--no-real-author', 'stub the author stage instead of opening a real PR')
+    .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
+    .option('--no-real-fly', 'stub the deploy stages instead of deploying to Fly')
+    .option('--no-auto-merge', 'on approval, wait for you to merge the PR on GitHub instead of merging automatically')
+    .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
+    .option('--fly-app <name>', 'Fly.io app name (auto-generated from target if omitted)')
+    .option('--fly-org <org>', 'Fly.io organization (default: personal)')
+    .option('--no-fly-create-app', 'do NOT create the Fly app if it does not exist (default: create)')
+    .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate (default: canary)')
+    .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set` (default: <target>/.env.convoy-secrets)')
+    .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds (default: 60)', (v) => Number(v))
+    .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary|concurrency (triggers medic with fixture logs; concurrency = serialised-renderer p99 breach)')
+    .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
+    .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
+    .option(
+      '--probe-path <path>',
+      'probe path for real rehearsal load (repeatable; default: the detected health path)',
+      (value: string, acc: string[]) => [...acc, value],
+      [] as string[],
+    )
+    .option('--probe-requests <n>', 'number of requests in the real rehearsal probe', (v) => Number(v))
+    .option('--probe-concurrency <n>', 'concurrency in the real rehearsal probe', (v) => Number(v))
+    .option('--env <kv>', 'env var to pass to the subprocess, KEY=VALUE (repeatable)', (value: string, acc: Record<string, string>) => {
+      const idx = value.indexOf('=');
+      if (idx > 0) acc[value.slice(0, idx)] = value.slice(idx + 1);
+      return acc;
+    }, {} as Record<string, string>)
+    .option('--real-vps', 'deploy to a VPS over SSH (rsync source, build on the box, blue/green slots)')
+    .option('--vps-host <host>', 'SSH destination: user@host (or set CONVOY_VPS_HOST)')
+    .option('--vps-key <path>', 'SSH private key path (default: ~/.ssh/config / agent)')
+    .option('--vps-port <port>', 'SSH port (default 22)', (v) => Number(v))
+    .option('--vps-deploy-root <path>', 'deploy root on the box (default: /srv/<app>)')
+    .option('--vps-manage-nginx', 'let Convoy author and reload nginx upstream config (default: leave nginx alone)')
+    .option('--real-vps-ghcr', 'build image locally, push to GHCR, deploy via docker compose on VPS (requires --real-vps-ghcr-config or individual --vps-* flags)')
+    .option('--real-vps-ghcr-config <path>', 'JSON file containing RealVpsGhcrOpt (written by `convoy apply` from MCP; see docs/mcp.md)')
+    .option('--vps-ghcr-image <ref>', 'GHCR image ref without tag, e.g. ghcr.io/myorg/my-app')
+    .option('--vps-ghcr-username <user>', 'GitHub username for docker login (or set GHCR_USERNAME)')
+    .option('--vps-ghcr-token <token>', 'GitHub token with packages:write (or set GHCR_TOKEN / GH_TOKEN)')
+    .option('--vps-manage-caddy', 'write /etc/caddy/sites/<app>.caddy and reload Caddy on the box')
+    .option('--vps-domain <domain>', 'domain for Caddy site file (required with --vps-manage-caddy)')
+    .option('--vps-container-port <port>', 'port the container listens on for Caddy reverse proxy (default 3000)', (v) => Number(v))
+    .option('--vps-run-migrations', 'run Prisma migrate deploy in a one-shot container before rolling the service')
+    .option('--vps-bake-window <seconds>', 'observe-stage bake window in seconds (default 60)', (v) => Number(v))
+    .option('--real-railway', 'deploy via Railway CLI')
+    .option('--railway-project <id>', 'Railway project ID')
+    .option('--real-cloudrun', 'deploy via gcloud run deploy')
+    .option('--cloudrun-service <name>', 'Cloud Run service name')
+    .option('--cloudrun-image <ref>', 'Container image ref (e.g. gcr.io/proj/app:latest)')
+    .option('--cloudrun-region <region>', 'GCP region (default: us-central1)')
+    .option('--cloudrun-project <id>', 'GCP project ID (reads gcloud config if omitted)');
+}
+
+registerDeployFlags(
+  program
+    .command('ship <target>')
+    .description('Plan + apply end-to-end. Real by default. Accepts a local path or a GitHub URL / owner/repo.')
+    .option('--platform <platform>', 'explicit platform choice: fly | railway | vercel | cloudrun | vps')
+    .option('--workspace <subdir>', 'target a specific subdirectory (e.g. backend, apps/web)')
+    .option('--skip-onboard', 'skip the first-contact onboarding gate (CI: proceeds with defaults)')
+    .option('--skip-orient', 'skip per-run drift detection between preferences and repo artifacts')
+    .option('--strict-drift', 'turn drift warnings into a hard pause (exit 2 with a blocker message)')
+    .option('--no-ai', 'skip the Opus narrative pass'),
+).action(async (target: string, options: ShipOpts) => {
+  await runShip(target, options);
+});
 
 program
   .command('plan <path>')
@@ -4078,119 +4176,24 @@ program
     await runStatus(runId);
   });
 
-program
-  .command('apply <planId>')
-  .description('Execute a saved plan. Real by default — opens a real PR, rehearses locally, deploys to Fly. Use --demo for a scripted pipeline.')
-  .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
-  .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
-  .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
-  .option(
-    '--already-set <keys>',
-    'comma-separated env var names the operator declares are already set on the deploy target (no platform queries). Example: --already-set=DATABASE_URL,CLERK_SECRET_KEY',
-    (value: string) => value.split(',').map((k) => k.trim()).filter((k) => k.length > 0),
-  )
-  .option('--recurring', 'declare this as an update to an already-live service (adjusts preflight tone; no platform probing)')
-  .option('--platform <platform>', 'override the plan\'s chosen platform: fly | railway | vercel | cloudrun — re-scored at apply time')
-  .option('--demo', 'scripted pipeline (no PR, no subprocess, no Fly deploy)')
-  .option('--no-real-author', 'stub the author stage instead of opening a real PR')
-  .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
-  .option('--no-real-fly', 'stub the deploy stages instead of deploying to Fly')
-  .option('--no-auto-merge', 'on approval, wait for you to merge the PR on GitHub instead of merging automatically')
-  .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
-  .option('--fly-app <name>', 'Fly.io app name (auto-generated from target if omitted)')
-  .option('--fly-org <org>', 'Fly.io organization (default: personal)')
-  .option('--no-fly-create-app', 'do NOT create the Fly app if it does not exist (default: create)')
-  .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate (default: canary)')
-  .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set` (default: <target>/.env.convoy-secrets)')
-  .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds (default: 60)', (v) => Number(v))
-  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary|concurrency (triggers medic with fixture logs; concurrency = serialised-renderer p99 breach)')
-  .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
-  .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
-  .option(
-    '--probe-path <path>',
-    'probe path for real rehearsal load (repeatable; default: the detected health path)',
-    (value: string, acc: string[]) => [...acc, value],
-    [] as string[],
-  )
-  .option('--probe-requests <n>', 'number of requests in the real rehearsal probe', (v) => Number(v))
-  .option('--probe-concurrency <n>', 'concurrency in the real rehearsal probe', (v) => Number(v))
-  .option('--env <kv>', 'env var to pass to the subprocess, KEY=VALUE (repeatable)', (value: string, acc: Record<string, string>) => {
-    const idx = value.indexOf('=');
-    if (idx > 0) acc[value.slice(0, idx)] = value.slice(idx + 1);
-    return acc;
-  }, {} as Record<string, string>)
-  .option('--real-vps', 'deploy to a VPS over SSH (rsync source, build on the box, blue/green slots)')
-  .option('--vps-host <host>', 'SSH destination: user@host (or set CONVOY_VPS_HOST)')
-  .option('--vps-key <path>', 'SSH private key path (default: ~/.ssh/config / agent)')
-  .option('--vps-port <port>', 'SSH port (default 22)', (v) => Number(v))
-  .option('--vps-deploy-root <path>', 'deploy root on the box (default: /srv/<app>)')
-  .option('--vps-manage-nginx', 'let Convoy author and reload nginx upstream config (default: leave nginx alone)')
-  .option('--real-vps-ghcr', 'build image locally, push to GHCR, deploy via docker compose on VPS (requires --real-vps-ghcr-config or individual --vps-* flags)')
-  .option('--real-vps-ghcr-config <path>', 'JSON file containing RealVpsGhcrOpt (written by `convoy apply` from MCP; see docs/mcp.md)')
-  .option('--vps-ghcr-image <ref>', 'GHCR image ref without tag, e.g. ghcr.io/myorg/my-app')
-  .option('--vps-ghcr-username <user>', 'GitHub username for docker login (or set GHCR_USERNAME)')
-  .option('--vps-ghcr-token <token>', 'GitHub token with packages:write (or set GHCR_TOKEN / GH_TOKEN)')
-  .option('--vps-manage-caddy', 'write /etc/caddy/sites/<app>.caddy and reload Caddy on the box')
-  .option('--vps-domain <domain>', 'domain for Caddy site file (required with --vps-manage-caddy)')
-  .option('--vps-container-port <port>', 'port the container listens on for Caddy reverse proxy (default 3000)', (v) => Number(v))
-  .option('--vps-run-migrations', 'run Prisma migrate deploy in a one-shot container before rolling the service')
-  .option('--vps-bake-window <seconds>', 'observe-stage bake window in seconds (default 60)', (v) => Number(v))
-  .option('--real-railway', 'deploy via Railway CLI')
-  .option('--railway-project <id>', 'Railway project ID')
-  .option('--real-cloudrun', 'deploy via gcloud run deploy')
-  .option('--cloudrun-service <name>', 'Cloud Run service name')
-  .option('--cloudrun-image <ref>', 'Container image ref (e.g. gcr.io/proj/app:latest)')
-  .option('--cloudrun-region <region>', 'GCP region (default: us-central1)')
-  .option('--cloudrun-project <id>', 'GCP project ID (reads gcloud config if omitted)')
-  .action(async (planId: string, options: ApplyOpts) => {
-    await runApply(planId, options);
-  });
+registerDeployFlags(
+  program
+    .command('apply <planId>')
+    .description('Execute a saved plan. Real by default — opens a real PR, rehearses locally, deploys to Fly. Use --demo for a scripted pipeline.')
+    .option('--platform <platform>', 'override the plan\'s chosen platform: fly | railway | vercel | cloudrun | vps — re-scored at apply time'),
+).action(async (planId: string, options: ApplyOpts) => {
+  await runApply(planId, options);
+});
 
-program
-  .command('resume [runId]')
-  .description('Continue a paused or failed run after fixing the code. Defaults to the most recent run. Skips stages already finished; replays from the first incomplete stage.')
-  .option('--fresh', 'create a new run row and replay every stage from scratch (default: continue the same run row, skip already-finished stages)')
-  .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
-  .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
-  .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
-  .option(
-    '--already-set <keys>',
-    'comma-separated env var names the operator declares are already set on the deploy target (no platform queries). Example: --already-set=DATABASE_URL,CLERK_SECRET_KEY',
-    (value: string) => value.split(',').map((k) => k.trim()).filter((k) => k.length > 0),
-  )
-  .option('--recurring', 'declare this as an update to an already-live service (adjusts preflight tone; no platform probing)')
-  .option('--platform <platform>', 'override the plan\'s chosen platform: fly | railway | vercel | cloudrun — re-scored at apply time')
-  .option('--demo', 'scripted pipeline (no PR, no subprocess, no Fly deploy)')
-  .option('--no-real-author', 'stub the author stage instead of opening a real PR')
-  .option('--no-real-rehearsal', 'stub the rehearse stage instead of running a local probe')
-  .option('--no-real-fly', 'stub the deploy stages instead of deploying to Fly')
-  .option('--no-auto-merge', 'on approval, wait for you to merge the PR on GitHub instead of merging automatically')
-  .option('--merge-method <method>', 'PR merge method: merge | squash | rebase (default: squash)')
-  .option('--fly-app <name>', 'Fly.io app name (auto-generated from target if omitted)')
-  .option('--fly-org <org>', 'Fly.io organization (default: personal)')
-  .option('--no-fly-create-app', 'do NOT create the Fly app if it does not exist (default: create)')
-  .option('--fly-strategy <s>', 'deploy strategy: canary | rolling | bluegreen | immediate (default: canary)')
-  .option('--fly-secrets-file <path>', 'env-style file of secrets to stage via `fly secrets set` (default: <target>/.env.convoy-secrets)')
-  .option('--fly-bake-window <seconds>', 'observe-stage bake window in seconds (default: 60)', (v) => Number(v))
-  .option('--inject-failure <where>', 'inject a demo failure: rehearse|canary|concurrency (triggers medic with fixture logs; concurrency = serialised-renderer p99 breach)')
-  .option('--logs <path>', 'path to a file of log lines to feed medic when injecting a failure')
-  .option('--env-file <path>', 'env file to load into the subprocess during --real-rehearsal (default: target repo\'s .env.convoy-rehearsal)')
-  .option(
-    '--probe-path <path>',
-    'probe path for real rehearsal load (repeatable; default: the detected health path)',
-    (value: string, acc: string[]) => [...acc, value],
-    [] as string[],
-  )
-  .option('--probe-requests <n>', 'number of requests in the real rehearsal probe', (v) => Number(v))
-  .option('--probe-concurrency <n>', 'concurrency in the real rehearsal probe', (v) => Number(v))
-  .option('--env <kv>', 'env var to pass to the subprocess, KEY=VALUE (repeatable)', (value: string, acc: Record<string, string>) => {
-    const idx = value.indexOf('=');
-    if (idx > 0) acc[value.slice(0, idx)] = value.slice(idx + 1);
-    return acc;
-  }, {} as Record<string, string>)
-  .action(async (runId: string | undefined, options: ApplyOpts) => {
-    await runResume(runId, options);
-  });
+registerDeployFlags(
+  program
+    .command('resume [runId]')
+    .description('Continue a paused or failed run after fixing the code. Defaults to the most recent run. Skips stages already finished; replays from the first incomplete stage.')
+    .option('--fresh', 'create a new run row and replay every stage from scratch (default: continue the same run row, skip already-finished stages)')
+    .option('--platform <platform>', 'override the plan\'s chosen platform: fly | railway | vercel | cloudrun | vps — re-scored at apply time'),
+).action(async (runId: string | undefined, options: ApplyOpts) => {
+  await runResume(runId, options);
+});
 
 program
   .command('replay [runId]')
@@ -4277,7 +4280,7 @@ program
   .description('Discover what platforms, CI/CD, secrets, and observability this repo already uses. Run before `convoy plan` on an unfamiliar codebase.')
   .option('--json', 'emit full result as JSON')
   .action(async (targetPath: string | undefined, opts: { json?: boolean }) => {
-    const localPath = resolve(targetPath ?? '.');
+    const localPath = resolve(targetPath ?? targetInvocationDir());
     if (!existsSync(localPath)) {
       process.stderr.write(`${pc.red('error')} path not found: ${localPath}\n`);
       process.exit(1);
@@ -4335,7 +4338,7 @@ program
   .option('--answers <json>', 'pre-fill answers as JSON (for non-interactive/MCP use)')
   .option('--platform <platform>', 'set the platform mandate directly: fly | railway | vercel | cloudrun | vps (skips that question)')
   .action(async (targetPath: string | undefined, opts: { answers?: string; platform?: string }) => {
-    const localPath = resolve(targetPath ?? '.');
+    const localPath = resolve(targetPath ?? targetInvocationDir());
     if (!existsSync(localPath)) {
       process.stderr.write(`${pc.red('error')} path not found: ${localPath}\n`);
       process.exit(1);

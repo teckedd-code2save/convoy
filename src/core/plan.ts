@@ -74,8 +74,15 @@ export interface PlanDeployabilitySection {
 export interface PlanPlatformDecision {
   chosen: Platform;
   reason: string;
-  source: 'override' | 'existing-config' | 'scored' | 'refused';
+  source: 'mandate' | 'override' | 'existing-config' | 'scored' | 'refused';
   candidates: PlanPlatformCandidate[];
+  /**
+   * Set on lane decisions when the lane inherited the plan-level platform
+   * but would have scored a different platform standalone (issue #28).
+   * Rendered as a dim note in the CLI plan output and on the web lane card
+   * — the operator should see the disagreement, not be surprised by it.
+   */
+  advisory?: string;
 }
 
 export interface PlanPlatformAdjustment {
@@ -184,9 +191,22 @@ export interface LaneScanSummary {
   risks: PlanRisk[];
 }
 
+export interface ClassifiedLaneEnvKey {
+  key: string;
+  kind: 'secret' | 'config';
+  /**
+   * Non-empty value found in the example file. Config keys with a default
+   * are prefilled ("from example — confirm for production") instead of
+   * rendering as missing. Never set for secret-shaped keys.
+   */
+  defaultValue?: string;
+}
+
 export interface LaneSecretsSection {
   expectedKeys: string[];
   sources: string[];
+  /** Classified view of expectedKeys (issue #34). Absent on legacy plans. */
+  keys?: ClassifiedLaneEnvKey[];
 }
 
 export interface DeploymentLane {
@@ -539,6 +559,30 @@ export function renderPlan(plan: ConvoyPlan): string {
         `  - ${lane.displayName} [${lane.role}] ${lane.servicePath} → ${lane.platformDecision.chosen}` +
           `${lane.scan.framework ? ` (${lane.scan.framework})` : ''}`,
       );
+      if (lane.platformDecision.advisory) {
+        L.push(`      ${lane.platformDecision.advisory}`);
+      }
+    }
+    L.push('');
+  }
+
+  const lanesWithKeys = plan.lanes.filter((lane) => lane.secrets.expectedKeys.length > 0);
+  if (lanesWithKeys.length > 0) {
+    L.push('Secrets & config');
+    for (const lane of lanesWithKeys) {
+      const classified = lane.secrets.keys
+        ?? lane.secrets.expectedKeys.map((key) => ({ key, kind: 'secret' as const }));
+      const secrets = classified.filter((k) => k.kind === 'secret');
+      const config = classified.filter((k) => k.kind === 'config');
+      const label = plan.lanes.length > 1 ? `[${lane.role}:${lane.servicePath}] ` : '';
+      if (secrets.length > 0) {
+        L.push(`  ${label}Secrets (${secrets.length}): ${secrets.map((k) => k.key).join(', ')}`);
+      }
+      if (config.length > 0) {
+        L.push(`  ${label}Config (${config.length}): ${config
+          .map((k) => ('defaultValue' in k && k.defaultValue ? `${k.key} (from example — confirm for production)` : k.key))
+          .join(', ')}`);
+      }
     }
     L.push('');
   }
@@ -572,6 +616,9 @@ export function renderPlan(plan: ConvoyPlan): string {
       }
     } else {
       L.push(`    ${pd.reason}`);
+    }
+    if (pd.advisory) {
+      L.push(`    ${pd.advisory}`);
     }
   }
 
@@ -619,6 +666,9 @@ export function computePlatformAdvisory(plan: ConvoyPlan): string | null {
   }
   if (lane.platformDecision.source === 'override') {
     return `${topScored.platform} scored higher (${topScored.score} vs ${chosenScore}). You chose ${lane.platformDecision.chosen} explicitly — this is just a note, not a correction.`;
+  }
+  if (lane.platformDecision.source === 'mandate') {
+    return `${topScored.platform} scored higher (${topScored.score} vs ${chosenScore}). Your team mandate from onboard is ${lane.platformDecision.chosen} — Convoy honors it. Update with convoy onboard --platform=${topScored.platform} if the team moved.`;
   }
   return null;
 }

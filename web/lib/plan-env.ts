@@ -96,6 +96,29 @@ export function computeExpectedKeys(plan: PlanSummary): ExpectedKey[] {
   return [...seen.entries()].map(([key, source]) => ({ key, source }));
 }
 
+/**
+ * Non-empty values from the target's .env.example / .env.local.example,
+ * keyed by var name. Config keys with a default here are "prefilled —
+ * confirm for production" rather than missing (issue #34).
+ */
+export function computeExampleDefaults(plan: PlanSummary): Record<string, string> {
+  const defaults: Record<string, string> = {};
+  const targetCwd = plan.target.localPath;
+  for (const cand of ['.env.example', '.env.local.example']) {
+    const p = resolve(targetCwd, cand);
+    if (!existsSync(p)) continue;
+    try {
+      const values = parseEnvText(readFileSync(p, 'utf8'));
+      for (const [key, value] of Object.entries(values)) {
+        if (!(key in defaults)) defaults[key] = value;
+      }
+    } catch {
+      // unreadable — skip
+    }
+  }
+  return defaults;
+}
+
 export interface StagedState {
   stagedLocally: Set<string>;
   markedAlreadySet: Set<string>;

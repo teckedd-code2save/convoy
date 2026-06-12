@@ -143,6 +143,12 @@ export interface AuthHints {
 export interface SecretsHints {
   expectedKeys: string[];
   sources: string[];
+  /**
+   * Non-empty values found alongside keys in the example files. These are
+   * candidate defaults for config keys ("from example — confirm for
+   * production"), never trusted for secret-shaped keys.
+   */
+  defaults: Record<string, string>;
 }
 
 export interface ServiceNode {
@@ -260,13 +266,14 @@ export function scanRepository(localPath: string, opts: ScanOptions = {}): ScanR
   const sourceDirs = detectSourceDirs(ecosystem, topLevelDirs);
   const testDirs = detectTestDirs(topLevelDirs, allFiles);
 
-  const startCommand = scripts['start'] ?? scripts['serve'] ?? null;
   const buildCommand = scripts['build'] ?? null;
   const devCommand = scripts['dev'] ?? scripts['develop'] ?? null;
   const testCommand = scripts['test'] ?? null;
 
   const healthPath = detectHealthPath(scanPath, allFiles);
   const port = detectPort(packageJson, scripts, scanPath, allFiles);
+
+  const startCommand = deriveStartCommand(scanPath, scripts, topLevelFiles, ecosystem, port, evidence);
 
   const readme = readReadmeExcerpt(scanPath, topLevelFiles);
 
@@ -368,6 +375,8 @@ export function scanServiceGraph(localPath: string, opts: ScanOptions = {}): Ser
   for (const node of nodes) {
     node.dependsOn = inferDependencies(node, nodesById);
   }
+
+  attachRepoSharedEnvKeys(localPath, nodes);
 
   return {
     localPath,
@@ -781,6 +790,172 @@ function detectExistingPlatform(files: string[], evidence: string[]): Platform |
   return null;
 }
 
+/**
+ * Derive the start command from whatever the repo actually declares, in
+ * a fixed precedence order (issue #33). Previously only package.json
+ * scripts counted, so Python/Go/containerized repos hard-blocked real
+ * rehearsal with `no-start-command` even when the Dockerfile or Procfile
+ * spelled the command out. Each non-package.json source records its own
+ * evidence line so the plan shows where the command came from.
+ *
+ *  1. package.json scripts.start / scripts.serve
+ *  2. Dockerfile CMD/ENTRYPOINT (exec and shell forms)
+ *  3. Procfile `web:` line
+ *  4. Python: uvicorn/gunicorn/fastapi in requirements.txt/pyproject.toml
+ *     plus main.py/app.py at the service root → synthesized uvicorn command
+ *  5. docker-compose service `command:` when resolvable to one service
+ */
+function deriveStartCommand(
+  scanPath: string,
+  scripts: Record<string, string>,
+  topLevelFiles: string[],
+  ecosystem: Ecosystem,
+  port: number | null,
+  evidence: string[],
+): string | null {
+  const fromScripts = scripts['start'] ?? scripts['serve'] ?? null;
+  if (fromScripts) return fromScripts;
+
+  if (topLevelFiles.includes('Dockerfile')) {
+    const fromDockerfile = parseDockerfileStartCommand(tryReadFile(scanPath, 'Dockerfile') ?? '');
+    if (fromDockerfile) {
+      evidence.push('start command from Dockerfile CMD');
+      return fromDockerfile;
+    }
+  }
+
+  if (topLevelFiles.includes('Procfile')) {
+    const raw = tryReadFile(scanPath, 'Procfile') ?? '';
+    for (const line of raw.split('\n')) {
+      const m = line.match(/^web:\s*(.+)$/);
+      if (m?.[1]) {
+        evidence.push('start command from Procfile web: line');
+        return m[1].trim();
+      }
+    }
+  }
+
+  if (ecosystem === 'python') {
+    const manifests = [
+      tryReadFile(scanPath, 'requirements.txt'),
+      tryReadFile(scanPath, 'pyproject.toml'),
+    ].filter((raw): raw is string => raw !== null).join('\n');
+    const mentionsAsgiServer = /\b(uvicorn|gunicorn|fastapi)\b/i.test(manifests);
+    const module = topLevelFiles.includes('main.py')
+      ? 'main'
+      : topLevelFiles.includes('app.py')
+        ? 'app'
+        : null;
+    if (mentionsAsgiServer && module) {
+      evidence.push(`start command synthesized from Python signals (${module}.py + uvicorn/gunicorn/fastapi in manifest)`);
+      return `uvicorn ${module}:app --host 0.0.0.0 --port ${port ?? 8000}`;
+    }
+  }
+
+  const composeFile = topLevelFiles.find(
+    (f) => f === 'docker-compose.yml' || f === 'docker-compose.yaml' ||
+           f === 'compose.yml' || f === 'compose.yaml',
+  );
+  if (composeFile) {
+    const fromCompose = composeStartCommand(tryReadFile(scanPath, composeFile) ?? '', basename(scanPath));
+    if (fromCompose) {
+      evidence.push(`start command from ${composeFile} service command`);
+      return fromCompose;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Final CMD/ENTRYPOINT from a Dockerfile. Exec form (JSON array) joins to
+ * a shell string; shell form passes through. ENTRYPOINT + CMD compose as
+ * `entrypoint cmd...` per Docker semantics. Later instructions win.
+ */
+function parseDockerfileStartCommand(raw: string): string | null {
+  let cmd: string | null = null;
+  let entrypoint: string | null = null;
+  // Join line continuations so multi-line exec arrays parse in one pass.
+  const text = raw.replace(/\\\r?\n/g, ' ');
+  for (const line of text.split('\n')) {
+    const m = line.trim().match(/^(CMD|ENTRYPOINT)\s+(.+)$/i);
+    if (!m || !m[1] || !m[2]) continue;
+    const value = dockerInstructionToCommand(m[2].trim());
+    if (!value) continue;
+    if (m[1].toUpperCase() === 'CMD') cmd = value;
+    else entrypoint = value;
+  }
+  if (entrypoint && cmd) return `${entrypoint} ${cmd}`;
+  return cmd ?? entrypoint;
+}
+
+function dockerInstructionToCommand(value: string): string | null {
+  if (value.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (Array.isArray(parsed)) {
+        const joined = parsed.map((part) => String(part)).join(' ').trim();
+        return joined.length > 0 ? joined : null;
+      }
+    } catch {
+      // malformed exec form — fall through and treat it as shell form
+    }
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * Pull a `command:` out of a docker-compose file. Resolution is coarse and
+ * deterministic: the service whose name matches the scanned directory wins;
+ * otherwise, if exactly one service declares a command, use that. Multiple
+ * ambiguous commands → null (better no command than the wrong service's).
+ */
+function composeStartCommand(raw: string, serviceHint: string): string | null {
+  const lines = raw.split('\n');
+  let inServices = false;
+  let currentService: string | null = null;
+  const commands = new Map<string, string>();
+  for (const line of lines) {
+    if (/^services:\s*(#.*)?$/.test(line)) {
+      inServices = true;
+      continue;
+    }
+    if (/^\S/.test(line)) {
+      // a different top-level key ends the services block
+      inServices = false;
+      continue;
+    }
+    if (!inServices) continue;
+    const svc = line.match(/^ {2}([A-Za-z0-9_.-]+):\s*(#.*)?$/);
+    if (svc?.[1]) {
+      currentService = svc[1];
+      continue;
+    }
+    if (!currentService) continue;
+    const cmd = line.match(/^\s{4,}command:\s*(.+?)\s*$/);
+    if (cmd?.[1]) {
+      commands.set(currentService, normalizeComposeCommand(cmd[1]));
+    }
+  }
+  const hinted = commands.get(serviceHint.toLowerCase()) ?? commands.get(serviceHint);
+  if (hinted) return hinted;
+  if (commands.size === 1) return [...commands.values()][0] ?? null;
+  return null;
+}
+
+function normalizeComposeCommand(value: string): string {
+  if (value.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(value.replace(/'/g, '"')) as unknown;
+      if (Array.isArray(parsed)) return parsed.map((part) => String(part)).join(' ');
+    } catch {
+      // fall through to the string form
+    }
+  }
+  return value.replace(/^["']|["']$/g, '');
+}
+
 function readDockerfileBase(localPath: string): string | null {
   const raw = tryReadFile(localPath, 'Dockerfile');
   if (!raw) return null;
@@ -1169,6 +1344,14 @@ function detectAuthHints(scan: ScanResult): AuthHints {
   };
 }
 
+/**
+ * Per-lane env-key attribution (issue #34). Keys belong to a lane when the
+ * lane declares them itself: a `<servicePath>/.env.example`, or the
+ * docker-compose service block for that lane (`environment:` entries and
+ * `env_file:` files). Root-level example files are NOT inherited by every
+ * lane anymore — repo-shared keys are attached once, to the primary lane,
+ * by scanServiceGraph after all nodes are built.
+ */
 function detectSecretsHints(
   localPath: string,
   servicePath: string,
@@ -1176,34 +1359,205 @@ function detectSecretsHints(
 ): SecretsHints {
   const expected = new Set<string>();
   const sources: string[] = [];
+  const defaults: Record<string, string> = {};
   const serviceRoot = servicePath === '.' ? localPath : join(localPath, servicePath);
+
   for (const candidate of ['.env.schema', '.env.example', '.env.local.example']) {
-    const raw = tryReadFile(serviceRoot, candidate) ?? tryReadFile(localPath, candidate);
+    // Service-local files only. The root fallback used to copy the repo's
+    // entire .env.example into every lane, so both lanes listed identical
+    // keys — root keys are now attributed once by scanServiceGraph.
+    const raw = tryReadFile(serviceRoot, candidate);
     if (!raw) continue;
-    const keys = extractEnvKeys(raw);
-    if (keys.length === 0) continue;
-    keys.forEach((key) => expected.add(key));
-    sources.push(candidate);
+    const entries = extractEnvEntries(raw);
+    if (entries.length === 0) continue;
+    for (const { key, value } of entries) {
+      expected.add(key);
+      if (value.length > 0) defaults[key] = value;
+    }
+    sources.push(servicePath === '.' ? candidate : `${servicePath}/${candidate}`);
   }
+
+  // docker-compose attribution: the service block matching this lane
+  // declares env keys for it.
+  if (servicePath !== '.') {
+    const composeFile = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']
+      .find((f) => tryReadFile(localPath, f) !== null);
+    if (composeFile) {
+      const services = parseComposeServiceEnv(tryReadFile(localPath, composeFile) ?? '');
+      const match = matchComposeService(services, servicePath);
+      if (match) {
+        if (match.environmentKeys.length > 0) {
+          match.environmentKeys.forEach((key) => expected.add(key));
+          sources.push(`${composeFile} (${match.name}.environment)`);
+        }
+        for (const envFile of match.envFiles) {
+          const raw = tryReadFile(localPath, envFile);
+          if (!raw) continue;
+          const entries = extractEnvEntries(raw);
+          if (entries.length === 0) continue;
+          for (const { key, value } of entries) {
+            expected.add(key);
+            if (value.length > 0) defaults[key] = value;
+          }
+          sources.push(`${composeFile} (${match.name}.env_file: ${envFile})`);
+        }
+      }
+    }
+  }
+
   if (scan.dataLayer.some((layer) => layer.includes('postgres'))) expected.add('DATABASE_URL');
   if (scan.dataLayer.includes('redis')) expected.add('REDIS_URL');
   return {
     expectedKeys: [...expected].sort(),
     sources,
+    defaults,
   };
 }
 
-function extractEnvKeys(text: string): string[] {
-  const out: string[] = [];
+interface ComposeServiceEnv {
+  name: string;
+  buildContext: string | null;
+  environmentKeys: string[];
+  envFiles: string[];
+}
+
+/**
+ * Coarse line-based parse of per-service `environment:` / `env_file:` /
+ * `build:` from a compose file. Handles list (`- KEY=value`, `- KEY`) and
+ * map (`KEY: value`) environment forms, scalar and list env_file forms,
+ * and inline or nested (`build: { context: ... }`) build contexts.
+ */
+function parseComposeServiceEnv(raw: string): ComposeServiceEnv[] {
+  const out: ComposeServiceEnv[] = [];
+  let inServices = false;
+  let current: ComposeServiceEnv | null = null;
+  let mode: 'none' | 'environment' | 'env_file' | 'build' = 'none';
+  for (const line of raw.split('\n')) {
+    if (/^services:\s*(#.*)?$/.test(line)) {
+      inServices = true;
+      continue;
+    }
+    if (/^\S/.test(line)) {
+      inServices = false;
+      current = null;
+      mode = 'none';
+      continue;
+    }
+    if (!inServices) continue;
+    const svc = line.match(/^ {2}([A-Za-z0-9_.-]+):\s*(#.*)?$/);
+    if (svc?.[1]) {
+      current = { name: svc[1], buildContext: null, environmentKeys: [], envFiles: [] };
+      out.push(current);
+      mode = 'none';
+      continue;
+    }
+    if (!current) continue;
+
+    const buildInline = line.match(/^ {4}build:\s*(\S.*?)\s*$/);
+    if (buildInline?.[1]) {
+      current.buildContext = buildInline[1];
+      mode = 'none';
+      continue;
+    }
+    if (/^ {4}build:\s*$/.test(line)) {
+      mode = 'build';
+      continue;
+    }
+    if (/^ {4}environment:\s*$/.test(line)) {
+      mode = 'environment';
+      continue;
+    }
+    const envFileInline = line.match(/^ {4}env_file:\s*(\S.*?)\s*$/);
+    if (envFileInline?.[1]) {
+      current.envFiles.push(stripQuotes(envFileInline[1]));
+      mode = 'none';
+      continue;
+    }
+    if (/^ {4}env_file:\s*$/.test(line)) {
+      mode = 'env_file';
+      continue;
+    }
+    if (/^ {4}\S/.test(line)) {
+      // a different service-level key ends any sub-block
+      mode = 'none';
+      continue;
+    }
+
+    if (mode === 'environment') {
+      const listItem = line.match(/^ {6,}-\s*(.+?)\s*$/);
+      if (listItem?.[1]) {
+        const entry = stripQuotes(listItem[1]);
+        const key = entry.split('=')[0]?.trim();
+        if (key && /^[A-Z_][A-Z0-9_]*$/i.test(key)) current.environmentKeys.push(key);
+        continue;
+      }
+      const mapItem = line.match(/^ {6,}([A-Za-z_][A-Za-z0-9_]*):/);
+      if (mapItem?.[1]) current.environmentKeys.push(mapItem[1]);
+    } else if (mode === 'env_file') {
+      const listItem = line.match(/^ {6,}-\s*(.+?)\s*$/);
+      if (listItem?.[1]) current.envFiles.push(stripQuotes(listItem[1]));
+    } else if (mode === 'build') {
+      const ctx = line.match(/^ {6,}context:\s*(\S.*?)\s*$/);
+      if (ctx?.[1]) current.buildContext = stripQuotes(ctx[1]);
+    }
+  }
+  return out;
+}
+
+function matchComposeService(
+  services: ComposeServiceEnv[],
+  servicePath: string,
+): ComposeServiceEnv | null {
+  const normalized = servicePath.replace(/^\.\//, '');
+  for (const svc of services) {
+    const ctx = svc.buildContext?.replace(/^\.\//, '').replace(/\/$/, '');
+    if (ctx && ctx === normalized) return svc;
+  }
+  const base = basename(normalized).toLowerCase();
+  return services.find((svc) => svc.name.toLowerCase() === base) ?? null;
+}
+
+function stripQuotes(value: string): string {
+  return value.replace(/^["']|["']$/g, '');
+}
+
+function extractEnvEntries(text: string): { key: string; value: string }[] {
+  const out: { key: string; value: string }[] = [];
   for (const line of text.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
     const idx = trimmed.indexOf('=');
     if (idx <= 0) continue;
     const key = trimmed.slice(0, idx).trim();
-    if (/^[A-Z_][A-Z0-9_]*$/i.test(key)) out.push(key);
+    const value = trimmed.slice(idx + 1).trim().replace(/^["']|["']$/g, '');
+    if (/^[A-Z_][A-Z0-9_]*$/i.test(key)) out.push({ key, value });
   }
   return out;
+}
+
+/**
+ * Root-level .env example keys are repo-shared: attribute them ONCE, to the
+ * primary lane, instead of duplicating them into every lane (issue #34).
+ * Keys a lane already claimed (service-local file, compose block, data
+ * layer) are left alone.
+ */
+function attachRepoSharedEnvKeys(localPath: string, nodes: ServiceNode[]): void {
+  const primary = nodes[0];
+  if (!primary || primary.path === '.') return; // root lane already reads root files itself
+  const claimed = new Set(nodes.flatMap((node) => node.secretsHints.expectedKeys));
+  for (const candidate of ['.env.schema', '.env.example', '.env.local.example']) {
+    const raw = tryReadFile(localPath, candidate);
+    if (!raw) continue;
+    const fresh = extractEnvEntries(raw).filter(({ key }) => !claimed.has(key));
+    if (fresh.length === 0) continue;
+    for (const { key, value } of fresh) {
+      primary.secretsHints.expectedKeys.push(key);
+      claimed.add(key);
+      if (value.length > 0) primary.secretsHints.defaults[key] = value;
+    }
+    primary.secretsHints.sources.push(`${candidate} (repo-shared)`);
+  }
+  primary.secretsHints.expectedKeys.sort();
 }
 
 function inferDependencies(
