@@ -1839,6 +1839,47 @@ async function appendVpsPreflight(
     return;
   }
 
+  // DNS preflight: only when Caddy management is on and a domain is provided.
+  // Caddy needs TLS — if the domain doesn't point at the box, ACME fails.
+  const domain = opts.vpsDomain;
+  if (opts.vpsManageCaddy && domain) {
+    const { checkDomainDns } = await import('./core/dns-preflight.js');
+    const dnsResult = await checkDomainDns(domain, host);
+    switch (dnsResult.status) {
+      case 'match':
+        report.checks.push({ name: 'dns', ok: true, detail: `${domain} → ${dnsResult.vpsIp}` });
+        break;
+      case 'no-record':
+        report.blockers.push({
+          id: 'vps.dns.no-record',
+          title: `${domain} has no A/AAAA record`,
+          detail: `Caddy cannot obtain a TLS certificate until the domain resolves. Add an A record:\n  A ${domain} → ${dnsResult.vpsIp ?? host}\nIf proxied through Cloudflare, set it to DNS-only (grey cloud) so ACME HTTP-01 works.`,
+          severity: 'hard',
+          fixes: [
+            { kind: 'manual', label: `Add A record: ${domain} → ${dnsResult.vpsIp ?? host}`, autoFixable: false },
+            { kind: 'flag', label: 'Skip Caddy TLS management (bring your own nginx/proxy)', flag: '--no-vps-manage-caddy', autoFixable: false },
+          ],
+        });
+        report.checks.push({ name: 'dns', ok: false, detail: `${domain} has no A record` });
+        break;
+      case 'mismatch':
+        report.blockers.push({
+          id: 'vps.dns.mismatch',
+          title: `${domain} resolves to ${dnsResult.domainIps.join(', ')} — VPS is ${dnsResult.vpsIp}`,
+          detail: `Traffic will not reach this deploy. Update the A record to point at your VPS:\n  A ${domain} → ${dnsResult.vpsIp}`,
+          severity: 'hard',
+          fixes: [
+            { kind: 'manual', label: `Update A record: ${domain} → ${dnsResult.vpsIp}`, autoFixable: false },
+          ],
+        });
+        report.checks.push({ name: 'dns', ok: false, detail: `${domain} → ${dnsResult.domainIps.join(',')} (want ${dnsResult.vpsIp})` });
+        break;
+      case 'unresolved-host':
+        report.checks.push({ name: 'dns', ok: false, detail: `DNS probe failed: ${dnsResult.reason}` });
+        break;
+    }
+  }
+
   report.checks.push({
     name: 'real vps',
     ok: true,

@@ -321,7 +321,7 @@ function AuthorSection({ files }: { files: PlanAuthoredFile[] }) {
               <span className="text-muted text-xs hidden group-open:inline">hide</span>
             </summary>
             <pre className="px-5 py-4 text-xs overflow-auto bg-ink text-paper leading-relaxed">
-              <code>{file.contentPreview}</code>
+              <code>{file.contentPreview || '# Preview not available — re-run convoy plan to regenerate'}</code>
             </pre>
           </details>
         ))}

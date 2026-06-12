@@ -5,7 +5,7 @@ export interface PlanAuthoredFile {
   path: string;
   lines: number;
   summary: string;
-  contentPreview: string;
+  contentPreview?: string;
 }
 
 export interface PlanPlatformCandidate {

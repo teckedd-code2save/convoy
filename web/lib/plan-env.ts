@@ -72,7 +72,7 @@ export function computeExpectedKeys(plan: PlanSummary): ExpectedKey[] {
 
   const schemaFile = plan.author.convoyAuthoredFiles.find((f) => f.path === '.env.schema');
   if (schemaFile) {
-    for (const k of extractEnvKeys(schemaFile.contentPreview)) {
+    for (const k of extractEnvKeys(schemaFile.contentPreview ?? '')) {
       if (!seen.has(k)) seen.set(k, 'schema');
     }
   }
