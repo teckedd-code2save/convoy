@@ -30,6 +30,14 @@ export interface BuildPlanOptions {
   branch?: string;
   sha?: string;
   platformOverride?: Platform;
+  /**
+   * Team platform mandate from .convoy/preferences.json (set at onboard).
+   * Wins over scoring and existing-config detection, loses only to an
+   * explicit --platform override. Carries its own provenance so the plan
+   * says "mandate", not "override" — the operator should see their
+   * onboarding answer honored, not a CLI flag they never passed.
+   */
+  platformMandate?: Platform;
   workspace?: string;
   ai?: EnrichmentOptions;
   /**
@@ -53,10 +61,10 @@ export async function buildPlan(
   const graph = scanServiceGraph(localPath, opts.workspace ? { workspace: opts.workspace } : {});
 
   const deployability = toPlanDeployability(scan);
-  const platform = resolvePlatform(scan, opts.platformOverride, deployability, opts.platformAdjustments);
+  const platform = resolvePlatform(scan, opts.platformOverride, deployability, opts.platformAdjustments, opts.platformMandate);
   const lanes = deployability.verdict === 'not-cloud-deployable'
     ? [] as DeploymentLane[]
-    : graph.nodes.map((node) => buildLane(node, opts.platformOverride, opts.platformAdjustments));
+    : graph.nodes.map((node) => buildLane(node, opts.platformOverride, opts.platformAdjustments, opts.platformMandate));
   const dependencies = buildDependencies(lanes);
   const connectionRequirements = buildConnectionRequirements(lanes);
   // Each lane's files are already path-prefixed by draftAuthorSection (e.g.
@@ -135,8 +143,9 @@ function buildLane(
   node: ServiceNode,
   override?: Platform,
   adjustments?: PlatformAdjustments,
+  mandate?: Platform,
 ): DeploymentLane {
-  const platformDecision = pickPlatformForLane(node, override, adjustments);
+  const platformDecision = pickPlatformForLane(node, override, adjustments, mandate);
   const author = draftAuthorSection(node.scan, platformDecision.chosen, node.path);
   const rehearsal = defaultRehearsal(node.scan, platformDecision.chosen);
   const promotion = defaultPromotion();
@@ -243,6 +252,7 @@ function resolvePlatform(
   override: Platform | undefined,
   deployability: PlanDeployabilitySection,
   adjustments?: PlatformAdjustments,
+  mandate?: Platform,
 ): PlanPlatformDecision {
   if (deployability.verdict === 'not-cloud-deployable') {
     return {
@@ -253,7 +263,7 @@ function resolvePlatform(
       candidates: [],
     };
   }
-  return pickPlatform(scan, override, adjustments);
+  return pickPlatform(scan, override, adjustments, mandate);
 }
 
 function toPlanRisks(scan: ScanResult): PlanRisk[] {

@@ -18,12 +18,21 @@ export function pickPlatform(
   scan: ScanResult,
   override?: Platform,
   extraAdjustments?: PlatformAdjustments,
+  mandate?: Platform,
 ): PlanPlatformDecision {
   if (override !== undefined) {
     return {
       chosen: override,
       reason: `respecting explicit --platform=${override} override`,
       source: 'override',
+      candidates: scoreAll(scan, extraAdjustments),
+    };
+  }
+  if (mandate !== undefined) {
+    return {
+      chosen: mandate,
+      reason: `honoring the team platform mandate (${mandate}) declared at onboard — .convoy/preferences.json`,
+      source: 'mandate',
       candidates: scoreAll(scan, extraAdjustments),
     };
   }
@@ -49,8 +58,9 @@ export function pickPlatformForLane(
   node: ServiceNode,
   override?: Platform,
   extraAdjustments?: PlatformAdjustments,
+  mandate?: Platform,
 ): PlanPlatformDecision {
-  return pickPlatform(node.scan, override, extraAdjustments);
+  return pickPlatform(node.scan, override, extraAdjustments, mandate);
 }
 
 function scoreAll(scan: ScanResult, extra?: PlatformAdjustments): PlanPlatformCandidate[] {

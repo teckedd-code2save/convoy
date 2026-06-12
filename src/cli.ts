@@ -646,9 +646,6 @@ async function runShip(
       ...(opts.strictDrift !== undefined && { strictDrift: opts.strictDrift }),
       interactive: true,
     });
-    if (mandate && platformOverride === undefined) {
-      platformOverride = mandate;
-    }
     thinking = startThinking();
 
     const byokKey = await resolveAnthropicKey(loadByokConfig(resolved.localPath));
@@ -657,6 +654,7 @@ async function runShip(
       ...(resolved.branch !== undefined && { branch: resolved.branch }),
       ...(resolved.sha !== undefined && { sha: resolved.sha }),
       ...(platformOverride !== undefined && { platformOverride }),
+      ...(mandate !== null && { platformMandate: mandate }),
       ...(opts.workspace !== undefined && { workspace: opts.workspace }),
       ...(adjustments !== undefined && { platformAdjustments: adjustments }),
       ai: opts.noAi ? { disable: true } : { ...(byokKey && { apiKey: byokKey }) },
@@ -761,9 +759,6 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
       ...(opts.strictDrift !== undefined && { strictDrift: opts.strictDrift }),
       interactive: !opts.json,
     });
-    if (mandate && !opts.platform) {
-      platformOverride = mandate;
-    }
     if (opts.vpsHost) {
       const { loadPreferences, mergePreferences, savePreferences } = await import('./onboard/preferences.js');
       const current = loadPreferences(resolved.localPath);
@@ -782,6 +777,7 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
       ...(resolved.branch !== undefined && { branch: resolved.branch }),
       ...(resolved.sha !== undefined && { sha: resolved.sha }),
       ...(platformOverride !== undefined && { platformOverride }),
+      ...(mandate !== null && { platformMandate: mandate }),
       ...(opts.workspace !== undefined && { workspace: opts.workspace }),
       ...(adjustments !== undefined && { platformAdjustments: adjustments }),
       ai: opts.noAi ? { disable: true } : { ...(byokKey && { apiKey: byokKey }) },

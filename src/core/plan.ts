@@ -74,7 +74,7 @@ export interface PlanDeployabilitySection {
 export interface PlanPlatformDecision {
   chosen: Platform;
   reason: string;
-  source: 'override' | 'existing-config' | 'scored' | 'refused';
+  source: 'mandate' | 'override' | 'existing-config' | 'scored' | 'refused';
   candidates: PlanPlatformCandidate[];
 }
 
@@ -619,6 +619,9 @@ export function computePlatformAdvisory(plan: ConvoyPlan): string | null {
   }
   if (lane.platformDecision.source === 'override') {
     return `${topScored.platform} scored higher (${topScored.score} vs ${chosenScore}). You chose ${lane.platformDecision.chosen} explicitly — this is just a note, not a correction.`;
+  }
+  if (lane.platformDecision.source === 'mandate') {
+    return `${topScored.platform} scored higher (${topScored.score} vs ${chosenScore}). Your team mandate from onboard is ${lane.platformDecision.chosen} — Convoy honors it. Update with convoy onboard --platform=${topScored.platform} if the team moved.`;
   }
   return null;
 }
