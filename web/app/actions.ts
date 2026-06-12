@@ -1,13 +1,14 @@
 'use server';
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, openSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import Anthropic from '@anthropic-ai/sdk';
 import { revalidatePath } from 'next/cache';
 
 import { probePlatformConnection } from '../../src/adapters/connections.js';
+import { buildPushContextFromPlan, pushSecretToPlatform as pushViaShared } from '../../src/core/secret-push.js';
 import { appendChatTurn, listChatTurns } from '@/lib/medic-chat';
 import {
   appendAlreadySet,
@@ -506,7 +507,10 @@ ${toolCallSummary || '(none recorded)'}`;
 // ---------------------------------------------------------------------------
 
 const VALID_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const SUPPORTED_PLATFORMS_LIST = ['fly', 'railway', 'vercel', 'cloudrun'];
+const SUPPORTED_PLATFORMS_LIST = ['fly', 'railway', 'vercel', 'cloudrun', 'vps'];
+// user@host, bare hostname, or IP. Conservative charset — the value travels
+// on argv (no shell), but we still refuse anything that isn't host-shaped.
+const VALID_VPS_HOST = /^[A-Za-z0-9](?:[A-Za-z0-9_.@:\-]*[A-Za-z0-9])?$/;
 
 /**
  * Stage a KEY=value pair into the plan's .env.convoy-secrets file. If the
@@ -850,10 +854,18 @@ export async function applyPlan(
 export async function changePlanPlatform(
   planId: string,
   platform: string,
+  vpsHost?: string,
 ): Promise<{ ok: boolean; newPlanId?: string; reason?: string }> {
   if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId' };
   if (!SUPPORTED_PLATFORMS_LIST.includes(platform)) {
     return { ok: false, reason: `platform must be one of ${SUPPORTED_PLATFORMS_LIST.join(', ')}` };
+  }
+  const host = typeof vpsHost === 'string' ? vpsHost.trim() : '';
+  if (platform === 'vps') {
+    if (host.length === 0) return { ok: false, reason: 'vps needs a host — enter an IP or hostname' };
+    if (host.length > 253 || !VALID_VPS_HOST.test(host)) {
+      return { ok: false, reason: 'invalid host — expected user@host, a hostname, or an IP' };
+    }
   }
   const plan = getPlan(planId);
   if (!plan) return { ok: false, reason: 'plan not found' };
@@ -869,6 +881,11 @@ export async function changePlanPlatform(
     '--no-ai',
     `--platform=${platform}`,
   ];
+  if (platform === 'vps' && host.length > 0) {
+    // The CLI threads this into the picker (CONVOY_VPS_HOST) and persists
+    // it to team preferences so the input pre-fills next time.
+    args.push(`--vps-host=${host}`);
+  }
   if (plan.target.repoUrl) {
     args.push(`--repo-url=${plan.target.repoUrl}`);
   }
@@ -903,4 +920,55 @@ export async function changePlanPlatform(
 
   revalidatePath('/');
   return { ok: true, newPlanId: match[1] };
+}
+
+/**
+ * Push one already-staged secret to the plan's chosen platform (issue #22).
+ * Reads the value from the plan's local .env.convoy-secrets (the row must be
+ * staged first) and hands it to the shared push module — the same code path
+ * `convoy stage-secrets` uses, so CLI and web can't drift apart.
+ *
+ * Never throws; a failed push returns the graceful "saved locally" fallback
+ * so the UI can render it inline. The local staging is untouched either way.
+ */
+export async function pushStagedSecret(
+  planId: string,
+  key: string,
+): Promise<{ ok: boolean; platform?: string; reason?: string }> {
+  if (!planId || typeof planId !== 'string') return { ok: false, reason: 'invalid planId' };
+  if (!key || !VALID_ENV_KEY.test(key)) return { ok: false, reason: 'invalid env key' };
+
+  const plan = getPlan(planId);
+  if (!plan) return { ok: false, reason: 'plan not found' };
+
+  const { secretsPath } = computeStagedState(plan);
+  let value: string | undefined;
+  try {
+    const text = existsSync(secretsPath) ? readFileSync(secretsPath, 'utf8') : '';
+    value = parseEnvText(text)[key];
+  } catch (err) {
+    return { ok: false, reason: `could not read staged secrets: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (value === undefined || value.length === 0) {
+    return { ok: false, reason: 'key is not staged locally — stage a value first' };
+  }
+
+  try {
+    const ctx = await buildPushContextFromPlan(plan);
+    const result = await pushViaShared(key, value, ctx);
+    if (result.ok) {
+      revalidatePath(`/plans/${planId}`);
+      return { ok: true, platform: ctx.platform };
+    }
+    return {
+      ok: false,
+      platform: ctx.platform,
+      reason: `saved locally — ${result.reason ?? 'push failed'}; will be staged at deploy time`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `saved locally — ${err instanceof Error ? err.message : String(err)}; will be staged at deploy time`,
+    };
+  }
 }

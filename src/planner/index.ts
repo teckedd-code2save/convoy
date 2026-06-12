@@ -21,7 +21,7 @@ import type { Platform } from '../core/types.js';
 
 import { draftAuthorSection } from './author.js';
 import { enrichPlan, type EnrichmentOptions } from './enricher.js';
-import { pickPlatform, pickPlatformForLane } from './picker.js';
+import { pickPlatform, pickPlatformForLane, type PlatformAdjustments } from './picker.js';
 import { scanRepository, scanServiceGraph, repoName, type ScanResult, type ServiceNode } from './scanner.js';
 import { resolveTarget, type ResolveOptions, type TargetResolution } from './target-resolver.js';
 
@@ -32,6 +32,12 @@ export interface BuildPlanOptions {
   platformOverride?: Platform;
   workspace?: string;
   ai?: EnrichmentOptions;
+  /**
+   * Extra score deltas from the orient pass (existing platform configs, CI
+   * deploy steps, VPS host in team preferences). Surfaced in the candidate
+   * score table like any scanner-derived adjustment.
+   */
+  platformAdjustments?: PlatformAdjustments;
 }
 
 export type BuildPlanResult = {
@@ -47,10 +53,10 @@ export async function buildPlan(
   const graph = scanServiceGraph(localPath, opts.workspace ? { workspace: opts.workspace } : {});
 
   const deployability = toPlanDeployability(scan);
-  const platform = resolvePlatform(scan, opts.platformOverride, deployability);
+  const platform = resolvePlatform(scan, opts.platformOverride, deployability, opts.platformAdjustments);
   const lanes = deployability.verdict === 'not-cloud-deployable'
     ? [] as DeploymentLane[]
-    : graph.nodes.map((node) => buildLane(node, opts.platformOverride));
+    : graph.nodes.map((node) => buildLane(node, opts.platformOverride, opts.platformAdjustments));
   const dependencies = buildDependencies(lanes);
   const connectionRequirements = buildConnectionRequirements(lanes);
   // Each lane's files are already path-prefixed by draftAuthorSection (e.g.
@@ -125,8 +131,12 @@ export async function buildPlan(
   return { plan: enriched.plan, enrichmentSource: enriched.source };
 }
 
-function buildLane(node: ServiceNode, override?: Platform): DeploymentLane {
-  const platformDecision = pickPlatformForLane(node, override);
+function buildLane(
+  node: ServiceNode,
+  override?: Platform,
+  adjustments?: PlatformAdjustments,
+): DeploymentLane {
+  const platformDecision = pickPlatformForLane(node, override, adjustments);
   const author = draftAuthorSection(node.scan, platformDecision.chosen, node.path);
   const rehearsal = defaultRehearsal(node.scan, platformDecision.chosen);
   const promotion = defaultPromotion();
@@ -232,6 +242,7 @@ function resolvePlatform(
   scan: ScanResult,
   override: Platform | undefined,
   deployability: PlanDeployabilitySection,
+  adjustments?: PlatformAdjustments,
 ): PlanPlatformDecision {
   if (deployability.verdict === 'not-cloud-deployable') {
     return {
@@ -242,7 +253,7 @@ function resolvePlatform(
       candidates: [],
     };
   }
-  return pickPlatform(scan, override);
+  return pickPlatform(scan, override, adjustments);
 }
 
 function toPlanRisks(scan: ScanResult): PlanRisk[] {

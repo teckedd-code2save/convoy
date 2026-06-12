@@ -9,6 +9,7 @@ import {
   changePlanPlatform,
   importEnvVars,
   markEnvVarAlreadySet,
+  pushStagedSecret,
   setRecurring,
   stageEnvVar,
   unstageEnvVar,
@@ -28,6 +29,7 @@ export function ConfigPanel({
   alternatives,
   secretsPath,
   alreadySetPath,
+  vpsHost = '',
 }: {
   planId: string;
   platform: string;
@@ -36,6 +38,7 @@ export function ConfigPanel({
   alternatives: string[];
   secretsPath: string;
   alreadySetPath: string;
+  vpsHost?: string;
 }) {
   const staged = rows.filter((r) => r.state !== 'missing').length;
   const missing = rows.length - staged;
@@ -82,6 +85,7 @@ export function ConfigPanel({
           planId={planId}
           current={platform}
           alternatives={alternatives}
+          initialVpsHost={vpsHost}
         />
 
         {rows.length === 0 ? (
@@ -121,6 +125,7 @@ export function ConfigPanel({
                 <li key={row.key}>
                   <EnvRow
                     planId={planId}
+                    platform={platform}
                     row={row}
                     checked={selected.has(row.key)}
                     editing={editingKey === row.key}
@@ -200,21 +205,31 @@ function PlatformSwitchRow({
   planId,
   current,
   alternatives,
+  initialVpsHost,
 }: {
   planId: string;
   current: string;
   alternatives: string[];
+  initialVpsHost: string;
 }) {
   const router = useRouter();
   const [choice, setChoice] = useState(current);
+  const [host, setHost] = useState(initialVpsHost);
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
 
+  const needsHost = choice === 'vps';
+  const hostMissing = needsHost && host.trim().length === 0;
+
   const submit = () => {
-    if (choice === current) return;
+    if (choice === current || hostMissing) return;
     setError(null);
     startTransition(async () => {
-      const result = await changePlanPlatform(planId, choice);
+      const result = await changePlanPlatform(
+        planId,
+        choice,
+        needsHost ? host.trim() : undefined,
+      );
       if (!result.ok) {
         setError(result.reason ?? 'failed');
         return;
@@ -246,10 +261,24 @@ function PlatformSwitchRow({
             </option>
           ))}
         </select>
+        {needsHost ? (
+          <input
+            type="text"
+            value={host}
+            onChange={(e) => setHost(e.target.value)}
+            placeholder="IP or hostname (e.g. root@203.0.113.7)"
+            disabled={pending}
+            spellCheck={false}
+            autoComplete="off"
+            aria-label="VPS host"
+            className="text-sm font-mono bg-paper border border-rule rounded-md px-2 py-1 min-w-[220px] focus:border-accent focus:outline-none disabled:opacity-50"
+          />
+        ) : null}
         <button
           type="button"
           onClick={submit}
-          disabled={pending || choice === current}
+          disabled={pending || choice === current || hostMissing}
+          title={hostMissing ? 'vps needs a host — enter an IP or hostname' : undefined}
           className="text-xs font-medium px-3 py-1.5 rounded-md bg-ink text-paper hover:bg-ink/80 disabled:opacity-40 disabled:cursor-not-allowed transition"
         >
           {pending ? 'replanning…' : 're-plan'}
@@ -550,6 +579,7 @@ function BulkBar({
 
 function EnvRow({
   planId,
+  platform,
   row,
   checked,
   editing,
@@ -558,6 +588,7 @@ function EnvRow({
   onFinishEdit,
 }: {
   planId: string;
+  platform: string;
   row: PanelRow;
   checked: boolean;
   editing: boolean;
@@ -568,6 +599,24 @@ function EnvRow({
   const [pending, startTransition] = useTransition();
   const [value, setValue] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [pushState, setPushState] = useState<
+    | { kind: 'idle' }
+    | { kind: 'pushing' }
+    | { kind: 'pushed'; platform: string }
+    | { kind: 'failed'; message: string }
+  >({ kind: 'idle' });
+
+  const push = () => {
+    setPushState({ kind: 'pushing' });
+    startTransition(async () => {
+      const result = await pushStagedSecret(planId, row.key);
+      if (result.ok) {
+        setPushState({ kind: 'pushed', platform: result.platform ?? platform });
+      } else {
+        setPushState({ kind: 'failed', message: result.reason ?? 'push failed' });
+      }
+    });
+  };
 
   const runAction = (action: () => Promise<{ ok: boolean; reason?: string }>) => {
     setError(null);
@@ -617,6 +666,17 @@ function EnvRow({
         </span>
         {!showInput ? (
           <div className="ml-auto flex items-center gap-2">
+            {row.state === 'staged' ? (
+              <button
+                type="button"
+                onClick={push}
+                disabled={pending}
+                title={`Push the staged value to ${platform} via its CLI. Falls back to deploy-time staging if the CLI or auth is missing.`}
+                className="text-[10px] uppercase tracking-wider text-accent hover:text-ink disabled:opacity-40"
+              >
+                {pushState.kind === 'pushing' ? 'pushing…' : `push to ${platform}`}
+              </button>
+            ) : null}
             <button
               type="button"
               onClick={onStartEdit}
@@ -636,6 +696,12 @@ function EnvRow({
           </div>
         ) : null}
       </div>
+
+      {pushState.kind === 'pushed' ? (
+        <div className="text-xs text-success">✓ pushed to {pushState.platform}</div>
+      ) : pushState.kind === 'failed' ? (
+        <div className="text-xs text-warn">⚠ {pushState.message}</div>
+      ) : null}
 
       {showInput ? (
         <div className="flex items-center gap-2 flex-wrap">

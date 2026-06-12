@@ -69,10 +69,19 @@ async function pollRailwayStatus(cwd: string, projectId?: string): Promise<strin
 
 export async function railwaySetSecrets(secrets: Record<string, string>, cwd: string, projectId?: string): Promise<void> {
   for (const [key, value] of Object.entries(secrets)) {
-    const args = ['variables', 'set', `${key}=${value}`];
-    if (projectId) args.push('--project', projectId);
-    await exec('railway', args, { cwd });
+    await railwaySetVariable(key, value, cwd, projectId);
   }
+}
+
+/**
+ * Set a single variable on the linked Railway service. Modern Railway CLI
+ * syntax is `railway variables --set KEY=value`; requires the cwd to be
+ * linked (`railway link`) or a project id.
+ */
+export async function railwaySetVariable(key: string, value: string, cwd: string, projectId?: string): Promise<void> {
+  const args = ['variables', '--set', `${key}=${value}`];
+  if (projectId) args.push('--project', projectId);
+  await exec('railway', args, { cwd });
 }
 
 export async function railwayRollback(cwd: string, projectId?: string): Promise<RailwayRollbackResult> {

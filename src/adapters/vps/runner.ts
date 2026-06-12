@@ -1,4 +1,7 @@
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 /**
  * Low-level VPS deploy primitives over SSH + rsync. Convoy is the control
@@ -111,6 +114,72 @@ export async function sshAvailable(): Promise<boolean> {
 export async function rsyncAvailable(): Promise<boolean> {
   const result = await spawnCapture('rsync', ['--version'], { timeoutMs: 2000 });
   return result.ok;
+}
+
+/**
+ * Look for the operator's default SSH private keys (~/.ssh/id_ed25519,
+ * id_rsa, id_ecdsa). Discovery only — Convoy never generates keys; if none
+ * exist the caller prints the `ssh-keygen -t ed25519` recipe instead.
+ */
+export function discoverLocalSshKeys(): string[] {
+  const home = homedir();
+  const candidates = ['id_ed25519', 'id_rsa', 'id_ecdsa'];
+  const found: string[] = [];
+  for (const name of candidates) {
+    const p = join(home, '.ssh', name);
+    if (existsSync(p)) found.push(p);
+  }
+  return found;
+}
+
+export interface SshProbeResult {
+  status: 'connected' | 'auth-failed' | 'unreachable';
+  /** Remote user when connected (from `whoami`). */
+  user?: string;
+  /** Operator-facing line: what happened + the exact fix. */
+  detail: string;
+}
+
+/**
+ * Cheap connectivity + key-auth probe, run before bootstrap touches the box.
+ * `ssh -o BatchMode=yes -o ConnectTimeout=5 [-i key] user@host` with a
+ * sentinel command, classified into the three states an operator can act on:
+ *
+ *   connected    → exit 0, sentinel echoed back
+ *   auth-failed  → ssh reached the box but key auth was refused
+ *                  ("Permission denied" in stderr — fix: ssh-copy-id)
+ *   unreachable  → timeout / refused / no route ("check the IP and firewall")
+ */
+export async function probeSshAuth(
+  destination: string,
+  opts: { identityFile?: string; port?: number } = {},
+): Promise<SshProbeResult> {
+  const args: string[] = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5'];
+  if (opts.port) args.push('-p', String(opts.port));
+  if (opts.identityFile) args.push('-i', opts.identityFile);
+  args.push(destination, 'echo convoy-probe && whoami');
+
+  const result = await spawnCapture('ssh', args, { timeoutMs: 10_000 });
+  if (result.ok && result.stdout.includes('convoy-probe')) {
+    const user = result.stdout.split('\n').map((l) => l.trim()).filter(Boolean).pop() ?? '';
+    return {
+      status: 'connected',
+      ...(user && user !== 'convoy-probe' ? { user } : {}),
+      detail: `connected${user && user !== 'convoy-probe' ? ` as ${user}` : ''}`,
+    };
+  }
+
+  const stderr = result.stderr.toLowerCase();
+  if (/permission denied|too many authentication failures|no supported authentication/.test(stderr)) {
+    return {
+      status: 'auth-failed',
+      detail: `SSH key auth failed — upload your public key: ssh-copy-id ${destination} (or pass --ssh-key)`,
+    };
+  }
+  return {
+    status: 'unreachable',
+    detail: 'Host unreachable — check the IP and firewall',
+  };
 }
 
 /**

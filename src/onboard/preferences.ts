@@ -15,6 +15,8 @@ export interface DeployPreferences {
       autoRollback: boolean;
     };
     stagingApp: string | null;
+    /** SSH destination for the VPS lane (user@host or bare IP/hostname). */
+    vpsHost?: string | null;
   };
   platform: {
     mandate: string | null;
@@ -56,6 +58,7 @@ export const DEFAULT_PREFERENCES: Omit<DeployPreferences, 'version' | 'createdAt
     approvers: [],
     canary: { strategy: 'canary', trafficPercent: 5, bakeWindowSeconds: 120, autoRollback: true },
     stagingApp: null,
+    vpsHost: null,
   },
   platform: { mandate: null, budgetTier: 'startup' },
   release: { cadence: 'daily', gate: 'pr-merged', freezeDescription: null },

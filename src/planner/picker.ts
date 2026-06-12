@@ -4,16 +4,27 @@ import type { ScanResult, ServiceNode } from './scanner.js';
 
 const SUPPORTED: Platform[] = ['fly', 'railway', 'vercel', 'cloudrun', 'vps'];
 
+/**
+ * Extra adjustments fed in from outside the scan — today, the orient pass
+ * (issue #20): existing fly.toml / vercel.json / CI deploy steps / VPS host
+ * in team preferences. They flow through the same adjustments mechanism the
+ * deterministic scorer uses, so the deltas show up in the score table (CLI
+ * render, plan JSON, web candidate cards) instead of being invisible
+ * if-chains.
+ */
+export type PlatformAdjustments = Partial<Record<Platform, PlanPlatformAdjustment[]>>;
+
 export function pickPlatform(
   scan: ScanResult,
   override?: Platform,
+  extraAdjustments?: PlatformAdjustments,
 ): PlanPlatformDecision {
   if (override !== undefined) {
     return {
       chosen: override,
       reason: `respecting explicit --platform=${override} override`,
       source: 'override',
-      candidates: scoreAll(scan),
+      candidates: scoreAll(scan, extraAdjustments),
     };
   }
   if (scan.existingPlatform) {
@@ -21,10 +32,10 @@ export function pickPlatform(
       chosen: scan.existingPlatform,
       reason: `continuing existing ${scan.existingPlatform} setup detected in the repo`,
       source: 'existing-config',
-      candidates: scoreAll(scan),
+      candidates: scoreAll(scan, extraAdjustments),
     };
   }
-  const candidates = scoreAll(scan);
+  const candidates = scoreAll(scan, extraAdjustments);
   const top = candidates[0]!;
   return {
     chosen: top.platform,
@@ -37,17 +48,22 @@ export function pickPlatform(
 export function pickPlatformForLane(
   node: ServiceNode,
   override?: Platform,
+  extraAdjustments?: PlatformAdjustments,
 ): PlanPlatformDecision {
-  return pickPlatform(node.scan, override);
+  return pickPlatform(node.scan, override, extraAdjustments);
 }
 
-function scoreAll(scan: ScanResult): PlanPlatformCandidate[] {
-  const out = SUPPORTED.map((p) => scoreOne(p, scan));
+function scoreAll(scan: ScanResult, extra?: PlatformAdjustments): PlanPlatformCandidate[] {
+  const out = SUPPORTED.map((p) => scoreOne(p, scan, extra?.[p]));
   out.sort((a, b) => b.score - a.score);
   return out;
 }
 
-function scoreOne(platform: Platform, scan: ScanResult): PlanPlatformCandidate {
+function scoreOne(
+  platform: Platform,
+  scan: ScanResult,
+  extra?: PlanPlatformAdjustment[],
+): PlanPlatformCandidate {
   let score = 50;
   const adjustments: PlanPlatformAdjustment[] = [];
 
@@ -119,6 +135,10 @@ function scoreOne(platform: Platform, scan: ScanResult): PlanPlatformCandidate {
       if (scan.framework === 'next.js' && !hasWorker)   adj(-10, 'Next.js fits Vercel better unless you need a box');
       break;
     }
+  }
+
+  for (const a of extra ?? []) {
+    adj(a.delta, a.label);
   }
 
   score = Math.max(0, Math.min(100, score));
