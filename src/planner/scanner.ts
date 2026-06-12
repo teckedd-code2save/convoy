@@ -260,13 +260,14 @@ export function scanRepository(localPath: string, opts: ScanOptions = {}): ScanR
   const sourceDirs = detectSourceDirs(ecosystem, topLevelDirs);
   const testDirs = detectTestDirs(topLevelDirs, allFiles);
 
-  const startCommand = scripts['start'] ?? scripts['serve'] ?? null;
   const buildCommand = scripts['build'] ?? null;
   const devCommand = scripts['dev'] ?? scripts['develop'] ?? null;
   const testCommand = scripts['test'] ?? null;
 
   const healthPath = detectHealthPath(scanPath, allFiles);
   const port = detectPort(packageJson, scripts, scanPath, allFiles);
+
+  const startCommand = deriveStartCommand(scanPath, scripts, topLevelFiles, ecosystem, port, evidence);
 
   const readme = readReadmeExcerpt(scanPath, topLevelFiles);
 
@@ -779,6 +780,172 @@ function detectExistingPlatform(files: string[], evidence: string[]): Platform |
     return 'cloudrun';
   }
   return null;
+}
+
+/**
+ * Derive the start command from whatever the repo actually declares, in
+ * a fixed precedence order (issue #33). Previously only package.json
+ * scripts counted, so Python/Go/containerized repos hard-blocked real
+ * rehearsal with `no-start-command` even when the Dockerfile or Procfile
+ * spelled the command out. Each non-package.json source records its own
+ * evidence line so the plan shows where the command came from.
+ *
+ *  1. package.json scripts.start / scripts.serve
+ *  2. Dockerfile CMD/ENTRYPOINT (exec and shell forms)
+ *  3. Procfile `web:` line
+ *  4. Python: uvicorn/gunicorn/fastapi in requirements.txt/pyproject.toml
+ *     plus main.py/app.py at the service root → synthesized uvicorn command
+ *  5. docker-compose service `command:` when resolvable to one service
+ */
+function deriveStartCommand(
+  scanPath: string,
+  scripts: Record<string, string>,
+  topLevelFiles: string[],
+  ecosystem: Ecosystem,
+  port: number | null,
+  evidence: string[],
+): string | null {
+  const fromScripts = scripts['start'] ?? scripts['serve'] ?? null;
+  if (fromScripts) return fromScripts;
+
+  if (topLevelFiles.includes('Dockerfile')) {
+    const fromDockerfile = parseDockerfileStartCommand(tryReadFile(scanPath, 'Dockerfile') ?? '');
+    if (fromDockerfile) {
+      evidence.push('start command from Dockerfile CMD');
+      return fromDockerfile;
+    }
+  }
+
+  if (topLevelFiles.includes('Procfile')) {
+    const raw = tryReadFile(scanPath, 'Procfile') ?? '';
+    for (const line of raw.split('\n')) {
+      const m = line.match(/^web:\s*(.+)$/);
+      if (m?.[1]) {
+        evidence.push('start command from Procfile web: line');
+        return m[1].trim();
+      }
+    }
+  }
+
+  if (ecosystem === 'python') {
+    const manifests = [
+      tryReadFile(scanPath, 'requirements.txt'),
+      tryReadFile(scanPath, 'pyproject.toml'),
+    ].filter((raw): raw is string => raw !== null).join('\n');
+    const mentionsAsgiServer = /\b(uvicorn|gunicorn|fastapi)\b/i.test(manifests);
+    const module = topLevelFiles.includes('main.py')
+      ? 'main'
+      : topLevelFiles.includes('app.py')
+        ? 'app'
+        : null;
+    if (mentionsAsgiServer && module) {
+      evidence.push(`start command synthesized from Python signals (${module}.py + uvicorn/gunicorn/fastapi in manifest)`);
+      return `uvicorn ${module}:app --host 0.0.0.0 --port ${port ?? 8000}`;
+    }
+  }
+
+  const composeFile = topLevelFiles.find(
+    (f) => f === 'docker-compose.yml' || f === 'docker-compose.yaml' ||
+           f === 'compose.yml' || f === 'compose.yaml',
+  );
+  if (composeFile) {
+    const fromCompose = composeStartCommand(tryReadFile(scanPath, composeFile) ?? '', basename(scanPath));
+    if (fromCompose) {
+      evidence.push(`start command from ${composeFile} service command`);
+      return fromCompose;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Final CMD/ENTRYPOINT from a Dockerfile. Exec form (JSON array) joins to
+ * a shell string; shell form passes through. ENTRYPOINT + CMD compose as
+ * `entrypoint cmd...` per Docker semantics. Later instructions win.
+ */
+function parseDockerfileStartCommand(raw: string): string | null {
+  let cmd: string | null = null;
+  let entrypoint: string | null = null;
+  // Join line continuations so multi-line exec arrays parse in one pass.
+  const text = raw.replace(/\\\r?\n/g, ' ');
+  for (const line of text.split('\n')) {
+    const m = line.trim().match(/^(CMD|ENTRYPOINT)\s+(.+)$/i);
+    if (!m || !m[1] || !m[2]) continue;
+    const value = dockerInstructionToCommand(m[2].trim());
+    if (!value) continue;
+    if (m[1].toUpperCase() === 'CMD') cmd = value;
+    else entrypoint = value;
+  }
+  if (entrypoint && cmd) return `${entrypoint} ${cmd}`;
+  return cmd ?? entrypoint;
+}
+
+function dockerInstructionToCommand(value: string): string | null {
+  if (value.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (Array.isArray(parsed)) {
+        const joined = parsed.map((part) => String(part)).join(' ').trim();
+        return joined.length > 0 ? joined : null;
+      }
+    } catch {
+      // malformed exec form — fall through and treat it as shell form
+    }
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * Pull a `command:` out of a docker-compose file. Resolution is coarse and
+ * deterministic: the service whose name matches the scanned directory wins;
+ * otherwise, if exactly one service declares a command, use that. Multiple
+ * ambiguous commands → null (better no command than the wrong service's).
+ */
+function composeStartCommand(raw: string, serviceHint: string): string | null {
+  const lines = raw.split('\n');
+  let inServices = false;
+  let currentService: string | null = null;
+  const commands = new Map<string, string>();
+  for (const line of lines) {
+    if (/^services:\s*(#.*)?$/.test(line)) {
+      inServices = true;
+      continue;
+    }
+    if (/^\S/.test(line)) {
+      // a different top-level key ends the services block
+      inServices = false;
+      continue;
+    }
+    if (!inServices) continue;
+    const svc = line.match(/^ {2}([A-Za-z0-9_.-]+):\s*(#.*)?$/);
+    if (svc?.[1]) {
+      currentService = svc[1];
+      continue;
+    }
+    if (!currentService) continue;
+    const cmd = line.match(/^\s{4,}command:\s*(.+?)\s*$/);
+    if (cmd?.[1]) {
+      commands.set(currentService, normalizeComposeCommand(cmd[1]));
+    }
+  }
+  const hinted = commands.get(serviceHint.toLowerCase()) ?? commands.get(serviceHint);
+  if (hinted) return hinted;
+  if (commands.size === 1) return [...commands.values()][0] ?? null;
+  return null;
+}
+
+function normalizeComposeCommand(value: string): string {
+  if (value.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(value.replace(/'/g, '"')) as unknown;
+      if (Array.isArray(parsed)) return parsed.map((part) => String(part)).join(' ');
+    } catch {
+      // fall through to the string form
+    }
+  }
+  return value.replace(/^["']|["']$/g, '');
 }
 
 function readDockerfileBase(localPath: string): string | null {

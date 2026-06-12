@@ -1573,9 +1573,17 @@ async function preflightApply(
       // Surface detected sub-services as remediation — the common case is a
       // monorepo where the start command lives inside apps/* or packages/*.
       const subPaths = extractMonorepoSuggestions(plan);
+      const ecosystem = primaryLane(plan).scan.ecosystem;
+      const checkedSources =
+        'I checked, in order: package.json scripts.start, Dockerfile CMD/ENTRYPOINT, ' +
+        'Procfile `web:`, Python entrypoints (uvicorn/gunicorn/fastapi + main.py/app.py), ' +
+        'and docker-compose service `command:` — none yielded a start command.';
+      const ecosystemHint = ecosystem === 'node'
+        ? 'Add a `start` script to package.json, or pass --no-real-rehearsal.'
+        : 'Add a Dockerfile CMD, a Procfile `web:` line, or (Python) a main.py/app.py with uvicorn in the manifest — or pass --no-real-rehearsal.';
       const workspaceHint = subPaths.length > 0
         ? `This looks like a monorepo. Try --workspace=${subPaths[0]}${subPaths.length > 1 ? ` (other services: ${subPaths.slice(1).join(', ')})` : ''}.`
-        : 'Add a \`start\` script to the target, or pass --no-real-rehearsal.';
+        : ecosystemHint;
       const fixes: BlockerFix[] = [];
       if (subPaths.length > 0) {
         fixes.push({
@@ -1584,10 +1592,16 @@ async function preflightApply(
           flag: `--workspace=${subPaths[0]}`,
           autoFixable: true,
         });
-      } else {
+      } else if (ecosystem === 'node') {
         fixes.push({
           kind: 'edit-file',
           label: 'Add a "start" script to package.json',
+          autoFixable: false,
+        });
+      } else {
+        fixes.push({
+          kind: 'edit-file',
+          label: 'Declare the start command via Dockerfile CMD or a Procfile web: line',
           autoFixable: false,
         });
       }
@@ -1600,14 +1614,14 @@ async function preflightApply(
       report.blockers.push({
         id: 'real-rehearsal.no-start-command',
         title: 'No start command detected',
-        detail: `Convoy needs a start command to spawn the target locally. ${workspaceHint}`,
+        detail: `Convoy needs a start command to spawn the target locally. ${checkedSources} ${workspaceHint}`,
         severity: 'hard',
         fixes,
       });
       report.checks.push({
         name: 'real rehearsal',
         ok: false,
-        detail: 'no start command detected',
+        detail: 'no start command detected (checked package.json, Dockerfile, Procfile, Python signals, docker-compose)',
         remedy: workspaceHint,
       });
     } else {

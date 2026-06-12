@@ -63,6 +63,52 @@ test('scanServiceGraph keeps all monorepo services as coordinated lanes', () => 
   assert.deepEqual(nodesByPath.get('apps/api')?.secretsHints.expectedKeys, ['DATABASE_URL', 'REDIS_URL']);
 });
 
+test('start command falls back to Dockerfile CMD (exec form), with evidence', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'convoy-scan-'));
+  tempDirs.push(repo);
+  write(repo, 'go.mod', 'module example.com/api\n\ngo 1.22\n');
+  write(repo, 'Dockerfile', 'FROM golang:1.22\nEXPOSE 8080\nENTRYPOINT ["/app/server"]\nCMD ["--config", "/etc/app.yaml"]\n');
+
+  const graph = scanServiceGraph(repo);
+  const node = graph.nodes[0]!;
+  assert.equal(node.startCommand, '/app/server --config /etc/app.yaml');
+  assert.ok(node.scan.evidence.some((e) => e.includes('start command from Dockerfile CMD')));
+});
+
+test('start command falls back to Procfile web: line', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'convoy-scan-'));
+  tempDirs.push(repo);
+  write(repo, 'Gemfile', "source 'https://rubygems.org'\ngem 'rails'\n");
+  write(repo, 'Procfile', 'release: rake db:migrate\nweb: bundle exec puma -C config/puma.rb\n');
+
+  const graph = scanServiceGraph(repo);
+  assert.equal(graph.nodes[0]!.startCommand, 'bundle exec puma -C config/puma.rb');
+});
+
+test('python repos with uvicorn + main.py synthesize a uvicorn start command', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'convoy-scan-'));
+  tempDirs.push(repo);
+  write(repo, 'requirements.txt', 'fastapi==0.110.0\nuvicorn[standard]\n');
+  write(repo, 'main.py', 'from fastapi import FastAPI\napp = FastAPI()\n');
+
+  const graph = scanServiceGraph(repo);
+  assert.equal(graph.nodes[0]!.startCommand, 'uvicorn main:app --host 0.0.0.0 --port 8000');
+});
+
+test('docker-compose lone service command is the last-resort start command', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'convoy-scan-'));
+  tempDirs.push(repo);
+  write(repo, 'go.mod', 'module example.com/svc\n\ngo 1.22\n');
+  write(
+    repo,
+    'docker-compose.yml',
+    'services:\n  svc:\n    build: .\n    command: ./bin/serve --port 9090\n',
+  );
+
+  const graph = scanServiceGraph(repo);
+  assert.equal(graph.nodes[0]!.startCommand, './bin/serve --port 9090');
+});
+
 function write(root: string, relPath: string, content: string): void {
   const file = join(root, relPath);
   mkdirSync(dirname(file), { recursive: true });
