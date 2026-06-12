@@ -362,14 +362,7 @@ function defaultRehearsal(scan: ScanResult, platform: Platform): PlanRehearsalSe
 
   return {
     enabled: true,
-    targetDescriptor:
-      platform === 'fly'
-        ? `fly ephemeral app \`${repoName(scan.localPath)}-rehearsal-<sha>\` in iad`
-        : platform === 'railway'
-          ? `railway preview of \`${repoName(scan.localPath)}\` with scratch add-ons`
-          : platform === 'vercel'
-            ? `vercel preview deployment for \`${repoName(scan.localPath)}\``
-            : `cloud run revision \`${repoName(scan.localPath)}-rehearsal-<sha>\` in us-central1`,
+    targetDescriptor: rehearsalTargetDescriptor(platform, repoName(scan.localPath)),
     buildCommand: scan.buildCommand,
     startCommand: scan.startCommand,
     expectedPort: scan.port,
@@ -382,6 +375,32 @@ function defaultRehearsal(scan: ScanResult, platform: Platform): PlanRehearsalSe
     estimatedDurationSeconds: 300,
     estimatedCost: 'under $0.05 per rehearsal',
   };
+}
+
+/**
+ * Exhaustive over the Platform union — adding a platform without a branch
+ * here fails typecheck instead of silently narrating the wrong cloud
+ * (issue #29: vps plans used to fall through to Cloud Run text).
+ */
+function rehearsalTargetDescriptor(platform: Platform, repo: string): string {
+  switch (platform) {
+    case 'fly':
+      return `fly ephemeral app \`${repo}-rehearsal-<sha>\` in iad`;
+    case 'railway':
+      return `railway preview of \`${repo}\` with scratch add-ons`;
+    case 'vercel':
+      return `vercel preview deployment for \`${repo}\``;
+    case 'cloudrun':
+      return `cloud run revision \`${repo}-rehearsal-<sha>\` in us-central1`;
+    case 'vps':
+      return `local twin of \`${repo}\` (docker compose build + up on a scratch project)`;
+    default:
+      return assertNeverPlatform(platform);
+  }
+}
+
+function assertNeverPlatform(platform: never): never {
+  throw new Error(`unhandled platform in planner narrative: ${String(platform)}`);
 }
 
 function defaultPromotion(): PlanPromotionSection {
@@ -402,18 +421,40 @@ function defaultPromotion(): PlanPromotionSection {
 }
 
 function defaultRollback(platform: Platform): PlanRollbackSection {
-  return {
-    strategy:
-      platform === 'fly'
-        ? 'flyctl releases rollback'
-        : platform === 'railway'
-          ? 'railway redeploy previous'
-          : platform === 'vercel'
-            ? 'vercel alias previous deployment'
-            : 'gcloud run services update-traffic prior revision',
-    target: 'previous healthy release (auto-selected, verified before apply)',
-    estimatedSeconds: 10,
-  };
+  switch (platform) {
+    case 'fly':
+      return {
+        strategy: 'flyctl releases rollback',
+        target: 'previous healthy release (auto-selected, verified before apply)',
+        estimatedSeconds: 10,
+      };
+    case 'railway':
+      return {
+        strategy: 'railway redeploy previous',
+        target: 'previous healthy release (auto-selected, verified before apply)',
+        estimatedSeconds: 10,
+      };
+    case 'vercel':
+      return {
+        strategy: 'vercel alias previous deployment',
+        target: 'previous healthy release (auto-selected, verified before apply)',
+        estimatedSeconds: 10,
+      };
+    case 'cloudrun':
+      return {
+        strategy: 'gcloud run services update-traffic prior revision',
+        target: 'previous healthy release (auto-selected, verified before apply)',
+        estimatedSeconds: 10,
+      };
+    case 'vps':
+      return {
+        strategy: 'previous image tag re-rolled via compose over SSH',
+        target: 'previous healthy image tag (recorded on the VPS before apply)',
+        estimatedSeconds: 15,
+      };
+    default:
+      return assertNeverPlatform(platform);
+  }
 }
 
 function defaultApprovals(): PlanApproval[] {
