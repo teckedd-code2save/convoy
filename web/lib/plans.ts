@@ -51,6 +51,7 @@ export interface PlanSummary {
       source: string;
       reason: string;
       candidates: PlanPlatformCandidate[];
+      advisory?: string;
     };
     author: {
       convoyAuthoredFiles: PlanAuthoredFile[];

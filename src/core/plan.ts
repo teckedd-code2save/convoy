@@ -76,6 +76,13 @@ export interface PlanPlatformDecision {
   reason: string;
   source: 'mandate' | 'override' | 'existing-config' | 'scored' | 'refused';
   candidates: PlanPlatformCandidate[];
+  /**
+   * Set on lane decisions when the lane inherited the plan-level platform
+   * but would have scored a different platform standalone (issue #28).
+   * Rendered as a dim note in the CLI plan output and on the web lane card
+   * — the operator should see the disagreement, not be surprised by it.
+   */
+  advisory?: string;
 }
 
 export interface PlanPlatformAdjustment {
@@ -539,6 +546,9 @@ export function renderPlan(plan: ConvoyPlan): string {
         `  - ${lane.displayName} [${lane.role}] ${lane.servicePath} → ${lane.platformDecision.chosen}` +
           `${lane.scan.framework ? ` (${lane.scan.framework})` : ''}`,
       );
+      if (lane.platformDecision.advisory) {
+        L.push(`      ${lane.platformDecision.advisory}`);
+      }
     }
     L.push('');
   }
@@ -572,6 +582,9 @@ export function renderPlan(plan: ConvoyPlan): string {
       }
     } else {
       L.push(`    ${pd.reason}`);
+    }
+    if (pd.advisory) {
+      L.push(`    ${pd.advisory}`);
     }
   }
 

@@ -62,9 +62,10 @@ export async function buildPlan(
 
   const deployability = toPlanDeployability(scan);
   const platform = resolvePlatform(scan, opts.platformOverride, deployability, opts.platformAdjustments, opts.platformMandate);
+  const inheritedPlatform = laneInheritanceReason(platform, scan);
   const lanes = deployability.verdict === 'not-cloud-deployable'
     ? [] as DeploymentLane[]
-    : graph.nodes.map((node) => buildLane(node, opts.platformOverride, opts.platformAdjustments, opts.platformMandate));
+    : graph.nodes.map((node) => buildLane(node, platform, inheritedPlatform, opts.platformOverride, opts.platformAdjustments, opts.platformMandate));
   const dependencies = buildDependencies(lanes);
   const connectionRequirements = buildConnectionRequirements(lanes);
   // Each lane's files are already path-prefixed by draftAuthorSection (e.g.
@@ -139,13 +140,72 @@ export async function buildPlan(
   return { plan: enriched.plan, enrichmentSource: enriched.source };
 }
 
+/**
+ * Why (and whether) lanes must inherit the plan-level platform decision
+ * instead of re-scoring per-node (issue #28). Returns a human-readable
+ * phrase when inheritance applies, null when per-lane scoring is fine.
+ *
+ * Inheritance applies when:
+ *  - the root decision came from a mandate, an explicit override, or an
+ *    existing platform config — those are repo-wide statements, and a lane
+ *    that re-scores its way to a different platform produces an incoherent
+ *    plan ("ship to vps" headline + a fly-auth blocker for one lane); or
+ *  - the root scored vps because of root-level compose/Caddy topology —
+ *    those files bind the services together as one deploy unit.
+ *
+ * Per-lane re-scoring remains only when the root decision is 'scored' from
+ * generic signals and nothing at the root ties the services together.
+ */
+function laneInheritanceReason(root: PlanPlatformDecision, scan: ScanResult): string | null {
+  switch (root.source) {
+    case 'mandate':
+      return 'the team platform mandate applies repo-wide';
+    case 'override':
+      return `the --platform=${root.chosen} override applies repo-wide`;
+    case 'existing-config':
+      return `the repo already deploys to ${root.chosen}`;
+    case 'refused':
+      return null;
+    case 'scored': {
+      if (root.chosen !== 'vps') return null;
+      const hasCompose = scan.topLevelFiles.some(
+        (f) => f === 'docker-compose.yml' || f === 'docker-compose.yaml' ||
+               f === 'compose.yml' || f === 'compose.yaml',
+      );
+      const hasCaddy = scan.topLevelFiles.includes('Caddyfile');
+      return hasCompose || hasCaddy ? 'the repo co-deploys via compose' : null;
+    }
+  }
+}
+
 function buildLane(
   node: ServiceNode,
+  rootDecision: PlanPlatformDecision,
+  inheritanceReason: string | null,
   override?: Platform,
   adjustments?: PlatformAdjustments,
   mandate?: Platform,
 ): DeploymentLane {
-  const platformDecision = pickPlatformForLane(node, override, adjustments, mandate);
+  let platformDecision = pickPlatformForLane(node, override, adjustments, mandate);
+  if (inheritanceReason !== null && rootDecision.source !== 'refused') {
+    // Lanes follow the plan-level decision; keep the lane's own scored
+    // candidates so the disagreement (if any) stays visible as an advisory
+    // instead of vanishing into an unexplained chosen value.
+    const ownTop = [...platformDecision.candidates].sort((a, b) => b.score - a.score)[0];
+    const inheritedScore = platformDecision.candidates
+      .find((c) => c.platform === rootDecision.chosen)?.score ?? 0;
+    platformDecision = {
+      chosen: rootDecision.chosen,
+      source: rootDecision.source,
+      reason: `inheriting the repo-level ${rootDecision.chosen} decision — ${inheritanceReason}`,
+      candidates: platformDecision.candidates,
+    };
+    if (ownTop && ownTop.platform !== rootDecision.chosen && ownTop.score - inheritedScore >= 10) {
+      platformDecision.advisory =
+        `${node.name} would score ${ownTop.platform} ${ownTop.score} standalone; ` +
+        `keeping ${rootDecision.chosen} because ${inheritanceReason}.`;
+    }
+  }
   const author = draftAuthorSection(node.scan, platformDecision.chosen, node.path);
   const rehearsal = defaultRehearsal(node.scan, platformDecision.chosen);
   const promotion = defaultPromotion();

@@ -114,6 +114,9 @@ function LaneSection({ plan }: { plan: PlanSummary }) {
                   {lane.scan.healthPath ? <span className="ml-1 font-mono text-xs">health={lane.scan.healthPath}</span> : null}
                   {lane.scan.port ? <span className="ml-1 font-mono text-xs">:{lane.scan.port}</span> : null}
                 </div>
+                {lane.platformDecision.advisory ? (
+                  <div className="text-xs text-muted/80 italic">{lane.platformDecision.advisory}</div>
+                ) : null}
               </div>
 
               {/* Per-lane risks */}
