@@ -19,6 +19,10 @@ export interface PanelRow {
   key: string;
   source: 'schema' | 'example';
   state: 'staged' | 'already-set' | 'missing';
+  /** secret vs config classification (issue #34). Absent on legacy callers → treated as secret. */
+  kind?: 'secret' | 'config';
+  /** Non-empty .env.example value for config keys — prefilled default, confirm for production. */
+  defaultValue?: string;
 }
 
 export function ConfigPanel({
@@ -630,6 +634,8 @@ function EnvRow({
     });
   };
 
+  const prefilledConfig =
+    row.state === 'missing' && row.kind === 'config' && !!row.defaultValue;
   const badge =
     row.state === 'staged' ? (
       <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-success/10 text-success">
@@ -638,6 +644,10 @@ function EnvRow({
     ) : row.state === 'already-set' ? (
       <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-accent/10 text-accent">
         already set
+      </span>
+    ) : prefilledConfig ? (
+      <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-rule/60 text-muted">
+        from example — confirm for production
       </span>
     ) : (
       <span className="text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded bg-warn/10 text-warn">
@@ -650,7 +660,7 @@ function EnvRow({
   const showInput = row.state === 'missing' || editing;
 
   return (
-    <div className="px-4 py-3 space-y-2">
+    <div className={`px-4 py-3 space-y-2 ${row.kind === 'config' ? 'opacity-75' : ''}`}>
       <div className="flex items-baseline gap-3 flex-wrap">
         <input
           type="checkbox"

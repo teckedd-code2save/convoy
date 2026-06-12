@@ -30,6 +30,7 @@ import { probePlatformConnection } from './adapters/connections.js';
 import type { ConnectionCheck, ConnectionStatus } from './adapters/types.js';
 import { buildPlan } from './planner/index.js';
 import type { PlatformAdjustments } from './planner/picker.js';
+import { classifyEnvKey } from './core/env-classify.js';
 import { loadByokConfig, resolveAnthropicKey } from './core/key-resolver.js';
 import { scanRepository } from './planner/scanner.js';
 import { resolveTarget } from './planner/target-resolver.js';
@@ -1086,9 +1087,12 @@ function extractEnvKeys(content: string): string[] {
 export function computeExpectedKeys(plan: ConvoyPlan): {
   keys: Set<string>;
   sources: string[];
+  /** Non-empty example-file values, keyed by env var (issue #34). */
+  defaults: Record<string, string>;
 } {
   const expected = new Set<string>();
   const sources: string[] = [];
+  const defaults: Record<string, string> = {};
 
   const schemaFile = plan.author.convoyAuthoredFiles.find((f) => f.path === '.env.schema');
   if (schemaFile) {
@@ -1107,9 +1111,12 @@ export function computeExpectedKeys(plan: ConvoyPlan): {
       if (existsSync(p)) {
         try {
           const content = readFileSync(p, 'utf8');
-          const keys = extractEnvKeys(content);
-          keys.forEach((k) => expected.add(k));
-          if (keys.length > 0) sources.push(`${cand} (${keys.length})`);
+          const entries = parseEnvFileContent(content);
+          for (const [key, value] of Object.entries(entries)) {
+            expected.add(key);
+            if (value.length > 0) defaults[key] = value;
+          }
+          if (Object.keys(entries).length > 0) sources.push(`${cand} (${Object.keys(entries).length})`);
           break;
         } catch {
           // unreadable, skip
@@ -1118,7 +1125,7 @@ export function computeExpectedKeys(plan: ConvoyPlan): {
     }
   }
 
-  return { keys: expected, sources };
+  return { keys: expected, sources, defaults };
 }
 
 /**
@@ -1180,7 +1187,7 @@ function appendEnvStagingChecks(
   opts: ApplyOpts,
   report: PreflightReport,
 ): void {
-  const { keys: expectedRaw, sources } = computeExpectedKeys(plan);
+  const { keys: expectedRaw, sources, defaults } = computeExpectedKeys(plan);
   if (expectedRaw.size === 0) return;
 
   // Strip keys the platform injects itself (e.g. PORT on Vercel/Cloud Run/Fly).
@@ -1195,15 +1202,32 @@ function appendEnvStagingChecks(
 
   const { staged, secretsPath } = computeStagedKeys(plan, opts);
 
-  const missing = [...expected].filter((k) => !staged.has(k));
+  // Secret vs config (issue #34): config keys with a non-empty value in the
+  // example file are prefilled defaults, not missing — the operator just
+  // confirms them for production.
+  const unstaged = [...expected].filter((k) => !staged.has(k));
+  const missingSecrets = unstaged.filter((k) => classifyEnvKey(k) === 'secret');
+  const missingConfig = unstaged.filter(
+    (k) => classifyEnvKey(k) === 'config' && !(defaults[k] && defaults[k].length > 0),
+  );
+  const prefilledConfig = unstaged.filter(
+    (k) => classifyEnvKey(k) === 'config' && defaults[k] && defaults[k].length > 0,
+  );
+  const missing = [...missingSecrets, ...missingConfig];
   const have = expected.size - missing.length;
+  const secretCount = [...expected].filter((k) => classifyEnvKey(k) === 'secret').length;
+  const configCount = expected.size - secretCount;
+  const splitStr = ` — secrets (${secretCount}), config (${configCount})`;
   const sourcesStr = sources.length > 0 ? ` (sources: ${sources.join(', ')})` : '';
+  const prefilledStr = prefilledConfig.length > 0
+    ? ` · ${prefilledConfig.length} config default${prefilledConfig.length === 1 ? '' : 's'} from example — confirm for production: ${prefilledConfig.join(', ')}`
+    : '';
 
   if (missing.length === 0) {
     report.checks.push({
       name: 'env staging',
       ok: true,
-      detail: `${have}/${expected.size} expected vars staged or declared already-set${sourcesStr}`,
+      detail: `${have}/${expected.size} expected vars staged or declared already-set${splitStr}${sourcesStr}${prefilledStr}`,
     });
     return;
   }
@@ -1233,10 +1257,13 @@ function appendEnvStagingChecks(
       ? `${dataHints.join(' · ')} · OR ${remedyParts.join(' · ')}`
       : remedyParts.join(' · ');
 
+  const missingParts: string[] = [];
+  if (missingSecrets.length > 0) missingParts.push(`secrets missing: ${missingSecrets.join(', ')}`);
+  if (missingConfig.length > 0) missingParts.push(`config missing: ${missingConfig.join(', ')}`);
   report.checks.push({
     name: 'env staging',
     ok: false,
-    detail: `${have}/${expected.size} vars staged${sourcesStr} — missing: ${missing.join(', ')}`,
+    detail: `${have}/${expected.size} vars staged${splitStr}${sourcesStr} — ${missingParts.join(' · ')}${prefilledStr}`,
     remedy,
   });
 }
@@ -2377,7 +2404,10 @@ function detectInstallCommand(plan: ConvoyPlan): string | null {
 }
 
 function parseEnvFile(path: string): Record<string, string> {
-  const raw = readFileSync(path, 'utf8');
+  return parseEnvFileContent(readFileSync(path, 'utf8'));
+}
+
+function parseEnvFileContent(raw: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();

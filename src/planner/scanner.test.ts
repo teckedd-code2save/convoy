@@ -109,6 +109,46 @@ test('docker-compose lone service command is the last-resort start command', () 
   assert.equal(graph.nodes[0]!.startCommand, './bin/serve --port 9090');
 });
 
+test('env keys attribute per lane: compose blocks + service-local files, root keys once', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'convoy-scan-'));
+  tempDirs.push(repo);
+  write(repo, '.env.example', 'SHARED_FLAG=on\n');
+  write(
+    repo,
+    'docker-compose.yml',
+    [
+      'services:',
+      '  backend:',
+      '    build: ./backend',
+      '    environment:',
+      '      - STRIPE_SECRET_KEY=',
+      '      - LOG_LEVEL=info',
+      '  frontend:',
+      '    build: ./frontend',
+      '',
+    ].join('\n'),
+  );
+  write(repo, 'backend/requirements.txt', 'fastapi\nuvicorn\n');
+  write(repo, 'backend/main.py', 'app = None\n');
+  write(repo, 'frontend/package.json', JSON.stringify({ name: 'frontend', devDependencies: { vite: '^5.0.0' } }));
+  write(repo, 'frontend/.env.example', 'VITE_API_URL=http://localhost:8000\n');
+
+  const graph = scanServiceGraph(repo);
+  const backend = graph.nodes.find((n) => n.path === 'backend')!;
+  const frontend = graph.nodes.find((n) => n.path === 'frontend')!;
+
+  // compose environment keys belong to the backend lane
+  assert.ok(backend.secretsHints.expectedKeys.includes('STRIPE_SECRET_KEY'));
+  assert.ok(backend.secretsHints.expectedKeys.includes('LOG_LEVEL'));
+  // service-local example belongs to the frontend lane only
+  assert.ok(frontend.secretsHints.expectedKeys.includes('VITE_API_URL'));
+  assert.ok(!frontend.secretsHints.expectedKeys.includes('STRIPE_SECRET_KEY'));
+  assert.equal(frontend.secretsHints.defaults['VITE_API_URL'], 'http://localhost:8000');
+  // repo-shared root key lands exactly once (primary lane), not on every lane
+  const holders = graph.nodes.filter((n) => n.secretsHints.expectedKeys.includes('SHARED_FLAG'));
+  assert.equal(holders.length, 1);
+});
+
 function write(root: string, relPath: string, content: string): void {
   const file = join(root, relPath);
   mkdirSync(dirname(file), { recursive: true });

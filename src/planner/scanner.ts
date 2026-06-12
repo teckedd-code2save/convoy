@@ -143,6 +143,12 @@ export interface AuthHints {
 export interface SecretsHints {
   expectedKeys: string[];
   sources: string[];
+  /**
+   * Non-empty values found alongside keys in the example files. These are
+   * candidate defaults for config keys ("from example — confirm for
+   * production"), never trusted for secret-shaped keys.
+   */
+  defaults: Record<string, string>;
 }
 
 export interface ServiceNode {
@@ -369,6 +375,8 @@ export function scanServiceGraph(localPath: string, opts: ScanOptions = {}): Ser
   for (const node of nodes) {
     node.dependsOn = inferDependencies(node, nodesById);
   }
+
+  attachRepoSharedEnvKeys(localPath, nodes);
 
   return {
     localPath,
@@ -1336,6 +1344,14 @@ function detectAuthHints(scan: ScanResult): AuthHints {
   };
 }
 
+/**
+ * Per-lane env-key attribution (issue #34). Keys belong to a lane when the
+ * lane declares them itself: a `<servicePath>/.env.example`, or the
+ * docker-compose service block for that lane (`environment:` entries and
+ * `env_file:` files). Root-level example files are NOT inherited by every
+ * lane anymore — repo-shared keys are attached once, to the primary lane,
+ * by scanServiceGraph after all nodes are built.
+ */
 function detectSecretsHints(
   localPath: string,
   servicePath: string,
@@ -1343,34 +1359,205 @@ function detectSecretsHints(
 ): SecretsHints {
   const expected = new Set<string>();
   const sources: string[] = [];
+  const defaults: Record<string, string> = {};
   const serviceRoot = servicePath === '.' ? localPath : join(localPath, servicePath);
+
   for (const candidate of ['.env.schema', '.env.example', '.env.local.example']) {
-    const raw = tryReadFile(serviceRoot, candidate) ?? tryReadFile(localPath, candidate);
+    // Service-local files only. The root fallback used to copy the repo's
+    // entire .env.example into every lane, so both lanes listed identical
+    // keys — root keys are now attributed once by scanServiceGraph.
+    const raw = tryReadFile(serviceRoot, candidate);
     if (!raw) continue;
-    const keys = extractEnvKeys(raw);
-    if (keys.length === 0) continue;
-    keys.forEach((key) => expected.add(key));
-    sources.push(candidate);
+    const entries = extractEnvEntries(raw);
+    if (entries.length === 0) continue;
+    for (const { key, value } of entries) {
+      expected.add(key);
+      if (value.length > 0) defaults[key] = value;
+    }
+    sources.push(servicePath === '.' ? candidate : `${servicePath}/${candidate}`);
   }
+
+  // docker-compose attribution: the service block matching this lane
+  // declares env keys for it.
+  if (servicePath !== '.') {
+    const composeFile = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']
+      .find((f) => tryReadFile(localPath, f) !== null);
+    if (composeFile) {
+      const services = parseComposeServiceEnv(tryReadFile(localPath, composeFile) ?? '');
+      const match = matchComposeService(services, servicePath);
+      if (match) {
+        if (match.environmentKeys.length > 0) {
+          match.environmentKeys.forEach((key) => expected.add(key));
+          sources.push(`${composeFile} (${match.name}.environment)`);
+        }
+        for (const envFile of match.envFiles) {
+          const raw = tryReadFile(localPath, envFile);
+          if (!raw) continue;
+          const entries = extractEnvEntries(raw);
+          if (entries.length === 0) continue;
+          for (const { key, value } of entries) {
+            expected.add(key);
+            if (value.length > 0) defaults[key] = value;
+          }
+          sources.push(`${composeFile} (${match.name}.env_file: ${envFile})`);
+        }
+      }
+    }
+  }
+
   if (scan.dataLayer.some((layer) => layer.includes('postgres'))) expected.add('DATABASE_URL');
   if (scan.dataLayer.includes('redis')) expected.add('REDIS_URL');
   return {
     expectedKeys: [...expected].sort(),
     sources,
+    defaults,
   };
 }
 
-function extractEnvKeys(text: string): string[] {
-  const out: string[] = [];
+interface ComposeServiceEnv {
+  name: string;
+  buildContext: string | null;
+  environmentKeys: string[];
+  envFiles: string[];
+}
+
+/**
+ * Coarse line-based parse of per-service `environment:` / `env_file:` /
+ * `build:` from a compose file. Handles list (`- KEY=value`, `- KEY`) and
+ * map (`KEY: value`) environment forms, scalar and list env_file forms,
+ * and inline or nested (`build: { context: ... }`) build contexts.
+ */
+function parseComposeServiceEnv(raw: string): ComposeServiceEnv[] {
+  const out: ComposeServiceEnv[] = [];
+  let inServices = false;
+  let current: ComposeServiceEnv | null = null;
+  let mode: 'none' | 'environment' | 'env_file' | 'build' = 'none';
+  for (const line of raw.split('\n')) {
+    if (/^services:\s*(#.*)?$/.test(line)) {
+      inServices = true;
+      continue;
+    }
+    if (/^\S/.test(line)) {
+      inServices = false;
+      current = null;
+      mode = 'none';
+      continue;
+    }
+    if (!inServices) continue;
+    const svc = line.match(/^ {2}([A-Za-z0-9_.-]+):\s*(#.*)?$/);
+    if (svc?.[1]) {
+      current = { name: svc[1], buildContext: null, environmentKeys: [], envFiles: [] };
+      out.push(current);
+      mode = 'none';
+      continue;
+    }
+    if (!current) continue;
+
+    const buildInline = line.match(/^ {4}build:\s*(\S.*?)\s*$/);
+    if (buildInline?.[1]) {
+      current.buildContext = buildInline[1];
+      mode = 'none';
+      continue;
+    }
+    if (/^ {4}build:\s*$/.test(line)) {
+      mode = 'build';
+      continue;
+    }
+    if (/^ {4}environment:\s*$/.test(line)) {
+      mode = 'environment';
+      continue;
+    }
+    const envFileInline = line.match(/^ {4}env_file:\s*(\S.*?)\s*$/);
+    if (envFileInline?.[1]) {
+      current.envFiles.push(stripQuotes(envFileInline[1]));
+      mode = 'none';
+      continue;
+    }
+    if (/^ {4}env_file:\s*$/.test(line)) {
+      mode = 'env_file';
+      continue;
+    }
+    if (/^ {4}\S/.test(line)) {
+      // a different service-level key ends any sub-block
+      mode = 'none';
+      continue;
+    }
+
+    if (mode === 'environment') {
+      const listItem = line.match(/^ {6,}-\s*(.+?)\s*$/);
+      if (listItem?.[1]) {
+        const entry = stripQuotes(listItem[1]);
+        const key = entry.split('=')[0]?.trim();
+        if (key && /^[A-Z_][A-Z0-9_]*$/i.test(key)) current.environmentKeys.push(key);
+        continue;
+      }
+      const mapItem = line.match(/^ {6,}([A-Za-z_][A-Za-z0-9_]*):/);
+      if (mapItem?.[1]) current.environmentKeys.push(mapItem[1]);
+    } else if (mode === 'env_file') {
+      const listItem = line.match(/^ {6,}-\s*(.+?)\s*$/);
+      if (listItem?.[1]) current.envFiles.push(stripQuotes(listItem[1]));
+    } else if (mode === 'build') {
+      const ctx = line.match(/^ {6,}context:\s*(\S.*?)\s*$/);
+      if (ctx?.[1]) current.buildContext = stripQuotes(ctx[1]);
+    }
+  }
+  return out;
+}
+
+function matchComposeService(
+  services: ComposeServiceEnv[],
+  servicePath: string,
+): ComposeServiceEnv | null {
+  const normalized = servicePath.replace(/^\.\//, '');
+  for (const svc of services) {
+    const ctx = svc.buildContext?.replace(/^\.\//, '').replace(/\/$/, '');
+    if (ctx && ctx === normalized) return svc;
+  }
+  const base = basename(normalized).toLowerCase();
+  return services.find((svc) => svc.name.toLowerCase() === base) ?? null;
+}
+
+function stripQuotes(value: string): string {
+  return value.replace(/^["']|["']$/g, '');
+}
+
+function extractEnvEntries(text: string): { key: string; value: string }[] {
+  const out: { key: string; value: string }[] = [];
   for (const line of text.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
     const idx = trimmed.indexOf('=');
     if (idx <= 0) continue;
     const key = trimmed.slice(0, idx).trim();
-    if (/^[A-Z_][A-Z0-9_]*$/i.test(key)) out.push(key);
+    const value = trimmed.slice(idx + 1).trim().replace(/^["']|["']$/g, '');
+    if (/^[A-Z_][A-Z0-9_]*$/i.test(key)) out.push({ key, value });
   }
   return out;
+}
+
+/**
+ * Root-level .env example keys are repo-shared: attribute them ONCE, to the
+ * primary lane, instead of duplicating them into every lane (issue #34).
+ * Keys a lane already claimed (service-local file, compose block, data
+ * layer) are left alone.
+ */
+function attachRepoSharedEnvKeys(localPath: string, nodes: ServiceNode[]): void {
+  const primary = nodes[0];
+  if (!primary || primary.path === '.') return; // root lane already reads root files itself
+  const claimed = new Set(nodes.flatMap((node) => node.secretsHints.expectedKeys));
+  for (const candidate of ['.env.schema', '.env.example', '.env.local.example']) {
+    const raw = tryReadFile(localPath, candidate);
+    if (!raw) continue;
+    const fresh = extractEnvEntries(raw).filter(({ key }) => !claimed.has(key));
+    if (fresh.length === 0) continue;
+    for (const { key, value } of fresh) {
+      primary.secretsHints.expectedKeys.push(key);
+      claimed.add(key);
+      if (value.length > 0) primary.secretsHints.defaults[key] = value;
+    }
+    primary.secretsHints.sources.push(`${candidate} (repo-shared)`);
+  }
+  primary.secretsHints.expectedKeys.sort();
 }
 
 function inferDependencies(

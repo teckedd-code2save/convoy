@@ -19,6 +19,8 @@ import type {
 } from '../core/plan.js';
 import type { Platform } from '../core/types.js';
 
+import { classifyEnvKey } from '../core/env-classify.js';
+
 import { draftAuthorSection } from './author.js';
 import { enrichPlan, type EnrichmentOptions } from './enricher.js';
 import { pickPlatform, pickPlatformForLane, type PlatformAdjustments } from './picker.js';
@@ -238,6 +240,15 @@ function buildLane(
     secrets: {
       expectedKeys: node.secretsHints.expectedKeys,
       sources: node.secretsHints.sources,
+      keys: node.secretsHints.expectedKeys.map((key) => {
+        const kind = classifyEnvKey(key);
+        const defaultValue = kind === 'config' ? node.secretsHints.defaults[key] : undefined;
+        return {
+          key,
+          kind,
+          ...(defaultValue !== undefined && defaultValue.length > 0 && { defaultValue }),
+        };
+      }),
     },
     statusNarrative: [
       `I'll scan ${node.path} as a ${node.role} lane.`,
