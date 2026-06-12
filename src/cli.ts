@@ -4277,7 +4277,7 @@ program
   .description('Discover what platforms, CI/CD, secrets, and observability this repo already uses. Run before `convoy plan` on an unfamiliar codebase.')
   .option('--json', 'emit full result as JSON')
   .action(async (targetPath: string | undefined, opts: { json?: boolean }) => {
-    const localPath = resolve(targetPath ?? '.');
+    const localPath = resolve(targetPath ?? targetInvocationDir());
     if (!existsSync(localPath)) {
       process.stderr.write(`${pc.red('error')} path not found: ${localPath}\n`);
       process.exit(1);
@@ -4335,7 +4335,7 @@ program
   .option('--answers <json>', 'pre-fill answers as JSON (for non-interactive/MCP use)')
   .option('--platform <platform>', 'set the platform mandate directly: fly | railway | vercel | cloudrun | vps (skips that question)')
   .action(async (targetPath: string | undefined, opts: { answers?: string; platform?: string }) => {
-    const localPath = resolve(targetPath ?? '.');
+    const localPath = resolve(targetPath ?? targetInvocationDir());
     if (!existsSync(localPath)) {
       process.stderr.write(`${pc.red('error')} path not found: ${localPath}\n`);
       process.exit(1);
