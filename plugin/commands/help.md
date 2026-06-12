@@ -13,6 +13,23 @@ Convoy — slash commands
   Orient yourself. Shows CONVOY_HOME, state DB, recent plans, recent run,
   whether the web viewer is up. Run this first if you're lost.
 
+/convoy:onboard [path]
+  Run the onboard interview before the first plan. Captures platform
+  mandate, deployment style, approvers, compliance, and observability.
+  Onboard precedes everything — Convoy won't score platforms until it
+  knows how the team ships.
+    Examples:
+      /convoy:onboard
+      /convoy:onboard ./my-app
+
+/convoy:orient [path]
+  Read the repo's existing deployment signals and compare against saved
+  preferences. Surfaces drift (e.g. preferences say Fly but a vercel.json
+  appeared). Runs automatically before every plan once onboarded.
+    Examples:
+      /convoy:orient
+      /convoy:orient ./my-app
+
 /convoy:ship <target> [flags]
   Plan + apply end-to-end against a GitHub URL or local path. Real by
   default: opens a PR, rehearses locally, deploys to Fly. Pauses at each
