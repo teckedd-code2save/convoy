@@ -29,6 +29,7 @@ import type { Platform, Run, RunEvent, StageName } from './core/types.js';
 import { probePlatformConnection } from './adapters/connections.js';
 import type { ConnectionCheck, ConnectionStatus } from './adapters/types.js';
 import { buildPlan } from './planner/index.js';
+import type { PlatformAdjustments } from './planner/picker.js';
 import { loadByokConfig, resolveAnthropicKey } from './core/key-resolver.js';
 import { scanRepository } from './planner/scanner.js';
 import { resolveTarget } from './planner/target-resolver.js';
@@ -502,6 +503,100 @@ interface ShipOpts extends ApplyOpts {
   platform?: string;
   workspace?: string;
   noAi?: boolean;
+  skipOnboard?: boolean;
+  skipOrient?: boolean;
+  strictDrift?: boolean;
+}
+
+/**
+ * Onboard gate + orient drift detection, shared by `convoy plan` and
+ * `convoy ship` (issues #23 + #20). Doctrine:
+ *
+ *   first contact:   onboard  →  plan        (Convoy asks before it assumes)
+ *   every run after: orient   →  plan        (Convoy checks what changed)
+ *   greenfield:      onboard  →  plan, fast  (Convoy leads — its pick IS the pattern)
+ *
+ * No preferences on file + interactive + no --skip-onboard → BLOCK on the
+ * 5-question interview before scoring anything. Non-interactive / CI /
+ * --skip-onboard → warn and proceed with defaults.
+ *
+ * Preferences on file → orientRepo() runs on every plan and is compared
+ * against them. Consistent → silent. Drift → explicit warning (or hard
+ * pause under --strict-drift); the mandate still wins, never a silent
+ * re-score. No mandate → orient signals feed the picker as score
+ * adjustments so they show in the candidates table.
+ */
+async function applyOnboardAndOrient(
+  localPath: string,
+  opts: { skipOnboard?: boolean; skipOrient?: boolean; strictDrift?: boolean; interactive: boolean },
+): Promise<{ mandate: Platform | null; adjustments: PlatformAdjustments | undefined }> {
+  const { loadPreferences } = await import('./onboard/preferences.js');
+  let prefs = loadPreferences(localPath);
+
+  if (!prefs && !opts.skipOnboard) {
+    if (opts.interactive && stdin.isTTY) {
+      // Gate, not a warning: first contact blocks on the interview.
+      const { runQuickOnboard } = await import('./onboard/quick.js');
+      prefs = await runQuickOnboard(localPath);
+    } else {
+      process.stderr.write(`${pc.yellow('⚠')}  No team preferences on file and no TTY to ask — proceeding with defaults.\n`);
+      process.stderr.write(`   Run ${pc.bold(`convoy onboard ${localPath}`)} to capture platform mandate, approvers, and compliance.\n`);
+      process.stderr.write(`   Pass --skip-onboard to suppress this warning.\n\n`);
+    }
+  }
+
+  if (!prefs) {
+    return { mandate: null, adjustments: undefined };
+  }
+
+  const mandateRaw = prefs.platform.mandate;
+  const mandate = mandateRaw && isPlatform(mandateRaw) ? mandateRaw : null;
+
+  if (opts.skipOrient) {
+    return { mandate, adjustments: undefined };
+  }
+
+  // Per-run drift detection: what does the repo say today vs. what the team
+  // declared at onboard time?
+  try {
+    const { orientRepo } = await import('./orient/index.js');
+    const { collectPlatformSignals, detectDrift, signalsToAdjustments } = await import('./orient/drift.js');
+    const orient = await orientRepo(localPath);
+    const signals = collectPlatformSignals(orient, prefs);
+
+    if (mandate) {
+      const drift = detectDrift(mandate, signals);
+      if (drift.length > 0) {
+        for (const finding of drift) {
+          process.stderr.write(
+            `${pc.yellow('⚠')} ${pc.bold('Drift:')} you onboarded with platform=${mandate}, but ${finding.evidence} appeared since. ` +
+            `Still shipping to ${mandate}. If the team moved: ${pc.bold(`convoy onboard --platform=${finding.detectedPlatform}`)}\n`,
+          );
+        }
+        if (opts.strictDrift) {
+          process.stderr.write(
+            `\n${pc.red('✗')} ${pc.bold('--strict-drift: pausing on drift.')} Re-run after either updating the mandate ` +
+            `(${pc.bold('convoy onboard --platform=<p>')}) or removing the stray platform config, or drop --strict-drift to proceed with ${mandate}.\n`,
+          );
+          process.exit(2);
+        }
+      }
+      // Mandate wins; orient signals never re-score a mandated platform.
+      return { mandate, adjustments: undefined };
+    }
+
+    // Preferences exist but no mandate: orient signals feed the picker so
+    // existing fly.toml / vercel.json / CI deploy steps / a VPS host on
+    // file tilt the score table visibly.
+    const adjustments = signalsToAdjustments(signals);
+    return { mandate: null, adjustments: Object.keys(adjustments).length > 0 ? adjustments : undefined };
+  } catch (err) {
+    // Orientation must never block planning — it's advisory context.
+    process.stderr.write(
+      `${pc.yellow('!')} ${pc.dim(`orient pass failed (${err instanceof Error ? err.message : String(err)}); continuing without drift detection`)}\n`,
+    );
+    return { mandate, adjustments: undefined };
+  }
 }
 
 
@@ -530,7 +625,7 @@ async function runShip(
     platformOverride = opts.platform;
   }
 
-  const thinking = startThinking();
+  let thinking = startThinking();
   try {
     const resolved = await resolveTarget(target, {
       localBaseDir: targetInvocationDir(),
@@ -543,6 +638,19 @@ async function runShip(
 
     const inferredRepoUrl = resolved.repoUrl ?? undefined;
 
+    // Onboard gate + orient drift detection — same doctrine as `convoy plan`.
+    thinking.stop();
+    const { mandate, adjustments } = await applyOnboardAndOrient(resolved.localPath, {
+      ...(opts.skipOnboard !== undefined && { skipOnboard: opts.skipOnboard }),
+      ...(opts.skipOrient !== undefined && { skipOrient: opts.skipOrient }),
+      ...(opts.strictDrift !== undefined && { strictDrift: opts.strictDrift }),
+      interactive: true,
+    });
+    if (mandate && platformOverride === undefined) {
+      platformOverride = mandate;
+    }
+    thinking = startThinking();
+
     const byokKey = await resolveAnthropicKey(loadByokConfig(resolved.localPath));
     const { plan, enrichmentSource } = await buildPlan(resolved.localPath, {
       ...(inferredRepoUrl !== undefined && { repoUrl: inferredRepoUrl }),
@@ -550,6 +658,7 @@ async function runShip(
       ...(resolved.sha !== undefined && { sha: resolved.sha }),
       ...(platformOverride !== undefined && { platformOverride }),
       ...(opts.workspace !== undefined && { workspace: opts.workspace }),
+      ...(adjustments !== undefined && { platformAdjustments: adjustments }),
       ai: opts.noAi ? { disable: true } : { ...(byokKey && { apiKey: byokKey }) },
     });
     thinking.stop();
@@ -601,6 +710,9 @@ interface PlanOpts {
   noAi?: boolean;
   open?: boolean;
   skipOnboard?: boolean;
+  skipOrient?: boolean;
+  strictDrift?: boolean;
+  vpsHost?: string;
 }
 
 async function runPlan(path: string, opts: PlanOpts): Promise<void> {
@@ -618,7 +730,7 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
     platformOverride = opts.platform;
   }
 
-  const thinking = opts.json ? null : startThinking();
+  let thinking = opts.json ? null : startThinking();
   try {
     const resolved = await resolveTarget(path, {
       localBaseDir: targetInvocationDir(),
@@ -633,21 +745,36 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
 
     const inferredRepoUrl = opts.repoUrl ?? resolved.repoUrl ?? undefined;
 
-    // Check for preferences and warn if missing
-    const { loadPreferences } = await import('./onboard/preferences.js');
-    const prefs = loadPreferences(resolved.localPath);
-    if (!prefs && !opts.skipOnboard) {
-      process.stderr.write(`${pc.yellow('⚠')}  No team preferences on file. Run ${pc.bold(`convoy onboard ${resolved.localPath}`)} first to capture deployment style,\n`);
-      process.stderr.write(`   approvers, compliance requirements, and platform preferences.\n`);
-      process.stderr.write(`   Using defaults for now. Pass --skip-onboard to suppress this warning.\n\n`);
+    // --vps-host: make the host visible to the picker (env signal) and
+    // persist it into team preferences when they exist, so the web plan
+    // page can pre-fill it next time.
+    if (opts.vpsHost) {
+      process.env['CONVOY_VPS_HOST'] = opts.vpsHost;
     }
-    // If platform mandate is set, use it as override
-    if (prefs?.platform.mandate && !opts.platform) {
-      opts.platform = prefs.platform.mandate;
-      if (isPlatform(opts.platform)) {
-        platformOverride = opts.platform;
+
+    // Onboard gate + orient drift detection (interactive prompts — pause
+    // the spinner first).
+    thinking?.stop();
+    const { mandate, adjustments } = await applyOnboardAndOrient(resolved.localPath, {
+      ...(opts.skipOnboard !== undefined && { skipOnboard: opts.skipOnboard }),
+      ...(opts.skipOrient !== undefined && { skipOrient: opts.skipOrient }),
+      ...(opts.strictDrift !== undefined && { strictDrift: opts.strictDrift }),
+      interactive: !opts.json,
+    });
+    if (mandate && !opts.platform) {
+      platformOverride = mandate;
+    }
+    if (opts.vpsHost) {
+      const { loadPreferences, mergePreferences, savePreferences } = await import('./onboard/preferences.js');
+      const current = loadPreferences(resolved.localPath);
+      if (current) {
+        savePreferences(
+          resolved.localPath,
+          mergePreferences(current, { deployment: { ...current.deployment, vpsHost: opts.vpsHost } }),
+        );
       }
     }
+    thinking = opts.json ? null : startThinking();
 
     const byokKey = await resolveAnthropicKey(loadByokConfig(resolved.localPath));
     const { plan, enrichmentSource } = await buildPlan(resolved.localPath, {
@@ -656,6 +783,7 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
       ...(resolved.sha !== undefined && { sha: resolved.sha }),
       ...(platformOverride !== undefined && { platformOverride }),
       ...(opts.workspace !== undefined && { workspace: opts.workspace }),
+      ...(adjustments !== undefined && { platformAdjustments: adjustments }),
       ai: opts.noAi ? { disable: true } : { ...(byokKey && { apiKey: byokKey }) },
     });
     thinking?.stop();
@@ -2380,13 +2508,15 @@ interface VpsBootstrapOpts {
   deployRoot?: string;
   sshPort?: string;
   identityFile?: string;
+  sshUser?: string;
+  sshKey?: string;
   noDocker?: boolean;
   noCaddy?: boolean;
   yes?: boolean;
 }
 
 async function runVpsBootstrap(host: string, opts: VpsBootstrapOpts): Promise<void> {
-  const { sshAvailable } = await import('./adapters/vps/runner.js');
+  const { sshAvailable, discoverLocalSshKeys, probeSshAuth } = await import('./adapters/vps/runner.js');
   const { bootstrapVps } = await import('./adapters/vps/bootstrap.js');
 
   if (!(await sshAvailable())) {
@@ -2394,20 +2524,62 @@ async function runVpsBootstrap(host: string, opts: VpsBootstrapOpts): Promise<vo
     process.exit(2);
   }
 
+  // Normalize the destination: --ssh-user (default root) applies when the
+  // host doesn't already carry a user@ prefix.
+  const sshUser = opts.sshUser ?? 'root';
+  const destination = host.includes('@') ? host : `${sshUser}@${host}`;
+
+  // Key discovery before anything else: --ssh-key wins, then --identity-file,
+  // then the operator's default keys (~/.ssh/id_ed25519 / id_rsa / id_ecdsa).
+  // No keys at all → print the recipe; never auto-generate.
+  const identityFile = opts.sshKey ?? opts.identityFile;
+  const localKeys = discoverLocalSshKeys();
+  if (!identityFile && localKeys.length === 0) {
+    process.stdout.write(`${pc.yellow('!')} No SSH keys found in ~/.ssh (looked for id_ed25519, id_rsa, id_ecdsa).\n`);
+    process.stdout.write(`  Generate one: ${pc.bold('ssh-keygen -t ed25519')}\n`);
+    process.stdout.write(`  Then upload it: ${pc.bold(`ssh-copy-id ${destination}`)}\n`);
+    process.stdout.write(`  (Or point at an existing key with ${pc.bold('--ssh-key <path>')}.)\n`);
+    if (opts.yes === true) {
+      process.exit(2);
+    }
+  } else if (!identityFile) {
+    process.stdout.write(`${pc.dim(`SSH keys available: ${localKeys.join(', ')} (ssh picks via ~/.ssh/config / agent; force one with --ssh-key)`)}\n`);
+  }
+
   const deployRoot = opts.deployRoot ?? '/opt/convoy';
   const target = {
-    host,
+    host: destination,
     deployRoot,
     ...(opts.sshPort !== undefined && { port: parseInt(opts.sshPort, 10) }),
-    ...(opts.identityFile !== undefined && { identityFile: opts.identityFile }),
+    ...(identityFile !== undefined && { identityFile }),
   };
 
-  process.stdout.write(`${pc.dim('Probing')} ${pc.bold(host)} ${pc.dim('...')}\n`);
+  process.stdout.write(`${pc.dim('Probing')} ${pc.bold(destination)} ${pc.dim('...')}\n`);
+
+  // Connectivity + key-auth probe before any state change. The three
+  // outcomes each carry their own fix, so "Bootstrap failed. ssh
+  // connectivity" never happens again.
+  const probe = await probeSshAuth(destination, {
+    ...(identityFile !== undefined && { identityFile }),
+    ...(opts.sshPort !== undefined && { port: parseInt(opts.sshPort, 10) }),
+  });
+  if (probe.status === 'connected') {
+    process.stdout.write(`${pc.green('✓')} ${probe.detail}\n`);
+  } else {
+    process.stdout.write(`${pc.red('✗')} ${probe.detail}\n`);
+    if (opts.yes === true) {
+      process.stdout.write(`\n${pc.red('Bootstrap aborted before any change was made.')} Fix the SSH connection and re-run.\n`);
+      process.exit(2);
+    }
+  }
 
   if (opts.yes !== true) {
     // Dry-run: show what would happen without executing
-    process.stdout.write(`\n${pc.bold('vps bootstrap plan')} for ${pc.bold(host)}\n`);
-    process.stdout.write(`${pc.dim('deploy root:')} ${deployRoot}\n\n`);
+    process.stdout.write(`\n${pc.bold('vps bootstrap plan')} for ${pc.bold(destination)}\n`);
+    process.stdout.write(`${pc.dim('deploy root:')} ${deployRoot}\n`);
+    process.stdout.write(
+      `${pc.dim('ssh probe:')} ${probe.status === 'connected' ? pc.green(`✓ ${probe.detail}`) : pc.red(`✗ ${probe.detail}`)}\n\n`,
+    );
 
     if (opts.noDocker !== true) {
       process.stdout.write(`  ${pc.cyan('1.')} Install Docker (get.docker.com — skip if already present)\n`);
@@ -2554,6 +2726,23 @@ async function runStageSecrets(planId: string): Promise<void> {
     process.stdout.write(
       `${pc.green('✓')} Wrote ${Object.keys(valuesToStage).length} value${Object.keys(valuesToStage).length === 1 ? '' : 's'} to ${secretsPath}\n`,
     );
+
+    // Also push each value to the plan's chosen platform when its CLI +
+    // auth are available. Best-effort: the local write above is the source
+    // of truth, and a failed push degrades to "staged at deploy time" —
+    // never throws, never blocks the staging flow.
+    const { buildPushContextFromPlan, pushSecretToPlatform } = await import('./core/secret-push.js');
+    const pushCtx = await buildPushContextFromPlan(plan);
+    for (const [key, value] of Object.entries(valuesToStage)) {
+      const pushed = await pushSecretToPlatform(key, value, pushCtx);
+      if (pushed.ok) {
+        process.stdout.write(`  ${pc.green('✓')} ${pc.cyan(key)} pushed to ${pushCtx.platform}\n`);
+      } else {
+        process.stdout.write(
+          `  ${pc.yellow('⚠')} ${pc.cyan(key)} saved locally — ${pushed.reason ?? 'push failed'}; will be staged at deploy time\n`,
+        );
+      }
+    }
   }
 
   if (toMarkAlreadySet.length > 0) {
@@ -3819,8 +4008,11 @@ const program = new Command()
 program
   .command('ship <target>')
   .description('Plan + apply end-to-end. Real by default. Accepts a local path or a GitHub URL / owner/repo.')
-  .option('--platform <platform>', 'explicit platform choice: fly | railway | vercel | cloudrun')
+  .option('--platform <platform>', 'explicit platform choice: fly | railway | vercel | cloudrun | vps')
   .option('--workspace <subdir>', 'target a specific subdirectory (e.g. backend, apps/web)')
+  .option('--skip-onboard', 'skip the first-contact onboarding gate (CI: proceeds with defaults)')
+  .option('--skip-orient', 'skip per-run drift detection between preferences and repo artifacts')
+  .option('--strict-drift', 'turn drift warnings into a hard pause (exit 2 with a blocker message)')
   .option('-y, --auto-approve', 'auto-approve every gate. Default: pause at every gate; decide from the web UI')
   .option('--open', 'open the run in the web UI (http://localhost:3737) when it starts')
   .option('--trust-repo', 'allow real rehearsal to inherit cloud credentials from the parent env (default: scrubbed — only PATH/HOME/NODE_ENV + explicit --env)')
@@ -3864,14 +4056,17 @@ program
 program
   .command('plan <path>')
   .description('Produce an inspectable plan of what `convoy apply` would do. Reads the target path or GitHub URL; does not write or deploy anything.')
-  .option('--platform <platform>', 'explicit platform choice: fly | railway | vercel | cloudrun')
+  .option('--platform <platform>', 'explicit platform choice: fly | railway | vercel | cloudrun | vps')
   .option('--repo-url <url>', 'annotate the plan with a remote repo URL (does not fetch)')
   .option('--workspace <subdir>', 'target a specific subdirectory (e.g. backend, apps/web) for monorepos')
   .option('--save', 'persist the plan to .convoy/plans/<id>.json', false)
   .option('--open', 'open the saved plan in the web UI (requires --save)')
   .option('--json', 'output the raw plan as JSON instead of the human-readable render', false)
   .option('--no-ai', 'skip the Opus narrative pass and use the deterministic output')
-  .option('--skip-onboard', 'suppress the "no team preferences on file" warning')
+  .option('--skip-onboard', 'skip the first-contact onboarding gate (CI: proceeds with defaults)')
+  .option('--skip-orient', 'skip per-run drift detection between preferences and repo artifacts')
+  .option('--strict-drift', 'turn drift warnings into a hard pause (exit 2 with a blocker message)')
+  .option('--vps-host <host>', 'VPS destination (user@host or IP) — informs the vps lane and is saved to team preferences')
   .action(async (path: string, options: PlanOpts) => {
     await runPlan(path, options);
   });
@@ -4051,7 +4246,9 @@ program
   .argument('[host]', 'SSH destination: user@host')
   .option('--deploy-root <path>', 'base deploy directory on the box (default: /opt/convoy)')
   .option('--ssh-port <n>', 'SSH port (default: 22)')
-  .option('--identity-file <path>', 'path to SSH private key')
+  .option('--ssh-user <user>', 'SSH user when the host has no user@ prefix (default: root)')
+  .option('--ssh-key <path>', 'path to SSH private key (default: discovered ~/.ssh/id_ed25519 / id_rsa / id_ecdsa via ssh config/agent)')
+  .option('--identity-file <path>', 'path to SSH private key (alias of --ssh-key)')
   .option('--no-docker', 'skip Docker install')
   .option('--no-caddy', 'skip Caddy install')
   .option('-y, --yes', 'actually run the install commands (otherwise prints what it would do and exits)')
@@ -4136,13 +4333,21 @@ program
   .command('onboard [path]')
   .description('Capture team deployment preferences interactively. Persists to .convoy/preferences.json.')
   .option('--answers <json>', 'pre-fill answers as JSON (for non-interactive/MCP use)')
-  .action(async (targetPath: string | undefined, opts: { answers?: string }) => {
+  .option('--platform <platform>', 'set the platform mandate directly: fly | railway | vercel | cloudrun | vps (skips that question)')
+  .action(async (targetPath: string | undefined, opts: { answers?: string; platform?: string }) => {
     const localPath = resolve(targetPath ?? '.');
     if (!existsSync(localPath)) {
       process.stderr.write(`${pc.red('error')} path not found: ${localPath}\n`);
       process.exit(1);
     }
     const prefilled = opts.answers ? JSON.parse(opts.answers) as Record<string, unknown> : {};
+    if (opts.platform !== undefined) {
+      if (!isPlatform(opts.platform)) {
+        process.stderr.write(pc.red(`Unknown platform "${opts.platform}". Supported: ${SUPPORTED_PLATFORMS.join(', ')}\n`));
+        process.exit(2);
+      }
+      prefilled['platformMandate'] = opts.platform;
+    }
     const { runOnboard } = await import('./onboard/index.js');
     await runOnboard(localPath, prefilled);
   });

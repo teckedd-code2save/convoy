@@ -1,5 +1,6 @@
 import { notFound } from 'next/navigation';
 
+import { loadPreferences } from '../../../../src/onboard/preferences.js';
 import {
   computeExpectedKeys,
   computeStagedState,
@@ -12,7 +13,7 @@ import { ConfigPanel, type PanelRow } from './config-panel';
 import { BlockersSection } from './blockers-section';
 import { ApplyButton } from './apply-button';
 
-const SUPPORTED_PLATFORMS = ['fly', 'railway', 'vercel', 'cloudrun'];
+const SUPPORTED_PLATFORMS = ['fly', 'railway', 'vercel', 'cloudrun', 'vps'];
 
 export const dynamic = 'force-dynamic';
 
@@ -538,6 +539,16 @@ function ConfigPanelSection({ plan }: { plan: PlanSummary }) {
     computeStagedState(plan);
   const recurring = readRecurringPref(plan);
 
+  // VPS needs a host. Pre-fill the switcher's inline input from team
+  // preferences (read server-side; the value never round-trips through
+  // client state until the operator edits it).
+  let vpsHost = '';
+  try {
+    vpsHost = loadPreferences(plan.target.localPath)?.deployment.vpsHost ?? '';
+  } catch {
+    // preferences unreadable — leave blank
+  }
+
   const rows: PanelRow[] = expected.map((e) => ({
     key: e.key,
     source: e.source,
@@ -557,6 +568,7 @@ function ConfigPanelSection({ plan }: { plan: PlanSummary }) {
       alternatives={SUPPORTED_PLATFORMS}
       secretsPath={secretsPath}
       alreadySetPath={alreadySetPath}
+      vpsHost={vpsHost}
     />
   );
 }

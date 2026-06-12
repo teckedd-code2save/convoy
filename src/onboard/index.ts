@@ -29,7 +29,9 @@ export async function runOnboard(repoPath: string, prefilled: Partial<OnboardAns
 
   if (!process.stdin.isTTY) {
     // Non-interactive: merge prefilled answers into defaults and save
-    return applyAnswers(localPath, existing, prefilled);
+    const prefs = applyAnswers(localPath, existing, prefilled);
+    savePreferences(localPath, prefs);
+    return prefs;
   }
 
   const rl = readline.createInterface({ input, output });
