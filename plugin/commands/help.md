@@ -60,6 +60,19 @@ Convoy — slash commands
     Example:
       /convoy:ship-rollback my-fly-app
 
+Secrets management (CLI — not slash commands)
+─────────────────────────────────────────────
+  convoy stage-secrets <planId>   Interactive walkthrough to enter/stage env vars.
+                                  Leads with a manager pull offer when Infisical/
+                                  Doppler/Vault is configured.
+  convoy secrets pull <planId>    Pull expected keys directly from the detected
+                                  secrets manager (Infisical/Doppler/Vault) →
+                                  writes to .env.convoy-secrets.
+  convoy secrets push <planId>    Show the push commands to sync staged values back
+                                  to the secrets manager (operator-confirmed, never
+                                  automatic).
+  convoy secrets health           Probe the configured secrets manager (5s timeout).
+
 Pipeline order (reference)
 ──────────────────────────
   scan → pick → rehearse → author → canary → promote → observe

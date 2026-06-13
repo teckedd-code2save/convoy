@@ -5,7 +5,7 @@ export interface PlanAuthoredFile {
   path: string;
   lines: number;
   summary: string;
-  contentPreview: string;
+  contentPreview?: string;
 }
 
 export interface PlanPlatformCandidate {
@@ -26,6 +26,8 @@ export interface PlanSummary {
   version?: number;
   id: string;
   createdAt: string;
+  supersedes?: string;
+  supersededBy?: string;
   repo?: {
     name: string;
     repoUrl: string | null;
