@@ -163,6 +163,14 @@ export class RehearsalRunner {
 
     try {
       if (this.#target.installCommand) {
+        // Python lanes: provision an isolated venv so the install interpreter
+        // and the start interpreter are the same one. Without this, on a host
+        // with multiple Pythons (system + miniconda + framework) `pip` and
+        // `uvicorn` can resolve to different prefixes — deps install into one,
+        // the app boots under another, and imports fail. The venv's bin dir is
+        // auto-prepended to PATH by composeEnv (LOCAL_BIN_SUBDIRS), so both
+        // install and boot go through it.
+        await this.#ensurePythonVenv(installCwd, this.#target.installCommand, signal);
         this.#onPhase('install.running', { cmd: this.#target.installCommand, cwd: installCwd });
         await this.#execWait(this.#target.installCommand, installCwd, 180_000, signal);
         this.#onPhase('install.done');
@@ -232,6 +240,31 @@ export class RehearsalRunner {
       logs: [...this.#logs],
       durationMs: Date.now() - started,
     };
+  }
+
+  /**
+   * For pip-based install commands, ensure an isolated `.venv` exists in the
+   * install dir. A no-op when the command isn't pip-based or a venv is already
+   * present. Idempotent and safe: the venv's `.venv/bin` is what composeEnv
+   * prepends to PATH, pinning `pip` + `uvicorn` (etc.) to one interpreter.
+   */
+  async #ensurePythonVenv(cwd: string, installCommand: string, signal?: AbortSignal): Promise<void> {
+    const isPip = /(^|\s)pip[0-9.]*\s+install\b/.test(installCommand);
+    if (!isPip) return;
+    // Respect any venv the operator (or a prior step) already created.
+    if (
+      existsSync(`${cwd}/.venv/bin`) ||
+      existsSync(`${cwd}/venv/bin`) ||
+      existsSync(`${cwd}/.venv/Scripts`) ||
+      existsSync(`${cwd}/venv/Scripts`)
+    ) {
+      return;
+    }
+    this.#onPhase('venv.creating', { cwd });
+    // `python3 -m venv` ships its own pip, so the subsequent pip install and
+    // the boot command both resolve through `.venv/bin`.
+    await this.#execWait('python3 -m venv .venv', cwd, 120_000, signal);
+    this.#onPhase('venv.created', { path: `${cwd}/.venv` });
   }
 
   async #execWait(shellCmd: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {

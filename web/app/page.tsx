@@ -1,23 +1,10 @@
-import dynamicImport from 'next/dynamic';
-
 import { listPlans, type PlanSummary } from '@/lib/plans';
 import { listRuns, type RunRow } from '@/lib/runs';
+// Canvas-based client components — dynamic `ssr: false` imports live in a
+// Client Component (hero-dynamic) since that's where Next.js permits them.
+import { PipelineHero, HeroCards, Starfield } from '@/components/hero-dynamic';
 
 export const dynamic = 'force-dynamic';
-
-// Client components loaded dynamically (canvas-based)
-const PipelineHero = dynamicImport(
-  () => import('@/components/pipeline-hero').then(m => ({ default: m.PipelineHero })),
-  { ssr: false },
-);
-const HeroCards = dynamicImport(
-  () => import('@/components/hero-cards').then(m => ({ default: m.HeroCards })),
-  { ssr: false },
-);
-const Starfield = dynamicImport(
-  () => import('@/components/starfield').then(m => ({ default: m.Starfield })),
-  { ssr: false },
-);
 
 export default function Home() {
   const plans = listPlans();

@@ -6,8 +6,9 @@ import type { PlanSummary } from '@/lib/plans';
 
 export const dynamic = 'force-dynamic';
 
-export default function ProjectPage({ params }: { params: { slug: string } }) {
-  const found = getProject(params.slug);
+export default async function ProjectPage({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params;
+  const found = getProject(slug);
   if (!found) notFound();
   const project = found!;
 

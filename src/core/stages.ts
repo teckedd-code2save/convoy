@@ -292,6 +292,13 @@ export interface RealRehearsalOpt {
    * node_modules/.bin resolves framework binaries (next, vite, tsx, etc.).
    */
   serviceCwd?: string;
+  /**
+   * Where the install command runs. The install manifest (requirements.txt,
+   * package-lock.json, etc.) is detected at the lane's servicePath, so for a
+   * subdir lane the install must run there — not at the repo root. Defaults to
+   * repoPath when absent (legacy single-lane behavior).
+   */
+  installCwd?: string;
   installCommand?: string;
   buildCommand?: string;
   startCommand: string;
@@ -1055,7 +1062,7 @@ export class RehearseStage extends BaseStage {
 
     const runner = new RehearsalRunner(
       {
-        installCwd: cfg.repoPath,
+        installCwd: cfg.installCwd ?? cfg.repoPath,
         serviceCwd: cfg.serviceCwd ?? cfg.repoPath,
         startCommand: cfg.startCommand,
         port: cfg.port,
