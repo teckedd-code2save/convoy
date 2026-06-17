@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 
+import { compressRunEvents } from './compress.js';
 import type { ConvoyPlan } from './plan.js';
 import type { ConvoyMemory } from './memory.js';
 import type { Run, RunEvent } from './types.js';
@@ -66,14 +67,9 @@ export async function learnFromRun(
 
   const targetPath = plan?.target.localPath ?? run.repoUrl;
 
-  // Summarize the last 40 events (enough context without token bloat)
-  const eventLines = events
-    .slice(-40)
-    .map(
-      (e) =>
-        `[${e.stage}/${e.kind}${e.laneId ? `/${e.laneId}` : ''}] ${JSON.stringify(e.payload).slice(0, 240)}`,
-    )
-    .join('\n');
+  // Compress the event log — adaptive: verbatim if small, Opus summary if large.
+  // This replaces the old events.slice(-40) fixed truncation.
+  const eventLines = await compressRunEvents(events, { apiKey });
 
   const context = {
     runId: run.id,

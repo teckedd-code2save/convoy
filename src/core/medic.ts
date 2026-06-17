@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 
 import Anthropic from '@anthropic-ai/sdk';
 
+import { compressMessageHistory } from './compress.js';
 import type { DeveloperHandoffPacket, LaneRole, Platform } from './types.js';
 
 const MODEL = 'claude-opus-4-7';
@@ -139,14 +140,28 @@ export async function diagnose(
   const tools = buildTools();
   const toolCallsRecord: AgentToolCall[] = [];
 
-  const messages: Anthropic.MessageParam[] = [
+  let messages: Anthropic.MessageParam[] = [
     { role: 'user', content: buildInitialPrompt(input) },
   ];
 
   let finalDiagnosis: Omit<Diagnosis, 'source' | 'toolCalls'> | null = null;
+  const midpoint = Math.floor(MAX_TURNS / 2);
 
   try {
     for (let turn = 0; turn < MAX_TURNS; turn += 1) {
+      // At the midpoint, compress accumulated tool results if the message
+      // history has grown large. Mirrors the Hermes ~50% threshold strategy:
+      // Opus summarises evidence so far into a compact findings block,
+      // keeping the remaining turns focused rather than context-diluted.
+      if (turn === midpoint) {
+        const result = await compressMessageHistory(
+          client,
+          messages,
+          opts.model ?? MODEL,
+        );
+        messages = result.messages;
+      }
+
       const response = await client.messages.create({
         model: opts.model ?? MODEL,
         max_tokens: MAX_TOKENS,
