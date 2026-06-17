@@ -105,8 +105,12 @@ State is SQLite on the host, so multiple clients can interleave tool calls safel
 
 ```
 onboard → orient → scan → pick → rehearse → author → canary → promote → observe
-                                                 │
-                                                 └─ medic (sidecar on any breach)
+                                                 │                           │
+                                                 └─ medic (any breach)       └─ learn (every run)
+                                                                                      │
+                                                          memory ←───────────────────┘
+                                                             │
+                                                         enricher (next plan)
 ```
 
 | Stage | What it does |
@@ -121,6 +125,7 @@ onboard → orient → scan → pick → rehearse → author → canary → prom
 | **promote** | Configurable bake window between deploy and full promote. |
 | **observe** | Post-deploy watch window. SLO-healthy = release stays. Breach = auto-rollback. |
 | **medic** | Sidecar to any breach. An Opus 4.7 tool-use loop — up to six turns, four scoped tools (`read_log_tail`, `read_file`, `grep_repo`, `finalize_diagnosis`). Produces a structured root-cause card; never patches your code. |
+| **learn** | Post-run Opus pass (fire-and-forget). Reads the last 40 run events, extracts a lesson, writes confidence-weighted facts and reusable skill docs to the memory store. Never blocks the pipeline — a failed learn call is silently discarded. |
 
 **Plan supersede lineage.** Re-planning the same target marks the old plan `superseded`. `convoy plans` shows `active` / `superseded → <id>`. The web UI dims old plans so the operator always works from the current one.
 
@@ -323,11 +328,30 @@ convoy/
 └── docs/                   architecture.md · principles.md · rollback-proof.md
 ```
 
-**Three layers, each with a clear responsibility:**
+**Four layers, each with a clear responsibility:**
 
-- **TypeScript core** (`src/`) — deterministic. Scanner, picker, author, orchestrator, medic scaffolding, and all platform adapters run without AI. The enricher and medic are opt-in AI passes layered on top.
-- **Opus 4.7 enricher** — non-deterministic, upgrades quality. Tailors Dockerfiles, writes first-person plan narratives, and runs the medic loop. Degrades gracefully when `ANTHROPIC_API_KEY` is absent: ecosystem templates instead of tailored files, structured fallbacks instead of the medic.
+- **TypeScript core** (`src/`) — deterministic. Scanner, picker, author, orchestrator, medic scaffolding, and all platform adapters run without AI. The enricher, medic, and learn pass are opt-in AI passes layered on top.
+- **Agent memory** (`src/core/memory.ts`, `src/core/learn.ts`) — three-tier store in the same SQLite DB: semantic facts (persistent key/value about a repo), episodic outcomes (one compressed record per run), and procedural skills (reusable deployment patterns). After every run the learn pass extracts a lesson and writes to memory. Before every plan the enricher loads a context summary so Opus drafts with prior history. No weight mutation — learning is prompt augmentation.
+- **Opus 4.7 enricher + medic + learn** — non-deterministic, upgrades quality. The enricher tailors Dockerfiles and writes first-person plan narratives (loaded with prior context on repeat deploys). The medic runs a scoped tool-use loop on any breach. The learn pass closes the feedback loop. All three degrade gracefully when `ANTHROPIC_API_KEY` is absent.
 - **Next.js 15 viewer** (`web/`) — reads the same SQLite DB the CLI and MCP server write. Approval clicks write back via server actions. Nothing in the viewer has a separate state store.
+
+**Memory data flow:**
+
+```
+convoy plan ./app
+  └─ ConvoyMemory.buildContextSummary('./app')
+       ├─ facts:    "preferred_platform: fly [95%]"
+       ├─ outcomes: "[succeeded] fly @ observe · p99=142ms → migration ran cleanly"
+       └─ skills:   "Express + Prisma on Fly: run migrate deploy as release command"
+           │
+           └─► injected into enricher system prompt → Opus plans with history
+                                                            │
+convoy apply <plan>
+  └─ run completes → orchestrator.#triggerLearn()
+       └─ Opus reads 40 events → extracts lesson + facts + skills
+            └─► memory.recordOutcome() + memory.setFact() + memory.saveSkill()
+                   └─► available to next convoy plan
+```
 
 ---
 

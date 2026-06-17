@@ -50,6 +50,12 @@ export interface EnrichmentOptions {
   cacheDir?: string;
   model?: string;
   disable?: boolean;
+  /**
+   * Markdown context block from ConvoyMemory.buildContextSummary() —
+   * injected into the system prompt so Opus has prior deployment history
+   * and team-specific facts when drafting this plan.
+   */
+  priorContext?: string;
 }
 
 interface Enrichment {
@@ -81,10 +87,13 @@ export async function enrichPlan(
 
   try {
     const client = new Anthropic({ apiKey });
+    const systemText = opts.priorContext
+      ? `${SYSTEM_PROMPT}\n\n${opts.priorContext}`
+      : SYSTEM_PROMPT;
     const response = await client.messages.create({
       model: opts.model ?? MODEL,
       max_tokens: MAX_TOKENS,
-      system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+      system: [{ type: 'text', text: systemText, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: buildUserPrompt(scan, plan) }],
     });
 
