@@ -90,6 +90,57 @@ The **medic** activates on any stage failure. It is a **Claude agent loop** (Opu
 
 The **rollback** path is pre-staged at every stage. Forward progress is never permitted without a named, measured reverse.
 
+## Agent memory layer
+
+Convoy now maintains a three-tier memory store (same SQLite database, four new tables) so each run benefits from what prior runs learned.
+
+```mermaid
+flowchart LR
+  classDef tier fill:#0f6fff22,stroke:#0f6fff
+  classDef agent fill:#38d39922,stroke:#38d399
+  classDef db fill:#c084fc22,stroke:#c084fc
+
+  subgraph Memory["ConvoyMemory  (src/core/memory.ts)"]
+    Facts["memory_facts\nsemantic — key/value\nconfidence-weighted"]:::tier
+    Outcomes["memory_outcomes\nepisodic — one row\nper run"]:::tier
+    Skills["memory_skills\nprocedural — reusable\nstep-by-step patterns"]:::tier
+    Traces["decision_traces\nplatform pick ↔ actual\noutcome linkage"]:::tier
+  end
+
+  Enricher["Enricher (Opus)\nsrc/planner/enricher.ts"]:::agent
+  Learn["Learn pass (Opus)\nsrc/core/learn.ts"]:::agent
+  Orch["Orchestrator\nsrc/core/orchestrator.ts"]:::agent
+
+  Enricher -- "loads prior context\nvia buildContextSummary()" --> Memory
+  Orch -- "run completes\n(success or breach)" --> Learn
+  Learn -- "writes facts,\noutcome, skills" --> Memory
+  Traces -- "platform overrides\ndetected" --> Facts
+```
+
+| Tier | Table | Written by | Read by |
+|---|---|---|---|
+| **Semantic** | `memory_facts` | Learn pass, operator overrides | Enricher system prompt |
+| **Episodic** | `memory_outcomes` | Learn pass | Enricher, memory-agent |
+| **Procedural** | `memory_skills` | Learn pass | Enricher system prompt |
+| **Decision trace** | `decision_traces` | Orchestrator (platform pick) | Memory-agent drift report |
+
+### How the closed loop works
+
+1. **Plan**: `ConvoyMemory.buildContextSummary(localPath)` builds a Markdown block — prior facts, last 5 outcomes, top-3 skills. Injected into the enricher's system prompt before Opus drafts the plan. First run for a repo: empty → no change. Tenth run: Opus drafts against 9 prior outcomes.
+
+2. **Run**: Orchestrator runs stages. On completion (success, breach, or rollback), `#triggerLearn()` fires a fire-and-forget Opus call.
+
+3. **Learn**: `learnFromRun()` (Opus) reads the last 40 run events + plan context, extracts: one lesson sentence, 1–3 confidence-weighted facts, 0–2 skill docs. Writes them to memory. A failed learn pass never propagates — it's advisory.
+
+4. **Adapt**: Next plan for the same repo gets the lesson, facts, and skills in its enricher context. Platform scores drift toward what the team actually ships.
+
+### Memory invariants
+
+- Learning is **prompt augmentation, not weight mutation** — Convoy stays model-agnostic
+- All memory writes are **async and non-blocking** — a slow Opus call never delays the pipeline
+- **No secret values ever enter memory** — key names and counts only
+- Skill docs are **inspectable** at `.convoy/state.db` — operators can query with `sqlite3`
+
 ## Coordinated lane agents
 
 | Agent | Role |
@@ -101,6 +152,7 @@ The **rollback** path is pre-staged at every stage. Forward progress is never pe
 | **medic** | Claude agent loop. Four scoped tools; up to six turns. Emits structured diagnosis; pauses for developer fix on `owned=developer`. Implementation: `src/core/medic.ts`. |
 | **correlator** | Reads metrics during canary and observe stages. Decides go/no-go between promotion steps. |
 | **policy** | Evaluates rules — freeze windows, tier, required approvers, blast-radius budget. |
+| **learn** | Post-run Opus pass. Reads events + outcomes, extracts facts and skill docs, writes to memory. Fire-and-forget — never blocks the pipeline. Implementation: `src/core/learn.ts`. |
 
 Lane runtime model:
 

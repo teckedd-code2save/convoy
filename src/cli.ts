@@ -25,6 +25,7 @@ import {
   type RealVpsOpt,
 } from './core/stages.js';
 import { RunStateStore } from './core/state.js';
+import { ConvoyMemory } from './core/memory.js';
 import type { Platform, Run, RunEvent, StageName } from './core/types.js';
 import { probePlatformConnection } from './adapters/connections.js';
 import type { ConnectionCheck, ConnectionStatus } from './adapters/types.js';
@@ -793,6 +794,8 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
     thinking = opts.json ? null : startThinking();
 
     const byokKey = await resolveAnthropicKey(loadByokConfig(resolved.localPath));
+    const shipMemory = new ConvoyMemory(STATE_PATH);
+    const shipContext = shipMemory.buildContextSummary(resolved.localPath);
     const { plan, enrichmentSource } = await buildPlan(resolved.localPath, {
       ...(inferredRepoUrl !== undefined && { repoUrl: inferredRepoUrl }),
       ...(resolved.branch !== undefined && { branch: resolved.branch }),
@@ -801,7 +804,9 @@ async function runPlan(path: string, opts: PlanOpts): Promise<void> {
       ...(mandate !== null && { platformMandate: mandate }),
       ...(opts.workspace !== undefined && { workspace: opts.workspace }),
       ...(adjustments !== undefined && { platformAdjustments: adjustments }),
-      ai: opts.noAi ? { disable: true } : { ...(byokKey && { apiKey: byokKey }) },
+      ai: opts.noAi
+        ? { disable: true }
+        : { ...(byokKey && { apiKey: byokKey }), ...(shipContext && { priorContext: shipContext }) },
     });
     thinking?.stop();
 
@@ -2066,9 +2071,10 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
   );
 
   const store = new RunStateStore(STATE_PATH);
+  const memory = new ConvoyMemory(STATE_PATH);
   const bus = new ConvoyBus();
   const stages = defaultStages();
-  const orchestrator = new Orchestrator(store, bus, stages);
+  const orchestrator = new Orchestrator(store, bus, stages, memory);
 
   const startedAt = new Date();
   const unsubscribe = attachRenderer(bus, startedAt, opts.open === true);

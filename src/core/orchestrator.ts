@@ -1,4 +1,6 @@
 import type { ConvoyBus } from './bus.js';
+import { learnFromRun, type LearnOptions } from './learn.js';
+import type { ConvoyMemory } from './memory.js';
 import type { RunStateStore } from './state.js';
 import {
   RehearsalBreachError,
@@ -27,11 +29,18 @@ export class Orchestrator {
   readonly #store: RunStateStore;
   readonly #bus: ConvoyBus;
   readonly #stages: readonly Stage[];
+  readonly #memory: ConvoyMemory | null;
 
-  constructor(store: RunStateStore, bus: ConvoyBus, stages: readonly Stage[]) {
+  constructor(
+    store: RunStateStore,
+    bus: ConvoyBus,
+    stages: readonly Stage[],
+    memory?: ConvoyMemory,
+  ) {
     this.#store = store;
     this.#bus = bus;
     this.#stages = stages;
+    this.#memory = memory ?? null;
   }
 
   async run(repoUrl: string, opts: OrchestratorOpts): Promise<Run> {
@@ -106,6 +115,7 @@ export class Orchestrator {
         completedAt: new Date(),
       });
       this.#bus.emit({ type: 'run.updated', run: finished });
+      this.#triggerLearn(finished, opts);
       return finished;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -153,9 +163,19 @@ export class Orchestrator {
 
       // Breach is a controlled pause — developer fixes and restarts.
       // Don't rethrow, callers shouldn't treat this as a crash.
+      this.#triggerLearn(finalized, opts);
       if (isBreach) return finalized;
       throw err;
     }
+  }
+
+  /** Fire-and-forget learn pass — failures never affect run outcome. */
+  #triggerLearn(run: Run, opts: OrchestratorOpts): void {
+    if (!this.#memory) return;
+    const memory = this.#memory;
+    const learnOpts: LearnOptions = { apiKey: opts.apiKey };
+    const events = this.#store.listEvents(run.id);
+    learnFromRun(run, events, opts.plan ?? null, memory, learnOpts).catch(() => void 0);
   }
 
   /**
