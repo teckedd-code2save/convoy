@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "createdAt": "2026-06-12T14:39:26.556Z",
+  "deployment": {
+    "mode": "first",
+    "approvers": [],
+    "canary": {
+      "strategy": "canary",
+      "trafficPercent": 5,
+      "bakeWindowSeconds": 120,
+      "autoRollback": true
+    },
+    "stagingApp": null
+  },
+  "platform": {
+    "mandate": "vps",
+    "budgetTier": "hobby"
+  },
+  "release": {
+    "cadence": "many-per-day",
+    "gate": "pr-merged",
+    "freezeDescription": null
+  },
+  "secrets": {
+    "manager": "platform-native",
+    "compliance": [],
+    "dataResidency": "any"
+  },
+  "observability": {
+    "errorTracking": "sentry",
+    "metrics": null,
+    "notifications": {
+      "slack": null,
+      "prComments": true
+    }
+  },
+  "_adaptive": {
+    "lastUpdated": "2026-06-12T14:39:26.556Z",
+    "services": {}
+  },
+  "updatedAt": "2026-06-12T14:39:26.556Z"
+}

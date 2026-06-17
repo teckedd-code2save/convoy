@@ -1,8 +1,8 @@
 import { listPlans, type PlanSummary } from '@/lib/plans';
 import { listRuns, type RunRow } from '@/lib/runs';
-import { PipelineHero } from '@/components/pipeline-hero';
-import { HeroCards } from '@/components/hero-cards';
-import { Starfield } from '@/components/starfield';
+// Canvas-based client components — dynamic `ssr: false` imports live in a
+// Client Component (hero-dynamic) since that's where Next.js permits them.
+import { PipelineHero, HeroCards, Starfield } from '@/components/hero-dynamic';
 
 export const dynamic = 'force-dynamic';
 

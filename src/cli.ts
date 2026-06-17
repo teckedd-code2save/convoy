@@ -2451,6 +2451,9 @@ function buildRealRehearsalOpts(plan: ConvoyPlan, opts: ApplyOpts): RealRehearsa
   const result: RealRehearsalOpt = {
     repoPath: plan.target.localPath,
     serviceCwd,
+    // The install manifest is detected at the lane's servicePath, so the
+    // install command must run there (not the repo root) for subdir lanes.
+    installCwd: serviceCwd,
     startCommand,
     port,
     healthPath,

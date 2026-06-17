@@ -701,6 +701,34 @@ function detectSubServices(
     if (sniffed) out.push(sniffed);
   }
 
+  // Probe one level inside each detected service for a nested deployable — a
+  // child dir with its OWN Dockerfile (e.g. `backend/devlab`). The Dockerfile
+  // is the "independently shippable" signal, so colocated-but-separate
+  // microservices get their own lane while plain code subdirs (and image-only
+  // services that have no build dir at all) are correctly left out.
+  for (const parent of [...out]) {
+    const parentAbs = join(scanPath, parent.path);
+    let children: string[];
+    try {
+      children = readdirSync(parentAbs);
+    } catch {
+      continue;
+    }
+    for (const child of children) {
+      if (SKIP_DIRS.has(child)) continue;
+      const childAbs = join(parentAbs, child);
+      let entries: string[];
+      try {
+        entries = readdirSync(childAbs);
+      } catch {
+        continue; // not a directory
+      }
+      if (!entries.includes('Dockerfile')) continue;
+      const sniffed = sniffSubService(childAbs, `${parent.path}/${child}`);
+      if (sniffed) out.push(sniffed);
+    }
+  }
+
   if (out.length > 0) {
     evidence.push(`detected ${out.length} sub-service${out.length === 1 ? '' : 's'}: ${out.map((s) => s.path).join(', ')}`);
   }
