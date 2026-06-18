@@ -1713,7 +1713,11 @@ export class CanaryStage extends BaseStage {
 
     const staged = new Set<string>([...fileSecrets, ...fileAlready, ...cliAlready]);
     const connection = await probePlatformConnection(lane.platformDecision.chosen, targetCwd, {
-      appName: ctx.opts.realFly?.appName,
+      // For VPS the host arrives via --vps-host (realVps.host); probeVpsConnection
+      // reads it from opts.appName (or CONVOY_VPS_HOST). Without this the
+      // project_binding readiness check sees null and blocks the gate even though
+      // the deploy itself is correctly bound to a host.
+      appName: ctx.opts.realVps?.host ?? ctx.opts.realFly?.appName,
       expectedSecrets: lane.secrets.expectedKeys,
     });
     const connectionKeys = new Set(connection.envKeys);
