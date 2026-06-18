@@ -89,6 +89,13 @@ test('identity store is machine-local and keyed by repo+platform', () => {
     assert.equal(existsSync(join(repo, '.convoy', 'identity.json')), false);
     // A different repo gets its own identity.
     assert.equal(getIdentity(tmp(), 'vps'), null);
+
+    // Sensitive coordinates (host/port) live here, machine-local — not in the repo.
+    const repo2 = tmp();
+    setIdentity(repo2, 'vps', { kind: 'ssh-key-path', path: '/k' }, { host: 'root@10.0.0.1', port: 2222 });
+    const id2 = getIdentity(repo2, 'vps');
+    assert.equal(id2?.host, 'root@10.0.0.1');
+    assert.equal(id2?.port, 2222);
   } finally {
     if (realHome === undefined) delete process.env['HOME'];
     else process.env['HOME'] = realHome;

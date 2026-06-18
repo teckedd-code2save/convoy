@@ -27,6 +27,14 @@ export type IdentityRef =
 export interface DeployIdentity {
   platform: Platform;
   ref: IdentityRef;
+  /**
+   * Sensitive deploy coordinates kept machine-local instead of committed —
+   * used when the repo is NOT private, so a host IP + user never lands in
+   * version control. Empty when the repo is private (the host lives in the
+   * committed target instead).
+   */
+  host?: string;
+  port?: number;
   updatedAt: string;
 }
 
@@ -72,9 +80,20 @@ export function getIdentity(repoPath: string, platform: Platform): DeployIdentit
   return file.entries[`${repoKeyFor(repoPath)}::${platform}`] ?? null;
 }
 
-export function setIdentity(repoPath: string, platform: Platform, ref: IdentityRef): DeployIdentity {
+export function setIdentity(
+  repoPath: string,
+  platform: Platform,
+  ref: IdentityRef,
+  coords: { host?: string; port?: number } = {},
+): DeployIdentity {
   const file = load();
-  const entry: DeployIdentity = { platform, ref, updatedAt: new Date().toISOString() };
+  const entry: DeployIdentity = {
+    platform,
+    ref,
+    ...(coords.host ? { host: coords.host } : {}),
+    ...(coords.port ? { port: coords.port } : {}),
+    updatedAt: new Date().toISOString(),
+  };
   file.entries[`${repoKeyFor(repoPath)}::${platform}`] = entry;
   persist(file);
   return entry;

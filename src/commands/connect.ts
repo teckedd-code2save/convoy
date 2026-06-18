@@ -44,6 +44,21 @@ export interface ConnectOpts {
 
 const VALID_PLATFORMS: Platform[] = ['fly', 'vercel', 'railway', 'cloudrun', 'vps'];
 
+/**
+ * The committed view of a target: strip the sensitive coordinates (host/user/
+ * port) so they never land in version control. Everything left — platform,
+ * appName, imageRef, domain, region, secret-source pointer — is shareable.
+ */
+function committedView(target: DeployTarget, _detail: string | undefined): DeployTarget {
+  const { host: _h, user: _u, port: _p, ...rest } = target;
+  return rest;
+}
+
+/** Remove the host substring from a human detail line before it's persisted. */
+function hostFreeDetail(detail: string, host: string | undefined): string {
+  return host ? detail.split(host).join('<host>') : detail;
+}
+
 /** CLI-backed fixer: real prompts + foreground subprocesses (stdio inherited). */
 function makeCliFixer(rl: readline.Interface | null): AccessFixer {
   return {
@@ -179,28 +194,32 @@ export async function runConnect(repoPath: string, platformArg: string | undefin
       return res.ok;
     }
 
-    // Persist the identity choice immediately (machine-local) so the verify +
-    // resolve loop and every later run use the same key.
-    const ident = setIdentity(repoPath, platform, identityRef);
+    // Persist the identity choice + the sensitive coordinates (host/port)
+    // machine-local — they NEVER go into committed config. A box IP + user is
+    // reconnaissance, not a credential; keeping it out of git is the default
+    // standard regardless of repo visibility. Teammates set CONVOY_VPS_HOST or
+    // run `convoy connect` themselves.
+    const ident = setIdentity(repoPath, platform, identityRef, { host: target.host, port: target.port });
 
     if (opts.noProbe) {
-      // CI-style: capture coordinates without reaching out. Mark unverified.
-      upsertTarget(repoPath, target);
-      output.write(pc.dim(`Captured ${platform} target (not probed). Verify later with: convoy connect ${platform}\n`));
+      upsertTarget(repoPath, committedView(target, undefined));
+      output.write(pc.dim(`Captured ${platform} target (not probed). Host kept local. Verify later with: convoy connect ${platform}\n`));
       return false;
     }
 
     const fixer = makeCliFixer(rl);
     const { ok, result } = await resolveAccessInteractive(platform, repoPath, target, ident, fixer);
 
+    const detail = hostFreeDetail(result.detail, target.host);
     const verification: AccessVerification = ok
-      ? { verifiedAt: new Date().toISOString(), status: 'verified', ...(result.account ? { account: result.account } : {}), detail: result.detail }
-      : { verifiedAt: null, status: 'failed', detail: result.detail };
-    upsertTarget(repoPath, { ...target, verification });
+      ? { verifiedAt: new Date().toISOString(), status: 'verified', ...(result.account ? { account: result.account } : {}), detail }
+      : { verifiedAt: null, status: 'failed', detail };
+    upsertTarget(repoPath, { ...committedView(target, undefined), verification });
 
     if (ok) {
       output.write(`\n${pc.green('✓ access verified')} — ${result.detail}\n`);
-      output.write(pc.dim(`  Target saved to .convoy/preferences.json (commit it so teammates inherit it).\n`));
+      output.write(pc.dim(`  Shareable target saved to .convoy/preferences.json (commit it).\n`));
+      output.write(pc.dim(`  Host kept machine-local in ~/.convoy — teammates set CONVOY_VPS_HOST or run \`convoy connect ${platform}\`.\n`));
     } else {
       output.write(`\n${pc.yellow('! access not fully established')} — ${result.detail}\n`);
       for (const b of result.blockers) output.write(`  ${pc.yellow('•')} ${b.title} — ${b.detail}\n`);

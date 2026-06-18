@@ -2257,7 +2257,11 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
 
   if (platform === 'vps' && opts.realVps === true) {
     const vpsTarget = getTarget(plan.target.localPath, 'vps');
-    const host = opts.vpsHost ?? process.env['CONVOY_VPS_HOST'] ?? vpsTarget?.host;
+    // Host is sensitive and kept out of committed config: resolve it from the
+    // flag, CONVOY_VPS_HOST, the machine-local identity (where `convoy connect`
+    // stores it), or an explicitly-committed target host as a last resort.
+    const host = opts.vpsHost ?? process.env['CONVOY_VPS_HOST']
+      ?? getIdentity(plan.target.localPath, 'vps')?.host ?? vpsTarget?.host;
     if (!host) {
       console.error(
         pc.red('--real-vps requires --vps-host=user@host (or set CONVOY_VPS_HOST / run `convoy connect vps`).'),
@@ -2307,7 +2311,8 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
       // non-secret coordinates, so the operator need not re-pass them. The
       // token is never persisted — env stays its source.
       const ghcrTarget = getTarget(plan.target.localPath, 'vps');
-      const host = opts.vpsHost ?? process.env['CONVOY_VPS_HOST'] ?? ghcrTarget?.host;
+      const host = opts.vpsHost ?? process.env['CONVOY_VPS_HOST']
+        ?? getIdentity(plan.target.localPath, 'vps')?.host ?? ghcrTarget?.host;
       const imageRef = opts.vpsGhcrImage ?? process.env['CONVOY_GHCR_IMAGE'] ?? ghcrTarget?.imageRef;
       const ghcrUsername = opts.vpsGhcrUsername ?? process.env['GHCR_USERNAME'] ?? process.env['GITHUB_ACTOR'];
       const ghcrToken = opts.vpsGhcrToken ?? process.env['GHCR_TOKEN'] ?? process.env['GH_TOKEN'] ?? process.env['GITHUB_TOKEN'];

@@ -477,11 +477,14 @@ export function registerConvoyTools(server: McpServer): void {
         } else {
           identityRef = { kind: 'cli-cache' };
         }
-        const ident = setIdentity(resolvedRepo, platform, identityRef);
+        // Host is sensitive — kept machine-local, never written to committed
+        // config. `workingHost` is used for the probe; the persisted target omits it.
+        const workingHost = host ?? saved?.host;
+        const ident = setIdentity(resolvedRepo, platform, identityRef, isVps && workingHost ? { host: workingHost } : {});
 
-        const target: DeployTarget = {
+        const probeTarget: DeployTarget = {
           platform,
-          ...(host ?? saved?.host ? { host: host ?? saved?.host } : {}),
+          ...(workingHost ? { host: workingHost } : {}),
           ...(appName ?? saved?.appName ? { appName: appName ?? saved?.appName } : {}),
           ...(imageRef ?? saved?.imageRef ? { imageRef: imageRef ?? saved?.imageRef } : {}),
           ...(domain ?? saved?.domain ? { domain: domain ?? saved?.domain } : {}),
@@ -492,13 +495,16 @@ export function registerConvoyTools(server: McpServer): void {
         };
 
         const probeRemote = probe !== false;
-        const result = await verifyDeployAccess(platform, resolvedRepo, target, ident, { probeRemote });
+        const result = await verifyDeployAccess(platform, resolvedRepo, probeTarget, ident, { probeRemote });
+        const detail = workingHost ? result.detail.split(workingHost).join('<host>') : result.detail;
         const verification: AccessVerification = result.ok
-          ? { verifiedAt: new Date().toISOString(), status: 'verified', ...(result.account ? { account: result.account } : {}), detail: result.detail }
+          ? { verifiedAt: new Date().toISOString(), status: 'verified', ...(result.account ? { account: result.account } : {}), detail }
           : probeRemote
-            ? { verifiedAt: null, status: 'failed', detail: result.detail }
+            ? { verifiedAt: null, status: 'failed', detail }
             : { verifiedAt: null, status: 'unverified', detail: 'captured, not probed' };
-        upsertTarget(resolvedRepo, { ...target, verification });
+        // Commit the host-free view — the sensitive host stays machine-local.
+        const { host: _omitHost, ...committed } = probeTarget;
+        upsertTarget(resolvedRepo, { ...committed, verification });
 
         return ok({
           platform,

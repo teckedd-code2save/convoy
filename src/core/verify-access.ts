@@ -122,11 +122,12 @@ async function verifyCloud(
   };
 }
 
-function hostFromTarget(target: DeployTarget | null): string | undefined {
-  if (!target) return undefined;
-  if (target.host) return target.host;
-  if (target.user) return undefined; // user without host is unusable
-  return undefined;
+function hostFromTarget(target: DeployTarget | null, identity: DeployIdentity | null): string | undefined {
+  // The host is NEVER committed by default — it's sensitive (a box IP + user is
+  // reconnaissance). It lives machine-local (identity store) or in the
+  // environment. `target.host` is honored only if an operator deliberately put
+  // it there; otherwise we read the machine-local identity, then CONVOY_VPS_HOST.
+  return target?.host ?? identity?.host ?? process.env['CONVOY_VPS_HOST'] ?? undefined;
 }
 
 async function verifyVps(
@@ -158,7 +159,8 @@ async function verifyVps(
     return { ok: false, platform: 'vps', checks, blockers, detail: 'ssh client missing' };
   }
 
-  const host = hostFromTarget(target);
+  const host = hostFromTarget(target, identity);
+  const port = target?.port ?? identity?.port;
   const hostConfigured = Boolean(host);
   checks.push({
     area: 'project_binding',
@@ -191,7 +193,7 @@ async function verifyVps(
   const identityFile = identity?.ref.kind === 'ssh-key-path' ? identity.ref.path : undefined;
   const auth = await deps.probeSshAuth(host!, {
     ...(identityFile ? { identityFile } : {}),
-    ...(target?.port ? { port: target.port } : {}),
+    ...(port ? { port } : {}),
   });
   const authOk = auth.status === 'connected';
   checks.push({
@@ -217,7 +219,7 @@ async function verifyVps(
 
   // Connected — confirm the box can actually run a container deploy.
   const deployRoot = target?.deployRoot ?? `/srv/${target?.appName ?? 'convoy-app'}`;
-  const remote = await deps.probeRemote({ host: host!, deployRoot, ...(target?.port ? { port: target.port } : {}), ...(identityFile ? { identityFile } : {}) });
+  const remote = await deps.probeRemote({ host: host!, deployRoot, ...(port ? { port } : {}), ...(identityFile ? { identityFile } : {}) });
   checks.push({
     area: 'rollback',
     ok: remote.hasDocker,

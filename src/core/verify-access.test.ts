@@ -99,6 +99,28 @@ test('vps: connected + docker present verifies green', async () => {
   assert.equal(res.account, 'deploy');
 });
 
+test('vps: host resolves from the machine-local identity when the committed target has none', async () => {
+  // Committed target carries NO host (the sensitive coord is kept local); the
+  // identity supplies it. Verification must still find the box.
+  const hostlessTarget: DeployTarget = { platform: 'vps', secretSource: { kind: 'env-file' }, verification: { verifiedAt: null, status: 'unverified' } };
+  const identWithHost: DeployIdentity = { platform: 'vps', ref: { kind: 'ssh-key-path', path: '/k' }, host: 'deploy@box', updatedAt: '' };
+  const res = await verifyDeployAccess('vps', '/repo', hostlessTarget, identWithHost, { probeRemote: true }, deps({}));
+  assert.equal(res.ok, true);
+});
+
+test('vps: no host anywhere (target, identity, env) blocks', async () => {
+  const hostlessTarget: DeployTarget = { platform: 'vps', secretSource: { kind: 'env-file' }, verification: { verifiedAt: null, status: 'unverified' } };
+  const identNoHost: DeployIdentity = { platform: 'vps', ref: { kind: 'ssh-agent' }, updatedAt: '' };
+  const prev = process.env['CONVOY_VPS_HOST'];
+  delete process.env['CONVOY_VPS_HOST'];
+  try {
+    const res = await verifyDeployAccess('vps', '/repo', hostlessTarget, identNoHost, { probeRemote: true }, deps({}));
+    assert.equal(res.blockers[0]!.id, 'access.vps.no-host');
+  } finally {
+    if (prev !== undefined) process.env['CONVOY_VPS_HOST'] = prev;
+  }
+});
+
 test('vps: connected but docker missing blocks on bootstrap', async () => {
   const d = deps({ probeRemote: async () => ({ reachable: true, hasDocker: false, hasNginx: false, deployRootExists: false, diskFreeGb: 50, user: 'deploy' }) });
   const res = await verifyDeployAccess('vps', '/repo', vps, ident, { probeRemote: true }, d);
