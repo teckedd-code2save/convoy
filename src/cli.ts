@@ -33,6 +33,11 @@ import { buildPlan } from './planner/index.js';
 import type { PlatformAdjustments } from './planner/picker.js';
 import { classifyEnvKey } from './core/env-classify.js';
 import { loadByokConfig, resolveAnthropicKey } from './core/key-resolver.js';
+import type { PreflightCheck, BlockerFix, BlockerFixKind, PreflightBlocker } from './core/blockers.js';
+import type { ConnectOpts } from './commands/connect.js';
+import { verifyDeployAccess } from './core/verify-access.js';
+import { getTarget } from './core/deploy-target.js';
+import { getIdentity } from './core/identity-store.js';
 import { scanRepository } from './planner/scanner.js';
 import { resolveTarget } from './planner/target-resolver.js';
 
@@ -959,48 +964,6 @@ interface ApplyOpts {
   cloudrunImage?: string;
   cloudrunRegion?: string;
   cloudrunProject?: string;
-}
-
-interface PreflightCheck {
-  name: string;
-  ok: boolean;
-  detail: string;
-  remedy?: string;
-}
-
-/**
- * One thing the operator must change before apply can proceed.
- *
- * Modeled as a structured record (not a string) for two reasons:
- *  1. The web viewer renders blockers as cards with copy-able remedies and
- *     "did this" buttons — that needs typed fields, not free text. Today the
- *     CLI just prints them; tomorrow's PR persists them as run_events and
- *     the viewer drives them.
- *  2. Each fix carries enough metadata that we know whether Convoy can apply
- *     it itself (autoFixable + a copyable command), or whether it requires
- *     the operator (e.g. interactive `vercel link`).
- *
- * The rule (per principles.md, "evidence over assertion"): nothing is a
- * blocker unless it actually blocks *this* deploy on *this* platform. A key
- * the platform manages itself isn't "missing" — it's not the operator's job.
- */
-type BlockerFixKind = 'shell' | 'flag' | 'edit-file' | 'interactive' | 'manual';
-
-interface BlockerFix {
-  kind: BlockerFixKind;
-  label: string;
-  command?: string;
-  flag?: string;
-  autoFixable: boolean;
-}
-
-interface PreflightBlocker {
-  id: string;
-  title: string;
-  detail: string;
-  severity: 'hard' | 'soft';
-  fixes: BlockerFix[];
-  docsUrl?: string;
 }
 
 interface PreflightReport {
@@ -1993,6 +1956,40 @@ function autoFlyAppName(plan: ConvoyPlan): string {
   return `convoy-${base}-${hash}`.slice(0, 30);
 }
 
+/**
+ * Platforms whose real deploy is NOT auto-wired by "real by default" — they
+ * only ship when their explicit --real-* flag is present. Fly (and Vercel,
+ * which rides on --real-fly's default-on) are deliberately excluded: they have
+ * their own real-by-default path and preflight UX. For these three, the absence
+ * of a real adapter means the promote stage would fall through to the scripted
+ * pipeline, which is exactly the silent-no-deploy footgun this guard closes.
+ */
+const GUARDED_REAL_PLATFORMS: ReadonlySet<string> = new Set(['vps', 'railway', 'cloudrun']);
+
+/** Per-platform instructions for turning a refused scripted run into a real deploy. */
+function scriptedDeployRefusalRemedy(platform: string): string {
+  // Lead with `convoy connect` — the guided way to establish + verify access —
+  // then the explicit real-deploy flag wiring.
+  const connect = `  First establish verified access:  ${pc.bold(`convoy connect ${platform}`)}\n`;
+  switch (platform) {
+    case 'vps':
+      return (
+        connect +
+        `  Then deploy for real with one of:\n` +
+        `    ${pc.bold('--real-vps --vps-host=user@host')}   (SSH + rsync, build on the box, blue/green slots)\n` +
+        `        or set CONVOY_VPS_HOST in your shell and pass ${pc.bold('--real-vps')}\n` +
+        `    ${pc.bold('--real-vps-ghcr --vps-host=user@host --vps-ghcr-image=ghcr.io/<org>/<app>')}\n` +
+        `        (build locally, push to GHCR, docker compose on the box — pairs with --vps-manage-caddy --vps-domain=<domain>)`
+      );
+    case 'railway':
+      return connect + `  Then deploy for real with ${pc.bold('--real-railway')} (optionally ${pc.bold('--railway-project=<id>')}).`;
+    case 'cloudrun':
+      return connect + `  Then deploy for real with ${pc.bold('--real-cloudrun --cloudrun-image=<image-ref>')} (optionally --cloudrun-region, --cloudrun-project).`;
+    default:
+      return connect + `  Then pass the platform's --real-* flag.`;
+  }
+}
+
 async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
   checkConvoyEnv();
   const plans = new PlanStore(PLANS_DIR);
@@ -2078,6 +2075,50 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
 
   const startedAt = new Date();
   const unsubscribe = attachRenderer(bus, startedAt, opts.open === true);
+
+  // EARLY ACCESS GATE — before the pipeline commits any work, prove Convoy can
+  // reach + authenticate to the target. The goal is to clear auth blockers up
+  // front, not to stop on them: interactive runs drop into the resolve-in-place
+  // walkthrough (run the login / ssh-copy-id / bootstrap, then continue); CI
+  // gets a single clear exit-2 with the `convoy connect` remedy. Scoped to runs
+  // that actually opted into a real deploy (a --real-* flag = probe consent).
+  {
+    const accessPlatform = plan.platform.chosen;
+    // Probe only when a real deploy *to this platform* is actually configured —
+    // that's the operator's consent. Fly/Vercel are real-by-default (unless
+    // --no-real-fly); VPS/Railway/Cloud Run need their explicit --real-* flag.
+    // Without it, the honesty guard later handles the "no real target" case and
+    // points at `convoy connect`, so we don't preempt it here.
+    const realForPlatform =
+      (accessPlatform === 'fly' || accessPlatform === 'vercel') ? opts.realFly !== false && opts.demo !== true :
+      accessPlatform === 'vps' ? (opts.realVps === true || opts.realVpsGhcr === true) :
+      accessPlatform === 'railway' ? opts.realRailway === true :
+      accessPlatform === 'cloudrun' ? opts.realCloudrun === true : false;
+    if (realForPlatform) {
+      const target = getTarget(plan.target.localPath, accessPlatform);
+      const identity = getIdentity(plan.target.localPath, accessPlatform);
+      const access = await verifyDeployAccess(accessPlatform, plan.target.localPath, target, identity, { probeRemote: true });
+      if (access.ok) {
+        process.stdout.write(`${pc.green('✓')} ${pc.dim(`deploy access verified — ${access.detail}`)}\n`);
+      } else if (process.stdin.isTTY) {
+        process.stdout.write(`\n${pc.yellow('Deploy access for')} ${pc.bold(accessPlatform)} ${pc.yellow("isn't established yet — let's clear it before shipping.")}\n`);
+        const { runConnect } = await import('./commands/connect.js');
+        const cleared = await runConnect(plan.target.localPath, accessPlatform, {});
+        if (!cleared) {
+          unsubscribe();
+          store.close();
+          process.exit(2);
+        }
+      } else {
+        store.recordPreflightBlockers(plan.id, access.blockers.map((b) => ({ blockerId: b.id, payload: b })));
+        renderBlockers(access.blockers);
+        process.stdout.write(pc.red(`\nDeploy access not established for ${accessPlatform}. Run: convoy connect ${accessPlatform}\n`));
+        unsubscribe();
+        store.close();
+        process.exit(2);
+      }
+    }
+  }
 
   // Preflight — confirm each real-* stage can actually run. If a hard
   // prereq is missing and the user didn't opt out, fail with a clear remedy.
@@ -2215,10 +2256,11 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
   }
 
   if (platform === 'vps' && opts.realVps === true) {
-    const host = opts.vpsHost ?? process.env['CONVOY_VPS_HOST'];
+    const vpsTarget = getTarget(plan.target.localPath, 'vps');
+    const host = opts.vpsHost ?? process.env['CONVOY_VPS_HOST'] ?? vpsTarget?.host;
     if (!host) {
       console.error(
-        pc.red('--real-vps requires --vps-host=user@host (or set CONVOY_VPS_HOST in your shell).'),
+        pc.red('--real-vps requires --vps-host=user@host (or set CONVOY_VPS_HOST / run `convoy connect vps`).'),
       );
       process.exit(2);
     }
@@ -2261,8 +2303,12 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
         process.exit(2);
       }
     } else {
-      const host = opts.vpsHost ?? process.env['CONVOY_VPS_HOST'];
-      const imageRef = opts.vpsGhcrImage ?? process.env['CONVOY_GHCR_IMAGE'];
+      // Prefer the verified target captured by `convoy connect vps` for the
+      // non-secret coordinates, so the operator need not re-pass them. The
+      // token is never persisted — env stays its source.
+      const ghcrTarget = getTarget(plan.target.localPath, 'vps');
+      const host = opts.vpsHost ?? process.env['CONVOY_VPS_HOST'] ?? ghcrTarget?.host;
+      const imageRef = opts.vpsGhcrImage ?? process.env['CONVOY_GHCR_IMAGE'] ?? ghcrTarget?.imageRef;
       const ghcrUsername = opts.vpsGhcrUsername ?? process.env['GHCR_USERNAME'] ?? process.env['GITHUB_ACTOR'];
       const ghcrToken = opts.vpsGhcrToken ?? process.env['GHCR_TOKEN'] ?? process.env['GH_TOKEN'] ?? process.env['GITHUB_TOKEN'];
 
@@ -2349,6 +2395,36 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     process.stdout.write(
       `${pc.dim('Real Cloud Run deploy:')} ${pc.bold(service)} ${pc.dim(`(image: ${image}, region: ${opts.cloudrunRegion ?? 'us-central1'})`)}\n`,
     );
+  }
+
+  // ── Honesty guard: never silently run a scripted "deploy" for a real platform ──
+  // "Real by default" auto-wires Fly (and Vercel via --real-fly's default-on).
+  // VPS / Railway / Cloud Run only deploy for real when their explicit --real-*
+  // flag is present. Without it the promote stage falls through to the scripted
+  // pipeline: it ramps canary 10→100% and exits 0 "Convoy succeeded" having
+  // deployed nothing. For a tool teams trust to ship, that false-green is the one
+  // outcome we must never produce by default — Convoy does not get to assume
+  // scripted on the operator's behalf. The operator opts into scripted explicitly
+  // with --demo (or opts out of the platform deploy with --no-real-fly).
+  const wiredRealDeploy = Boolean(
+    orchestratorOpts.realFly ||
+      orchestratorOpts.realVercel ||
+      orchestratorOpts.realVps ||
+      orchestratorOpts.realVpsGhcr ||
+      orchestratorOpts.realRailway ||
+      orchestratorOpts.realCloudRun,
+  );
+  const operatorChoseScripted = opts.demo === true || opts.realFly === false;
+  if (!operatorChoseScripted && GUARDED_REAL_PLATFORMS.has(platform) && !wiredRealDeploy) {
+    console.error(
+      `\n${pc.red('Refusing to run a scripted pipeline for a real-deploy platform.')}\n` +
+        `  Plan platform: ${pc.bold(platform)} — but no real-deploy target was configured for this run.\n` +
+        `  A scripted run ramps canary 10→100% and reports success without deploying anything,\n` +
+        `  so Convoy stops here rather than hand you a false green.\n\n` +
+        `${scriptedDeployRefusalRemedy(platform)}\n` +
+        `  Or pass ${pc.bold('--demo')} to intentionally run the scripted (no-deploy) pipeline.\n`,
+    );
+    process.exit(2);
   }
 
   // Make sure the web viewer is up before the orchestrator creates the run.
@@ -4636,6 +4712,28 @@ program
     }
     const { runOnboard } = await import('./onboard/index.js');
     await runOnboard(localPath, prefilled);
+  });
+
+program
+  .command('connect [platform]')
+  .description('Establish + verify deploy access for a platform (fly|vercel|railway|cloudrun|vps), resolving auth blockers in place, then save the target. Run before shipping so the pipeline never stops for auth.')
+  .option('--vps-host <host>', 'SSH destination user@host (or set CONVOY_VPS_HOST)')
+  .option('--vps-key <path>', 'SSH private key path to use for this box')
+  .option('--vps-port <port>', 'SSH port', (v) => Number(v))
+  .option('--deploy-root <path>', 'deploy root on the box')
+  .option('--app <name>', 'fly app / cloudrun service / railway service name')
+  .option('--image <ref>', 'GHCR image ref without tag, e.g. ghcr.io/org/app')
+  .option('--domain <domain>', 'domain for the target')
+  .option('--region <region>', 'platform region')
+  .option('--secret-source <kind>', 'where secrets live: platform-native | env-file | interactive | doppler | infisical | vault | aws-sm | azure-devops')
+  .option('--answers-file <path>', 'JSON file with a partial target (non-interactive/CI/MCP)')
+  .option('--no-probe', 'capture coordinates without reaching out to the platform/box')
+  .option('--check-only', 'verify access and report; do not resolve or persist')
+  .action(async (platform: string | undefined, opts: ConnectOpts & { probe?: boolean }) => {
+    const localPath = resolve(targetInvocationDir());
+    const { runConnect } = await import('./commands/connect.js');
+    // commander maps `--no-probe` to `probe: false`; normalize to our flag.
+    await runConnect(localPath, platform, { ...opts, noProbe: opts.probe === false });
   });
 
 await program.parseAsync();

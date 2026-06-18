@@ -26,6 +26,8 @@ import type { Approval, Platform, Run, RunEvent } from '../core/types.js';
 import type { RealVpsGhcrOpt } from '../core/stages.js';
 import { resolveAnthropicKey, type ByokConfig } from '../core/key-resolver.js';
 import { buildPlan } from '../planner/index.js';
+import type { IdentityRef } from '../core/identity-store.js';
+import type { DeployTarget, AccessVerification } from '../onboard/preferences.js';
 
 // ---------------------------------------------------------------------------
 // Path resolution — mirror the CLI's STATE_PATH / PLANS_DIR contract. The CLI
@@ -241,7 +243,7 @@ export function registerConvoyTools(server: McpServer): void {
     'convoy_apply',
     {
       description:
-        'Apply a saved plan: runs the pipeline (scan → pick → rehearse → author → canary → promote → observe). Returns the run ID immediately; the pipeline runs in the background. Use convoy_status to follow progress and convoy_approve when the run pauses at a gate. Real stages (PR, local rehearsal, Fly deploy) are opt-in; default is the scripted pipeline that needs no credentials.',
+        'Apply a saved plan: runs the pipeline (scan → pick → rehearse → author → canary → promote → observe). Returns the run ID immediately; the pipeline runs in the background. Use convoy_status to follow progress and convoy_approve when the run pauses at a gate. Real PR (realAuthor) and local rehearsal (realRehearsal) are opt-in. Deploy: Fly is real by default; VPS/Railway/Cloud Run only deploy when configured (e.g. realVpsGhcr) — applying a VPS/Railway/Cloud Run plan without a real-deploy target is REFUSED, not silently scripted, so the run never reports a false success without shipping. PREREQUISITE for a real deploy: establish access first with convoy_connect — it verifies Convoy can reach + authenticate to the target and persists the (non-secret) target. If a real run is attempted without verified access it hard-blocks with a convoy_connect remedy.',
       inputSchema: {
         planId: z.string().describe('Plan id (or unique prefix) from convoy_plan / convoy_list_plans'),
         autoApprove: z.boolean().optional()
@@ -423,6 +425,91 @@ export function registerConvoyTools(server: McpServer): void {
           steps: report.steps,
           log,
           nextStep: `Bootstrap complete. You can now call convoy_apply with realVpsGhcr.deployRoot="${target.deployRoot}".`,
+        });
+      }),
+  );
+
+  server.registerTool(
+    'convoy_connect',
+    {
+      description:
+        'Establish + verify deploy access for a platform BEFORE convoy_apply. Captures only NON-SECRET coordinates (vps host, GHCR image ref, domain, region) and a secret-source POINTER into the committed target (.convoy/preferences.json), records this machine\'s SSH identity locally (~/.convoy/identity.json), and probes that Convoy can actually reach + authenticate to the target. ' +
+        'NEVER accepts raw secret values — tokens and private keys stay in env / ssh-agent / your secrets manager. Returns verified=true, or the blockers to clear. Run this before convoy_apply for vps/railway/cloudrun so the pipeline never stops for auth. Note: agents are non-interactive — a vps auth-failed (key not yet trusted) or a cloud not-logged-in needs a human shell (ssh-copy-id / `vercel login`); this tool reports it rather than running it.',
+      inputSchema: {
+        platform: z.enum(['fly', 'vercel', 'railway', 'cloudrun', 'vps']),
+        planId: z.string().optional().describe('Plan id to derive the target repo path from (preferred).'),
+        repoPath: z.string().optional().describe('Target repo path, if no planId.'),
+        host: z.string().optional().describe('vps: SSH destination user@host (non-secret).'),
+        appName: z.string().optional().describe('fly app / cloudrun service / railway service name.'),
+        imageRef: z.string().optional().describe('GHCR image ref without tag, e.g. ghcr.io/org/app (non-secret).'),
+        domain: z.string().optional(),
+        region: z.string().optional(),
+        deployRoot: z.string().optional(),
+        sshKeyPath: z.string().optional().describe('vps: path to THIS machine\'s SSH private key (a path, never the key itself).'),
+        secretSource: z.enum(['platform-native', 'env-file', 'interactive', 'doppler', 'infisical', 'vault', 'aws-sm', 'azure-devops']).optional()
+          .describe('Where this project keeps secrets — a pointer, never values.'),
+        probe: z.boolean().optional().describe('Reach out to verify access (default true). false = capture coordinates only.'),
+      },
+    },
+    async ({ platform, planId, repoPath, host, appName, imageRef, domain, region, deployRoot, sshKeyPath, secretSource, probe }) =>
+      guarded(async () => {
+        const { getTarget, upsertTarget, parseSecretSource } = await import('../core/deploy-target.js');
+        const { setIdentity } = await import('../core/identity-store.js');
+        const { verifyDeployAccess } = await import('../core/verify-access.js');
+        const { discoverLocalSshKeys } = await import('../adapters/vps/runner.js');
+
+        let resolvedRepo = repoPath;
+        if (!resolvedRepo && planId) {
+          const r = resolvePlanId(planId);
+          if ('id' in r) resolvedRepo = new PlanStore(PLANS_DIR).load(r.id)?.target.localPath ?? undefined;
+        }
+        if (!resolvedRepo) resolvedRepo = REPO_ROOT;
+
+        const saved = getTarget(resolvedRepo, platform);
+        const isVps = platform === 'vps';
+        let identityRef: IdentityRef;
+        if (isVps) {
+          if (sshKeyPath) identityRef = { kind: 'ssh-key-path', path: sshKeyPath };
+          else {
+            const keys = discoverLocalSshKeys();
+            identityRef = keys.length > 0 ? { kind: 'ssh-key-path', path: keys[0]! } : { kind: 'ssh-agent' };
+          }
+        } else {
+          identityRef = { kind: 'cli-cache' };
+        }
+        const ident = setIdentity(resolvedRepo, platform, identityRef);
+
+        const target: DeployTarget = {
+          platform,
+          ...(host ?? saved?.host ? { host: host ?? saved?.host } : {}),
+          ...(appName ?? saved?.appName ? { appName: appName ?? saved?.appName } : {}),
+          ...(imageRef ?? saved?.imageRef ? { imageRef: imageRef ?? saved?.imageRef } : {}),
+          ...(domain ?? saved?.domain ? { domain: domain ?? saved?.domain } : {}),
+          ...(region ?? saved?.region ? { region: region ?? saved?.region } : {}),
+          ...(deployRoot ?? saved?.deployRoot ? { deployRoot: deployRoot ?? saved?.deployRoot } : {}),
+          secretSource: parseSecretSource(secretSource, saved?.secretSource ?? (isVps ? { kind: 'env-file' } : { kind: 'platform-native' })),
+          verification: { verifiedAt: null, status: 'unverified' },
+        };
+
+        const probeRemote = probe !== false;
+        const result = await verifyDeployAccess(platform, resolvedRepo, target, ident, { probeRemote });
+        const verification: AccessVerification = result.ok
+          ? { verifiedAt: new Date().toISOString(), status: 'verified', ...(result.account ? { account: result.account } : {}), detail: result.detail }
+          : probeRemote
+            ? { verifiedAt: null, status: 'failed', detail: result.detail }
+            : { verifiedAt: null, status: 'unverified', detail: 'captured, not probed' };
+        upsertTarget(resolvedRepo, { ...target, verification });
+
+        return ok({
+          platform,
+          repoPath: resolvedRepo,
+          verified: result.ok,
+          detail: result.detail,
+          checks: result.checks,
+          blockers: result.blockers,
+          nextStep: result.ok
+            ? `Access verified — call convoy_apply with the real deploy config for ${platform}.`
+            : `Clear the blockers above, then re-run convoy_connect. Interactive fixes (ssh-copy-id / platform login) must be run from a human shell.`,
         });
       }),
   );
