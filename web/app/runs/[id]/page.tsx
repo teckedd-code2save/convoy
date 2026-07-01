@@ -7,6 +7,7 @@ import { AutoRefresher } from './refresher';
 import { ApprovalActions } from './approval-form';
 import { FixActions } from './fix-actions';
 import { MedicChat } from './medic-chat';
+import { RollbackForm } from './rollback-form';
 import { ScrollIntoFailure } from './scroll-into-failure';
 import { SecretStagingForm } from './secret-staging-form';
 
@@ -125,6 +126,12 @@ export default async function RunPage({
       </header>
 
       {run.status === 'rolled_back' ? <RolledBackBanner run={run} /> : null}
+
+      {extractFlyAppFromEvents(events) ? (
+        <div className="max-w-sm">
+          <RollbackForm appName={extractFlyAppFromEvents(events)!} />
+        </div>
+      ) : null}
 
       <ProgressBar events={events} startedAt={run.startedAt} completedAt={run.completedAt} />
 
@@ -1057,6 +1064,25 @@ function Metric({ label, value, status }: { label: string; value: string; status
       <div className={`text-lg font-semibold tabular-nums font-mono ${color}`}>{value}</div>
     </div>
   );
+}
+
+/**
+ * Extract the Fly app name from a run's events. Looks for canary stage events
+ * with phase 'fly.creating' or 'fly.deployed' (which include the app name).
+ * Returns null if no Fly deployment events are found.
+ */
+function extractFlyAppFromEvents(events: EventRow[]): string | null {
+  const flyEvents = events.filter((e) => {
+    if (e.stage !== 'canary') return false;
+    const p = e.payload as Record<string, unknown> | null;
+    if (!p) return false;
+    return p['phase'] === 'fly.creating' || p['phase'] === 'fly.deployed';
+  });
+  if (flyEvents.length === 0) return null;
+  const p = flyEvents[flyEvents.length - 1]?.payload as Record<string, unknown> | null;
+  if (!p) return null;
+  const app = p['app'];
+  return typeof app === 'string' && app.length > 0 ? app : null;
 }
 
 function RolledBackBanner({ run }: { run: RunRow }) {

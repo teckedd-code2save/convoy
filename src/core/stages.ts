@@ -9,7 +9,9 @@ import {
   flyHealthCheck,
   flyListReleases,
   flyRollback,
+  flyRollbackPreview,
   flySetSecrets,
+  type FlyRollbackPreview,
 } from '../adapters/fly/runner.js';
 import {
   vercelDeploy,
@@ -2335,8 +2337,13 @@ export class PromoteStage extends BaseStage {
 
 /**
  * Shared rollback helper invoked by promote and observe stages when they
- * detect a breach. Emits phases, calls flyRollback, updates run status to
- * rolled_back, and throws so the orchestrator records a clean failure.
+ * detect a breach. First fetches a preview of what will change, then
+ * requests operator approval before executing the rollback. If auto-approve
+ * is set (CONVOY_AUTO_APPROVE=1), it skips the approval gate.
+ *
+ * Because this is a standalone async function (not a stage method), it
+ * cannot call `awaitApproval` (which is `protected` on BaseStage). Instead
+ * it polls the approval store directly with listPendingApprovals + getApproval.
  */
 async function triggerRealFlyRollback(
   ctx: StageContext,
@@ -2348,8 +2355,82 @@ async function triggerRealFlyRollback(
     const event = ctx.store.appendEvent(ctx.run.id, firedBy, kind, payload);
     ctx.bus.emit({ type: 'event.appended', event });
   };
+
+  // 1. Fetch preview
+  emit('progress', { phase: 'rollback.preview_fetching', reason });
+  const previewResult = await flyRollbackPreview(cfg.appName);
+  if (!previewResult.ok) {
+    // If we can't get a preview, proceed directly (better to roll back
+    // blindly than leave a broken deploy in place).
+    emit('progress', { phase: 'rollback.preview_unavailable', error: previewResult.error });
+    return executeRollback(ctx, cfg, reason, firedBy, emit);
+  }
+
+  const preview = previewResult.preview;
+  emit('progress', { phase: 'rollback.preview', preview: { ...preview } });
+
+  // 2. Request approval gate
+  const autoApprove = ctx.opts.autoApprove ?? process.env['CONVOY_AUTO_APPROVE'] === '1';
+  if (!autoApprove) {
+    const approval = ctx.store.requestApproval(ctx.run.id, 'rollback', {
+      reason,
+      firedBy,
+      preview: {
+        appName: preview.appName,
+        currentVersion: preview.currentRelease.version,
+        targetVersion: preview.targetRelease.version,
+        imageDiff: preview.imageDiff,
+        summary: preview.summary,
+      },
+    });
+    emit('progress', { phase: 'rollback.awaiting_approval', approvalId: approval.id });
+
+    // 3. Update run status so the web UI shows the pending gate
+    ctx.store.updateRun(ctx.run.id, { status: 'awaiting_approval' });
+
+    // 4. Poll until operator decides
+    while (true) {
+      if (ctx.signal.aborted) throw new Error('aborted');
+      const pending = ctx.store.listPendingApprovals(ctx.run.id).find((a) => a.kind === 'rollback');
+      if (!pending) break; // already decided
+      const current = ctx.store.getApproval(pending.id);
+      if (current && current.status !== 'pending') {
+        if (current.status === 'rejected') {
+          emit('progress', { phase: 'rollback.rejected', reason: 'operator declined the rollback' });
+          ctx.store.updateRun(ctx.run.id, {
+            status: 'failed',
+            completedAt: new Date(),
+            outcomeReason: `${reason}; rollback rejected by operator`,
+          });
+          const updated = ctx.store.getRun(ctx.run.id);
+          if (updated) ctx.bus.emit({ type: 'run.updated', run: updated });
+          throw new Error(`${firedBy} breach — rollback rejected by operator`);
+        }
+        break; // approved
+      }
+      await sleep(400, ctx.signal);
+    }
+  }
+
+  // 5. Execute
+  return executeRollback(ctx, cfg, reason, firedBy, emit, preview);
+}
+
+/**
+ * Execute the actual flyctl rollback and update run state. Extracted so the
+ * same code path works whether we went through the approval gate or not
+ * (e.g. auto-approve or preview_unavailable fallback).
+ */
+async function executeRollback(
+  ctx: StageContext,
+  cfg: RealFlyOpt,
+  reason: string,
+  firedBy: 'promote' | 'observe',
+  emit: (kind: EventKind, payload: unknown) => void,
+  preview?: FlyRollbackPreview,
+): Promise<never> {
   emit('progress', { phase: 'rollback.starting', reason });
-  const result = await flyRollback(cfg.appName);
+  const result = await flyRollback(cfg.appName, preview?.targetRelease.version);
   if (!result.ok) {
     emit('progress', { phase: 'rollback.failed', error: result.error });
     ctx.store.updateRun(ctx.run.id, {

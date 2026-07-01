@@ -730,6 +730,55 @@ export function registerConvoyTools(server: McpServer): void {
         }
       }),
   );
+
+  server.registerTool(
+    'convoy_rollback_preview',
+    {
+      description: 'Preview a rollback for a Fly.io app: show current release version, target release version, image diff, and a human-readable summary. Returns structured data the calling agent can render or act on. Next step: convoy_rollback_apply to execute, or run `convoy rollback <appName>` at the CLI.',
+      inputSchema: {
+        appName: z.string().describe('Fly.io app name to preview rollback for'),
+        targetVersion: z.number().int().positive().optional()
+          .describe('Specific release version to roll back to (default: previous complete release)'),
+      },
+    },
+    async ({ appName, targetVersion }) =>
+      guarded(async () => {
+        const { flyRollbackPreview } = await import('../adapters/fly/runner.js');
+        const result = await flyRollbackPreview(appName, targetVersion);
+        if (!result.ok) return fail(result.error);
+        return ok({
+          ...result.preview,
+          nextStep: `Call convoy_rollback_apply with flyApp="${appName}" and targetVersion=${result.preview.targetRelease.version}, or run \`convoy rollback ${appName}\``,
+        });
+      }),
+  );
+
+  server.registerTool(
+    'convoy_rollback_apply',
+    {
+      description: 'Execute a rollback for a Fly.io app to a specific release version. Run convoy_rollback_preview first to see what will change. This action changes the live deployment.',
+      inputSchema: {
+        appName: z.string().describe('Fly.io app name to roll back'),
+        targetVersion: z.number().int().positive().describe('Release version to restore'),
+      },
+    },
+    async ({ appName, targetVersion }) =>
+      guarded(async () => {
+        const { flyRollback } = await import('../adapters/fly/runner.js');
+        const result = await flyRollback(appName, targetVersion);
+        if (!result.ok) return fail(result.error ?? 'rollback failed');
+        return ok({
+          appName,
+          restoredVersion: result.restoredVersion,
+          summary: `Rolled back "${appName}" to v${result.restoredVersion}`,
+          watchUrl: watchUrlFromApp(appName),
+        });
+      }),
+  );
+}
+
+function watchUrlFromApp(appName: string): string {
+  return `${WEB_BASE}/runs?flyApp=${appName}`;
 }
 
 export function createConvoyServer(): McpServer {

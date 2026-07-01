@@ -4633,10 +4633,81 @@ program
 
 program
   .command('rollback <service>')
-  .description('Roll back the most recent deployment for a service (not yet implemented).')
-  .action((service: string) => {
-    console.error(pc.yellow(`rollback ${service}: not yet implemented`));
-    process.exit(2);
+  .description('Roll back a Fly.io app to a previous release. Shows a preview of what will change and asks for confirmation before executing.')
+  .option('-v, --version <number>', 'Target release version (defaults to the previous complete release)')
+  .option('-y, --yes', 'Skip confirmation prompt (auto-approve)')
+  .action(async (service: string, opts: { version?: string; yes?: boolean }) => {
+    try {
+      const { flyRollbackPreview, flyRollback } = await import('./adapters/fly/runner.js');
+
+      // 1. Show preview
+      const targetVersion = opts.version ? Number(opts.version) : undefined;
+      if (targetVersion !== undefined && (Number.isNaN(targetVersion) || targetVersion < 1)) {
+        console.error(pc.red('error: --version must be a positive integer'));
+        process.exit(2);
+      }
+
+      process.stderr.write(`${pc.dim('⟳')} Fetching rollback preview for ${pc.cyan(service)}...\n`);
+      const previewResult = await flyRollbackPreview(service, targetVersion);
+      if (!previewResult.ok) {
+        console.error(pc.red(`rollback preview failed: ${previewResult.error}`));
+        process.exit(1);
+      }
+
+      const { preview } = previewResult;
+      process.stdout.write(`\n${pc.bold('Rollback Preview')}\n`);
+      process.stdout.write(pc.dim('─'.repeat(48)) + '\n');
+      process.stdout.write(`  ${pc.bold('App:')}       ${pc.cyan(preview.appName)}\n`);
+      process.stdout.write(`  ${pc.bold('Current:')}  v${preview.currentRelease.version}`);
+      if (preview.currentRelease.image) {
+        process.stdout.write(`  ${pc.dim(preview.currentRelease.image.slice(0, 40))}\n`);
+      } else {
+        process.stdout.write('\n');
+      }
+      process.stdout.write(`  ${pc.bold('Target:')}   v${preview.targetRelease.version}`);
+      if (preview.targetRelease.image) {
+        process.stdout.write(`  ${pc.dim(preview.targetRelease.image.slice(0, 40))}\n`);
+      } else {
+        process.stdout.write('\n');
+      }
+      process.stdout.write(`  ${pc.bold('Image:')}    ${preview.imageDiff.changed ? pc.yellow('will change') : pc.green('same image')}\n`);
+      if (preview.currentRelease.description) {
+        process.stdout.write(`  ${pc.bold('Current:')}  ${pc.dim(preview.currentRelease.description)}\n`);
+      }
+      if (preview.targetRelease.description) {
+        process.stdout.write(`  ${pc.bold('Target:')}   ${pc.dim(preview.targetRelease.description)}\n`);
+      }
+      process.stdout.write(pc.dim('─'.repeat(48)) + '\n\n');
+
+      // 2. Confirm
+      if (!opts.yes) {
+        process.stderr.write(`${pc.yellow('Rollback will restore v' + preview.targetRelease.version + ' — this changes the live deployment.')}\n`);
+        process.stderr.write('Are you sure? (y/N) ');
+        const answer = await new Promise<string>((resolve) => {
+          process.stdin.setEncoding('utf8');
+          process.stdin.once('data', (chunk: string) => resolve(chunk.trim().toLowerCase()));
+        });
+        if (answer !== 'y' && answer !== 'yes') {
+          process.stderr.write(pc.yellow('Rollback cancelled.\n'));
+          process.exit(0);
+        }
+      }
+
+      // 3. Execute
+      process.stderr.write(`${pc.dim('⟳')} Rolling back ${pc.cyan(service)} to v${preview.targetRelease.version}...\n`);
+      const result = await flyRollback(service, preview.targetRelease.version);
+      if (!result.ok) {
+        console.error(pc.red(`rollback failed: ${result.error}`));
+        process.exit(1);
+      }
+
+      process.stdout.write(`\n${pc.green('✓')} Rolled back to v${result.restoredVersion}\n`);
+      process.exit(0);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(pc.red(`rollback error: ${msg}`));
+      process.exit(1);
+    }
   });
 
 program

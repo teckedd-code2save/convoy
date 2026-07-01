@@ -237,6 +237,77 @@ export async function flyListReleases(appName: string): Promise<FlyRelease[]> {
   }
 }
 
+export interface FlyRollbackPreview {
+  appName: string;
+  currentRelease: FlyRelease;
+  targetRelease: FlyRelease;
+  imageDiff: { current: string; target: string; changed: boolean };
+  hasChanges: boolean;
+  summary: string;
+}
+
+/**
+ * Preview a rollback before executing it. Lists releases and determines what
+ * the current release is and what the target (previous complete) release is.
+ * Returns structured diff info so the operator can see what's about to change.
+ */
+export async function flyRollbackPreview(
+  appName: string,
+  targetVersion?: number,
+): Promise<{ ok: true; preview: FlyRollbackPreview } | { ok: false; error: string }> {
+  try {
+    const releases = await flyListReleases(appName);
+    if (releases.length === 0) {
+      return { ok: false, error: 'no releases found for app' };
+    }
+
+    const current = releases[0]!;
+    const target =
+      targetVersion !== undefined
+        ? releases.find((r) => r.version === targetVersion)
+        : releases.find((r) => r.version < current.version && r.status === 'complete');
+
+    if (!target) {
+      return {
+        ok: false,
+        error: targetVersion !== undefined
+          ? `release v${targetVersion} not found for ${appName}`
+          : `no prior complete release found for ${appName}`,
+      };
+    }
+    if (!target.image) {
+      return { ok: false, error: `release v${target.version} has no image reference` };
+    }
+
+    const currentImage = current.image ?? '(unknown)';
+    const targetImage = target.image;
+    const changed = currentImage !== targetImage;
+
+    const summary = [
+      `Rollback "${appName}" from v${current.version} → v${target.version}`,
+      `  Current image: ${currentImage}`,
+      `  Target image:  ${targetImage}`,
+      `  ${changed ? 'Image will change' : 'Same image (config-only rollback)'}`,
+      ...(current.description ? [`  Current description: ${current.description}`] : []),
+      ...(target.description ? [`  Target description: ${target.description}`] : []),
+    ].join('\n');
+
+    return {
+      ok: true,
+      preview: {
+        appName,
+        currentRelease: current,
+        targetRelease: target,
+        imageDiff: { current: currentImage, target: targetImage, changed },
+        hasChanges: changed,
+        summary,
+      },
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 /**
  * Rollback by redeploying a previous release's image. Modern flyctl has no
  * \`fly releases rollback\` subcommand; the supported path is to `fly deploy

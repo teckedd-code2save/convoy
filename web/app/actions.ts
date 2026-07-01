@@ -972,3 +972,75 @@ export async function pushStagedSecret(
     };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Rollback preview + execute (web UI)
+// ---------------------------------------------------------------------------
+
+export interface RollbackPreviewResult {
+  appName: string;
+  currentVersion: number;
+  targetVersion: number;
+  currentImage: string | undefined;
+  targetImage: string | undefined;
+  imageChanged: boolean;
+  summary: string;
+}
+
+/**
+ * Fetch a rollback preview for a Fly.io app. Returns the current and target
+ * release info so the UI can render a before/after diff.
+ */
+export async function rollbackPreview(
+  appName: string,
+  targetVersion?: number,
+): Promise<{ ok: true; preview: RollbackPreviewResult } | { ok: false; reason: string }> {
+  if (!appName || typeof appName !== 'string') return { ok: false, reason: 'invalid appName' };
+  if (appName.length > 100) return { ok: false, reason: 'appName too long' };
+
+  try {
+    const { flyRollbackPreview } = await import('../../src/adapters/fly/runner.js');
+    const result = await flyRollbackPreview(appName, targetVersion);
+    if (!result.ok) return { ok: false, reason: result.error };
+
+    const { preview } = result;
+    return {
+      ok: true,
+      preview: {
+        appName: preview.appName,
+        currentVersion: preview.currentRelease.version,
+        targetVersion: preview.targetRelease.version,
+        currentImage: preview.currentRelease.image,
+        targetImage: preview.targetRelease.image,
+        imageChanged: preview.imageDiff.changed,
+        summary: preview.summary,
+      },
+    };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Execute a rollback to a specific version. The operator has already seen
+ * the preview and confirmed — this is the action that actually changes
+ * the live deployment.
+ */
+export async function executeRollback(
+  appName: string,
+  targetVersion: number,
+): Promise<{ ok: true; restoredVersion?: number } | { ok: false; reason: string }> {
+  if (!appName || typeof appName !== 'string') return { ok: false, reason: 'invalid appName' };
+  if (!Number.isInteger(targetVersion) || targetVersion < 1) {
+    return { ok: false, reason: 'targetVersion must be a positive integer' };
+  }
+
+  try {
+    const { flyRollback } = await import('../../src/adapters/fly/runner.js');
+    const result = await flyRollback(appName, targetVersion);
+    if (!result.ok) return { ok: false, reason: result.error ?? 'rollback failed' };
+    return { ok: true, restoredVersion: result.restoredVersion };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+}
