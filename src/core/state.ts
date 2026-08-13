@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
+import { withFileLock } from './file-lock.js';
+
 import type {
   Approval,
   ApprovalKind,
@@ -194,57 +196,67 @@ export interface RunUpdates {
 
 export class RunStateStore {
   readonly #db: Database.Database;
+  readonly #lockPath: string;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
-    this.#db = new Database(path);
-    this.#db.pragma('journal_mode = WAL');
-    this.#db.pragma('foreign_keys = ON');
-    this.#db.exec(SCHEMA);
-    this.#migrate();
+    this.#lockPath = `${path}.lock`;
+    // DB creation, pragmas, and schema migration are writes too — serialize
+    // them so two processes opening a fresh DB can't race the ALTER TABLEs
+    // in #migrate. The lock is released before the constructor returns.
+    this.#db = withFileLock(this.#lockPath, () => {
+      const db = new Database(path);
+      db.pragma('journal_mode = WAL');
+      db.pragma('foreign_keys = ON');
+      db.exec(SCHEMA);
+      this.#migrate(db);
+      return db;
+    });
   }
 
-  #migrate(): void {
-    const cols = this.#db
+  #migrate(db: Database.Database): void {
+    const cols = db
       .prepare<[], { name: string }>('PRAGMA table_info(runs)')
       .all()
       .map((c) => c.name);
     if (!cols.includes('plan_id')) {
-      this.#db.exec('ALTER TABLE runs ADD COLUMN plan_id TEXT');
+      db.exec('ALTER TABLE runs ADD COLUMN plan_id TEXT');
     }
     if (!cols.includes('outcome_reason')) {
-      this.#db.exec('ALTER TABLE runs ADD COLUMN outcome_reason TEXT');
+      db.exec('ALTER TABLE runs ADD COLUMN outcome_reason TEXT');
     }
     if (!cols.includes('outcome_restored_version')) {
-      this.#db.exec('ALTER TABLE runs ADD COLUMN outcome_restored_version INTEGER');
+      db.exec('ALTER TABLE runs ADD COLUMN outcome_restored_version INTEGER');
     }
-    const eventCols = this.#db
+    const eventCols = db
       .prepare<[], { name: string }>('PRAGMA table_info(run_events)')
       .all()
       .map((c) => c.name);
     if (!eventCols.includes('lane_id')) {
-      this.#db.exec('ALTER TABLE run_events ADD COLUMN lane_id TEXT');
+      db.exec('ALTER TABLE run_events ADD COLUMN lane_id TEXT');
     }
-    const approvalCols = this.#db
+    const approvalCols = db
       .prepare<[], { name: string }>('PRAGMA table_info(approvals)')
       .all()
       .map((c) => c.name);
     if (!approvalCols.includes('lane_id')) {
-      this.#db.exec('ALTER TABLE approvals ADD COLUMN lane_id TEXT');
+      db.exec('ALTER TABLE approvals ADD COLUMN lane_id TEXT');
     }
   }
 
   createRun(repoUrl: string, planId?: string | null): Run {
-    const id = randomUUID();
-    const now = new Date().toISOString();
-    this.#db
-      .prepare(
-        'INSERT INTO runs (id, repo_url, status, started_at, plan_id) VALUES (?, ?, ?, ?, ?)',
-      )
-      .run(id, repoUrl, 'pending' satisfies RunStatus, now, planId ?? null);
-    const run = this.getRun(id);
-    if (!run) throw new Error(`Run ${id} missing after insert`);
-    return run;
+    return withFileLock(this.#lockPath, () => {
+      const id = randomUUID();
+      const now = new Date().toISOString();
+      this.#db
+        .prepare(
+          'INSERT INTO runs (id, repo_url, status, started_at, plan_id) VALUES (?, ?, ?, ?, ?)',
+        )
+        .run(id, repoUrl, 'pending' satisfies RunStatus, now, planId ?? null);
+      const run = this.getRun(id);
+      if (!run) throw new Error(`Run ${id} missing after insert`);
+      return run;
+    });
   }
 
   listRunsForPlan(planId: string): Run[] {
@@ -277,47 +289,49 @@ export class RunStateStore {
   }
 
   updateRun(id: string, updates: RunUpdates): Run {
-    const fields: string[] = [];
-    const values: (string | number | null)[] = [];
+    return withFileLock(this.#lockPath, () => {
+      const fields: string[] = [];
+      const values: (string | number | null)[] = [];
 
-    if (updates.status !== undefined) {
-      fields.push('status = ?');
-      values.push(updates.status);
-    }
-    if (updates.platform !== undefined) {
-      fields.push('platform = ?');
-      values.push(updates.platform);
-    }
-    if (updates.liveUrl !== undefined) {
-      fields.push('live_url = ?');
-      values.push(updates.liveUrl);
-    }
-    if (updates.completedAt !== undefined) {
-      fields.push('completed_at = ?');
-      values.push(updates.completedAt ? updates.completedAt.toISOString() : null);
-    }
-    if (updates.outcomeReason !== undefined) {
-      fields.push('outcome_reason = ?');
-      values.push(updates.outcomeReason);
-    }
-    if (updates.outcomeRestoredVersion !== undefined) {
-      fields.push('outcome_restored_version = ?');
-      values.push(updates.outcomeRestoredVersion);
-    }
+      if (updates.status !== undefined) {
+        fields.push('status = ?');
+        values.push(updates.status);
+      }
+      if (updates.platform !== undefined) {
+        fields.push('platform = ?');
+        values.push(updates.platform);
+      }
+      if (updates.liveUrl !== undefined) {
+        fields.push('live_url = ?');
+        values.push(updates.liveUrl);
+      }
+      if (updates.completedAt !== undefined) {
+        fields.push('completed_at = ?');
+        values.push(updates.completedAt ? updates.completedAt.toISOString() : null);
+      }
+      if (updates.outcomeReason !== undefined) {
+        fields.push('outcome_reason = ?');
+        values.push(updates.outcomeReason);
+      }
+      if (updates.outcomeRestoredVersion !== undefined) {
+        fields.push('outcome_restored_version = ?');
+        values.push(updates.outcomeRestoredVersion);
+      }
 
-    if (fields.length === 0) {
-      const existing = this.getRun(id);
-      if (!existing) throw new Error(`Run ${id} not found`);
-      return existing;
-    }
+      if (fields.length === 0) {
+        const existing = this.getRun(id);
+        if (!existing) throw new Error(`Run ${id} not found`);
+        return existing;
+      }
 
-    this.#db
-      .prepare(`UPDATE runs SET ${fields.join(', ')} WHERE id = ?`)
-      .run(...values, id);
+      this.#db
+        .prepare(`UPDATE runs SET ${fields.join(', ')} WHERE id = ?`)
+        .run(...values, id);
 
-    const run = this.getRun(id);
-    if (!run) throw new Error(`Run ${id} missing after update`);
-    return run;
+      const run = this.getRun(id);
+      if (!run) throw new Error(`Run ${id} missing after update`);
+      return run;
+    });
   }
 
   appendEvent(
@@ -327,23 +341,25 @@ export class RunStateStore {
     payload: unknown,
     laneId?: string | null,
   ): RunEvent {
-    const id = randomUUID();
-    const now = new Date().toISOString();
-    this.#db
-      .prepare(
-        'INSERT INTO run_events (id, run_id, stage, kind, lane_id, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      )
-      .run(id, runId, stage, kind, laneId ?? null, JSON.stringify(payload), now);
+    return withFileLock(this.#lockPath, () => {
+      const id = randomUUID();
+      const now = new Date().toISOString();
+      this.#db
+        .prepare(
+          'INSERT INTO run_events (id, run_id, stage, kind, lane_id, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        )
+        .run(id, runId, stage, kind, laneId ?? null, JSON.stringify(payload), now);
 
-    return {
-      id,
-      runId,
-      stage,
-      kind,
-      ...(laneId !== undefined ? { laneId } : {}),
-      payload,
-      createdAt: new Date(now),
-    };
+      return {
+        id,
+        runId,
+        stage,
+        kind,
+        ...(laneId !== undefined ? { laneId } : {}),
+        payload,
+        createdAt: new Date(now),
+      };
+    });
   }
 
   listEvents(runId: string): RunEvent[] {
@@ -356,30 +372,34 @@ export class RunStateStore {
   }
 
   requestApproval(runId: string, kind: ApprovalKind, summary: unknown, laneId?: string | null): Approval {
-    const id = randomUUID();
-    this.#db
-      .prepare(
-        'INSERT INTO approvals (id, run_id, kind, lane_id, summary, status) VALUES (?, ?, ?, ?, ?, ?)',
-      )
-      .run(id, runId, kind, laneId ?? null, JSON.stringify(summary), 'pending' satisfies ApprovalStatus);
+    return withFileLock(this.#lockPath, () => {
+      const id = randomUUID();
+      this.#db
+        .prepare(
+          'INSERT INTO approvals (id, run_id, kind, lane_id, summary, status) VALUES (?, ?, ?, ?, ?, ?)',
+        )
+        .run(id, runId, kind, laneId ?? null, JSON.stringify(summary), 'pending' satisfies ApprovalStatus);
 
-    const approval = this.getApproval(id);
-    if (!approval) throw new Error(`Approval ${id} missing after insert`);
-    return approval;
+      const approval = this.getApproval(id);
+      if (!approval) throw new Error(`Approval ${id} missing after insert`);
+      return approval;
+    });
   }
 
   decideApproval(id: string, status: 'approved' | 'rejected'): Approval {
-    const now = new Date().toISOString();
-    const result = this.#db
-      .prepare('UPDATE approvals SET status = ?, decided_at = ? WHERE id = ? AND status = ?')
-      .run(status, now, id, 'pending');
+    return withFileLock(this.#lockPath, () => {
+      const now = new Date().toISOString();
+      const result = this.#db
+        .prepare('UPDATE approvals SET status = ?, decided_at = ? WHERE id = ? AND status = ?')
+        .run(status, now, id, 'pending');
 
-    if (result.changes === 0) {
-      throw new Error(`Approval ${id} not found or already decided`);
-    }
-    const approval = this.getApproval(id);
-    if (!approval) throw new Error(`Approval ${id} missing after decide`);
-    return approval;
+      if (result.changes === 0) {
+        throw new Error(`Approval ${id} not found or already decided`);
+      }
+      const approval = this.getApproval(id);
+      if (!approval) throw new Error(`Approval ${id} missing after decide`);
+      return approval;
+    });
   }
 
   getApproval(id: string): Approval | null {
@@ -411,27 +431,29 @@ export class RunStateStore {
     blockers: { blockerId: string; payload: unknown }[],
     runId?: string | null,
   ): PersistedBlocker[] {
-    const now = new Date().toISOString();
-    const tx = this.#db.transaction(() => {
-      this.#db
-        .prepare(
-          `UPDATE preflight_blockers
-           SET status = 'resolved', resolved_at = ?
-           WHERE plan_id = ? AND status = 'open'`,
-        )
-        .run(now, planId);
+    return withFileLock(this.#lockPath, () => {
+      const now = new Date().toISOString();
+      const tx = this.#db.transaction(() => {
+        this.#db
+          .prepare(
+            `UPDATE preflight_blockers
+             SET status = 'resolved', resolved_at = ?
+             WHERE plan_id = ? AND status = 'open'`,
+          )
+          .run(now, planId);
 
-      const insert = this.#db.prepare(
-        `INSERT INTO preflight_blockers
-         (id, plan_id, run_id, blocker_id, payload, status, created_at)
-         VALUES (?, ?, ?, ?, ?, 'open', ?)`,
-      );
-      for (const b of blockers) {
-        insert.run(randomUUID(), planId, runId ?? null, b.blockerId, JSON.stringify(b.payload), now);
-      }
+        const insert = this.#db.prepare(
+          `INSERT INTO preflight_blockers
+          (id, plan_id, run_id, blocker_id, payload, status, created_at)
+          VALUES (?, ?, ?, ?, ?, 'open', ?)`,
+        );
+        for (const b of blockers) {
+          insert.run(randomUUID(), planId, runId ?? null, b.blockerId, JSON.stringify(b.payload), now);
+        }
+      });
+      tx();
+      return this.listOpenBlockersByPlan(planId);
     });
-    tx();
-    return this.listOpenBlockersByPlan(planId);
   }
 
   listOpenBlockersByPlan(planId: string): PersistedBlocker[] {
@@ -446,18 +468,20 @@ export class RunStateStore {
   }
 
   acknowledgeBlocker(id: string): PersistedBlocker | null {
-    const now = new Date().toISOString();
-    this.#db
-      .prepare(
-        `UPDATE preflight_blockers
-         SET status = 'acknowledged', resolved_at = ?
-         WHERE id = ? AND status = 'open'`,
-      )
-      .run(now, id);
-    const row = this.#db
-      .prepare<[string], PreflightBlockerRow>('SELECT * FROM preflight_blockers WHERE id = ?')
-      .get(id);
-    return row ? toPersistedBlocker(row) : null;
+    return withFileLock(this.#lockPath, () => {
+      const now = new Date().toISOString();
+      this.#db
+        .prepare(
+          `UPDATE preflight_blockers
+           SET status = 'acknowledged', resolved_at = ?
+           WHERE id = ? AND status = 'open'`,
+        )
+        .run(now, id);
+      const row = this.#db
+        .prepare<[string], PreflightBlockerRow>('SELECT * FROM preflight_blockers WHERE id = ?')
+        .get(id);
+      return row ? toPersistedBlocker(row) : null;
+    });
   }
 
   close(): void {

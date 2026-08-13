@@ -14,9 +14,9 @@ The real rehearsal runner (`src/core/rehearsal-runner.ts`) spawns the target as 
 
 ### 2. SQLite state is unsafe under concurrent Convoy runs
 
-`.convoy/state.db` has no write locking. Two concurrent `npm run convoy -- apply` sessions can corrupt the plan index or produce interleaved state transitions.
+`.convoy/state.db` had no write locking — two concurrent `npm run convoy -- apply` sessions could race the schema migration or interleave multi-statement write sequences (insert-then-read, preflight blocker replacement), corrupting the plan index or producing interleaved state transitions.
 
-**Status:** Unresolved. A file-lock mechanism (`lockfile` package, or `fs.open` with exclusive flag) is the minimal fix. Not yet implemented because single-user use hasn't hit this.
+**Status:** Resolved. `src/core/file-lock.ts` provides a cross-process advisory file lock (`state.db.lock`, exclusive create + PID-based stale-lock reaping). `RunStateStore` acquires it around DB creation, schema migration, and every write method; reads stay lock-free (WAL). A second concurrent writer waits (default 30s, tunable via `CONVOY_STATE_LOCK_TIMEOUT_MS`), then fails with a helpful `FileLockError` — it never interleaves. Covered by `src/core/file-lock.test.ts` and the two-stores test in `src/core/state.test.ts`.
 
 ### 3. Rollback has no cross-platform tests
 
