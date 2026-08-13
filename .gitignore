@@ -33,3 +33,7 @@ docs/hackathon-*.md
 
 # Claude Code internal tooling (worktrees, session state)
 .claude/
+
+# Local agent scratch (Hermes desktop attachments, unpacked pptx scratch)
+.hermes/
+unpacked/
