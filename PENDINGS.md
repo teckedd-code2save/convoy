@@ -22,7 +22,7 @@ The real rehearsal runner (`src/core/rehearsal-runner.ts`) spawns the target as 
 
 The rollback path (`medic`) exists for Fly.io (`src/adapters/fly/runner.ts`) but has never been tested against a real Fly app that was deployed by a previous Convoy apply. The scripted rollback mode uses canned data.
 
-**Status:** Needs a dedicated test harness that deploys a real app, injects failure, and verifies the rollback path end-to-end. Until then, the rollback is an educated guess.
+**Status:** Resolved. `scripts/rollback-harness.sh` ships `demo-app/` to a real Fly app through Convoy's pipeline, injects a broken release (HTTP-500 image — `scripts/rollback-harness/bad.Dockerfile`), rolls back via `convoy rollback`, and verifies the known-good image + `/health` + `/orders` are restored. **fixed** `f3cae86` — see `docs/rollback-harness.md`. The live run is one command after `fly auth login`; the harness refuses to run without a session, which keeps CI hermetic.
 
 ---
 
