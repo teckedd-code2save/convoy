@@ -444,6 +444,13 @@ npm run typecheck
 (cd demo-app && npx tsc --noEmit)
 ```
 
+### Rollback harness (real Fly.io app)
+
+`scripts/rollback-harness.sh` deploys the demo-app to Fly through the real pipeline,
+injects a broken release, rolls back via `convoy rollback`, and verifies the
+known-good image + health + `/orders` are restored. Requires `fly auth login` (which
+is also what keeps it out of CI). See [`docs/rollback-harness.md`](./docs/rollback-harness.md).
+
 ---
 
 ## Three principles (non-negotiable)
