@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveGhcrConfig } from './core/ghcr-config.js';
 import { Command } from 'commander';
 import pc from 'picocolors';
 
@@ -2301,7 +2302,7 @@ async function runApply(planId: string, opts: ApplyOpts): Promise<void> {
     if (opts.realVpsGhcrConfig) {
       try {
         const { readFileSync } = await import('node:fs');
-        ghcrOpts = JSON.parse(readFileSync(opts.realVpsGhcrConfig, 'utf8')) as RealVpsGhcrOpt;
+        ghcrOpts = resolveGhcrConfig(JSON.parse(readFileSync(opts.realVpsGhcrConfig, 'utf8')));
       } catch (err) {
         console.error(pc.red(`--real-vps-ghcr-config: failed to read ${opts.realVpsGhcrConfig}: ${err instanceof Error ? err.message : String(err)}`));
         process.exit(2);

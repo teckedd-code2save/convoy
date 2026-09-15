@@ -12,10 +12,13 @@
  * owns it for JSON-RPC frames. Diagnostics go to console.error only.
  */
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, openSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, closeSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+
+import { authorizeTool, canCallTool, type McpAccess } from './access.js';
+import { prepareGhcrConfig, executionEnvironment } from '../core/ghcr-config.js';
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -23,7 +26,6 @@ import { z } from 'zod';
 import { PlanStore } from '../core/plan.js';
 import { RunStateStore } from '../core/state.js';
 import type { Approval, Platform, Run, RunEvent } from '../core/types.js';
-import type { RealVpsGhcrOpt } from '../core/stages.js';
 import { resolveAnthropicKey, type ByokConfig } from '../core/key-resolver.js';
 import { buildPlan } from '../planner/index.js';
 import type { IdentityRef } from '../core/identity-store.js';
@@ -164,8 +166,13 @@ const byokSchema = z.object({
     .describe('Secret name to fetch (default: ANTHROPIC_API_KEY)'),
 }).optional().describe('BYOK: supply your own Anthropic API key so Convoy does not bill you for AI calls. Omit to use the server\'s key (if any).');
 
-export function registerConvoyTools(server: McpServer): void {
-  server.registerTool(
+export function registerConvoyTools(server: McpServer, access: McpAccess = { role: 'local' }): void {
+  const registerTool: typeof server.registerTool = (name, config, handler) => {
+    const registered = server.registerTool(name, config, handler);
+    if (!canCallTool(access, name)) registered.disable();
+    return registered;
+  };
+  registerTool(
     'convoy_plan',
     {
       description:
@@ -215,7 +222,7 @@ export function registerConvoyTools(server: McpServer): void {
       }),
   );
 
-  server.registerTool(
+  registerTool(
     'convoy_list_plans',
     {
       description: 'List saved deployment plans (newest first). Use a returned planId with convoy_apply.',
@@ -239,7 +246,7 @@ export function registerConvoyTools(server: McpServer): void {
       }),
   );
 
-  server.registerTool(
+  registerTool(
     'convoy_apply',
     {
       description:
@@ -261,7 +268,8 @@ export function registerConvoyTools(server: McpServer): void {
           appName: z.string().describe('App name used in logs and Caddy site file'),
           imageRef: z.string().describe('GHCR image ref without tag, e.g. ghcr.io/myorg/my-app'),
           ghcrUsername: z.string().describe('GitHub username for docker login'),
-          ghcrToken: z.string().describe('GitHub token with packages:write (agent) and packages:read (box)'),
+          ghcrToken: z.string().optional().describe('Deprecated: local stdio only. Prefer ghcrTokenEnv.'),
+          ghcrTokenEnv: z.enum(['GHCR_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN']).optional().describe('Server environment variable containing the GHCR token (default GHCR_TOKEN).'),
           buildArgs: z.record(z.string(), z.string()).optional().describe('Docker --build-arg key=value pairs'),
           composeService: z.string().optional().describe('Compose service name (default: web)'),
           runMigrations: z.boolean().optional().describe('Run Prisma migrate deploy before rolling (default false)'),
@@ -279,6 +287,7 @@ export function registerConvoyTools(server: McpServer): void {
     },
     async ({ planId, autoApprove, realRehearsal, realAuthor, realFly, realVpsGhcr, byok }) =>
       guarded(async () => {
+        authorizeTool(access, 'convoy_apply', { autoApprove, realRehearsal, realVpsGhcr });
         const resolved = resolvePlanId(planId);
         if ('error' in resolved) return fail(resolved.error);
         const fullPlanId = resolved.id;
@@ -294,15 +303,15 @@ export function registerConvoyTools(server: McpServer): void {
             );
           }
 
-          // Spawn `convoy apply` exactly like the web UI does: same tsx
-          // invocation via the npm script, detached + unref so the pipeline
-          // outlives this tool call, stdio captured to a per-plan log.
+          // Run the CLI detached so the pipeline outlives this tool call.
+          // The parent has already loaded .env. Do not load it again in the
+          // child: that would restore the MCP credentials stripped below.
           const logDir = join(REPO_ROOT, '.convoy');
           mkdirSync(logDir, { recursive: true });
           const logPath = join(logDir, `apply-${fullPlanId.slice(0, 8)}.log`);
-          const logFd = openSync(logPath, 'a');
+          const ghcr = realVpsGhcr ? prepareGhcrConfig(realVpsGhcr) : undefined;
 
-          const args = ['run', 'convoy', '--silent', '--', 'apply', fullPlanId];
+          const args = ['--import', 'tsx', 'src/cli.ts', 'apply', fullPlanId];
           if (autoApprove === true) args.push('--auto-approve');
           // The CLI defaults every real stage ON; Convoy's rule is that real
           // stages are opt-in for agents, so stub each one unless requested.
@@ -314,7 +323,7 @@ export function registerConvoyTools(server: McpServer): void {
           // path flag rather than trying to flatten it into CLI flags.
           if (realVpsGhcr !== undefined) {
             const configPath = join(logDir, `ghcr-${fullPlanId.slice(0, 8)}.json`);
-            writeFileSync(configPath, JSON.stringify(realVpsGhcr as RealVpsGhcrOpt, null, 2), 'utf8');
+            writeFileSync(configPath, JSON.stringify(ghcr!.config, null, 2), { encoding: 'utf8', mode: 0o600 });
             args.push('--real-vps-ghcr', '--real-vps-ghcr-config', configPath);
           }
 
@@ -326,15 +335,24 @@ export function registerConvoyTools(server: McpServer): void {
             ? await resolveAnthropicKey(byok as ByokConfig)
             : null;
 
-          const child = spawn('npm', args, {
+          const logFd = openSync(logPath, 'a', 0o600);
+          let spawnError: Error | undefined;
+          let child: ReturnType<typeof spawn>;
+          try {
+            child = spawn(process.execPath, args, {
             cwd: REPO_ROOT,
             env: {
-              ...process.env,
+              ...executionEnvironment(process.env),
+              ...ghcr?.env,
               ...(byokKey ? { ANTHROPIC_API_KEY: byokKey } : {}),
             },
             stdio: ['ignore', logFd, logFd],
             detached: true,
-          });
+            });
+          } finally {
+            closeSync(logFd);
+          }
+          child.once('error', (error) => { spawnError = error; });
           child.unref();
 
           // Poll for the orchestrator-created run row so we can hand back a
@@ -344,6 +362,7 @@ export function registerConvoyTools(server: McpServer): void {
           const startedAtFloor = Date.now();
           const deadline = Date.now() + 30_000;
           while (Date.now() < deadline) {
+            if (spawnError) return fail(`Could not start apply: ${spawnError.message}`);
             const fresh = store
               .listRunsForPlan(fullPlanId)
               .find((r) => r.startedAt.getTime() >= startedAtFloor - 500);
@@ -366,7 +385,7 @@ export function registerConvoyTools(server: McpServer): void {
       }),
   );
 
-  server.registerTool(
+  registerTool(
     'convoy_vps_bootstrap',
     {
       description:
@@ -429,7 +448,7 @@ export function registerConvoyTools(server: McpServer): void {
       }),
   );
 
-  server.registerTool(
+  registerTool(
     'convoy_connect',
     {
       description:
@@ -520,7 +539,7 @@ export function registerConvoyTools(server: McpServer): void {
       }),
   );
 
-  server.registerTool(
+  registerTool(
     'convoy_status',
     {
       description:
@@ -559,7 +578,7 @@ export function registerConvoyTools(server: McpServer): void {
       ),
   );
 
-  server.registerTool(
+  registerTool(
     'convoy_approve',
     {
       description:
@@ -603,7 +622,7 @@ export function registerConvoyTools(server: McpServer): void {
       ),
   );
 
-  server.registerTool(
+  registerTool(
     'convoy_diagnose',
     {
       description:
@@ -658,7 +677,7 @@ export function registerConvoyTools(server: McpServer): void {
       ),
   );
 
-  server.registerTool(
+  registerTool(
     'convoy_list_runs',
     {
       description: 'List recent runs (newest first) with status, platform, and live URL. Use a runId with convoy_status or convoy_diagnose.',
@@ -672,7 +691,7 @@ export function registerConvoyTools(server: McpServer): void {
       ),
   );
 
-  server.registerTool(
+  registerTool(
     'convoy_orient',
     {
       description: 'Discover what platforms, CI/CD, secrets, and observability a repo already uses. Run this before convoy_plan on an unfamiliar repo.',
@@ -694,7 +713,7 @@ export function registerConvoyTools(server: McpServer): void {
       }),
   );
 
-  server.registerTool(
+  registerTool(
     'convoy_onboard',
     {
       description: 'Capture team deployment preferences for a repo. Call before convoy_plan on a new project. Results persist to .convoy/preferences.json.',
@@ -731,7 +750,7 @@ export function registerConvoyTools(server: McpServer): void {
       }),
   );
 
-  server.registerTool(
+  registerTool(
     'convoy_rollback_preview',
     {
       description: 'Preview a rollback for a Fly.io app: show current release version, target release version, image diff, and a human-readable summary. Returns structured data the calling agent can render or act on. Next step: convoy_rollback_apply to execute, or run `convoy rollback <appName>` at the CLI.',
@@ -753,7 +772,7 @@ export function registerConvoyTools(server: McpServer): void {
       }),
   );
 
-  server.registerTool(
+  registerTool(
     'convoy_rollback_apply',
     {
       description: 'Execute a rollback for a Fly.io app to a specific release version. Run convoy_rollback_preview first to see what will change. This action changes the live deployment.',
@@ -781,11 +800,11 @@ function watchUrlFromApp(appName: string): string {
   return `${WEB_BASE}/runs?flyApp=${appName}`;
 }
 
-export function createConvoyServer(): McpServer {
+export function createConvoyServer(access: McpAccess = { role: 'local' }): McpServer {
   const server = new McpServer({
     name: 'convoy',
     version: '0.0.1',
   });
-  registerConvoyTools(server);
+  registerConvoyTools(server, access);
   return server;
 }
