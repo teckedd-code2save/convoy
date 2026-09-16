@@ -1,92 +1,93 @@
 #!/usr/bin/env node
-/**
- * Convoy MCP server — Streamable HTTP transport.
- *
- * Use this for CI runners, hosted Convoy instances, and Docker deployments
- * where a persistent HTTP endpoint is better than spawning a subprocess per
- * session. The stdio transport (src/mcp/index.ts) stays the recommended path
- * for Claude Code local development.
- *
- * Runs stateless: no session IDs, no in-memory state between requests. All
- * durable state lives in .convoy/state.db, so multiple HTTP clients can
- * interleave tool calls safely.
- *
- * Usage:
- *   npm run mcp-http
- *   CONVOY_MCP_PORT=3739 npm run mcp-http
- *
- * Connect a client:
- *   claude mcp add convoy-http --transport sse http://localhost:3738/mcp
- */
+/** Streamable HTTP for a single trusted Convoy workspace. See docs/mcp.md. */
 import { createServer, type IncomingMessage } from 'node:http';
-
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-
+import { authenticateHttp, loadHttpCredentials } from './access.js';
 import { createConvoyServer } from './server.js';
 
-const PORT = parseInt(process.env['CONVOY_MCP_PORT'] ?? '3738', 10);
+class RequestError extends Error {
+  constructor(public status: number, message: string) { super(message); }
+}
 
 async function readBody(req: IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => {
-      const body = Buffer.concat(chunks).toString('utf8').trim();
-      if (!body) { resolve(undefined); return; }
-      try { resolve(JSON.parse(body)); }
-      catch { resolve(undefined); }
-    });
-    req.on('error', reject);
+  const chunks: Buffer[] = [];
+  let length = 0;
+  for await (const chunk of req) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    length += bytes.length;
+    if (length > 1_048_576) throw new RequestError(413, 'Request exceeds 1 MiB');
+    chunks.push(bytes);
+  }
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+  catch { throw new RequestError(400, 'Invalid JSON body'); }
+}
+
+export function createConvoyHttpServer(env: NodeJS.ProcessEnv = process.env) {
+  // Refuse startup with an exposed, unauthenticated MCP endpoint.
+  loadHttpCredentials(env);
+  const allowedOrigins = new Set((env['CONVOY_MCP_ALLOWED_ORIGINS'] ?? '').split(',').map((s) => s.trim()).filter(Boolean));
+  return createServer(async (req, res) => {
+    const path = (req.url ?? '').split('?')[0];
+    if (path === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, transport: 'http', version: '0.0.1' }));
+      return;
+    }
+    if (path !== '/mcp') { res.writeHead(404); res.end(); return; }
+    const origin = req.headers.origin;
+    if (origin && !allowedOrigins.has(origin)) {
+      res.writeHead(403); res.end('Origin is not allowed'); return;
+    }
+    let access;
+    try { access = authenticateHttp(req.headers.authorization, loadHttpCredentials(env)); }
+    catch { res.writeHead(503); res.end('MCP authentication is not configured'); return; }
+    if (!access) {
+      res.writeHead(401, { 'WWW-Authenticate': 'Bearer realm="convoy"', 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Valid bearer credential required' })); return;
+    }
+    if (req.method !== 'POST') {
+      res.writeHead(405, { Allow: 'POST' }); res.end(); return;
+    }
+    if (Number(req.headers['content-length'] ?? 0) > 1_048_576) {
+      res.writeHead(413); res.end('Request exceeds 1 MiB'); return;
+    }
+    // A stateless transport handles ONE request. Sharing it breaks subsequent
+    // and concurrent calls and can mix the principals of different requests.
+    let server: ReturnType<typeof createConvoyServer> | undefined;
+    try {
+      const body = await readBody(req);
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+      server = createConvoyServer(access);
+      const close = () => { void server?.close().catch(() => undefined); };
+      res.once('close', close);
+      await server.connect(transport);
+      await transport.handleRequest(req, res, body);
+    } catch (err) {
+      if (!res.headersSent && !res.destroyed) {
+        res.writeHead(err instanceof RequestError ? err.status : 500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err instanceof RequestError ? err.message : 'MCP request failed' }));
+      }
+      await server?.close().catch(() => undefined);
+    }
   });
 }
 
-async function main(): Promise<void> {
-  // Stateless: sessionIdGenerator undefined means no Mcp-Session-Id header is
-  // sent and no per-session state is buffered. Every POST is an independent
-  // JSON-RPC round-trip — correct for short-lived CI callers.
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  const mcpServer = createConvoyServer();
-  await mcpServer.connect(transport);
-
-  const httpServer = createServer(async (req, res) => {
-    const url = req.url ?? '';
-    if (url === '/mcp' || url.startsWith('/mcp?')) {
-      try {
-        const body = req.method === 'POST' ? await readBody(req) : undefined;
-        await transport.handleRequest(req, res, body);
-      } catch (err) {
-        if (!res.headersSent) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
-        }
-      }
-      return;
-    }
-    if (url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, transport: 'http', port: PORT, version: '0.0.1' }));
-      return;
-    }
-    res.writeHead(404);
-    res.end();
-  });
-
-  httpServer.listen(PORT, () => {
-    console.error(`convoy mcp server (http) ready`);
-    console.error(`  MCP endpoint : http://0.0.0.0:${PORT}/mcp`);
-    console.error(`  Health check : http://0.0.0.0:${PORT}/health`);
-  });
-
-  for (const sig of ['SIGINT', 'SIGTERM'] as NodeJS.Signals[]) {
-    process.on(sig, () => {
-      httpServer.close(() => {
-        transport.close().catch(() => undefined).finally(() => process.exit(0));
-      });
-    });
+function main() {
+  const port = Number(process.env['CONVOY_MCP_PORT'] ?? 3738);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid CONVOY_MCP_PORT');
+  const host = process.env['CONVOY_MCP_HOST'] ?? '127.0.0.1';
+  const server = createConvoyHttpServer();
+  server.requestTimeout = 30_000;
+  server.headersTimeout = 15_000;
+  server.listen(port, host, () => console.error('Convoy MCP HTTP listening on ' + host + ':' + port));
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    process.once(signal, () => server.close(() => process.exit(0)));
   }
 }
 
-main().catch((err: unknown) => {
-  console.error('convoy mcp http server failed to start:', err);
-  process.exit(1);
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try { main(); }
+  catch (err) { console.error(err instanceof Error ? err.message : String(err)); process.exitCode = 1; }
+}
